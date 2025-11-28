@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package dfs;
+
+service MasterService {
+  // File system operations
+  rpc GetFileInfo (GetFileInfoRequest) returns (GetFileInfoResponse);
+  rpc CreateFile (CreateFileRequest) returns (CreateFileResponse);
+  rpc AllocateBlock (AllocateBlockRequest) returns (AllocateBlockResponse);
+  rpc CompleteFile (CompleteFileRequest) returns (CompleteFileResponse);
+  rpc ListFiles (ListFilesRequest) returns (ListFilesResponse);
+  
+  // DataNode registration (simplified)
+  rpc RegisterChunkServer (RegisterChunkServerRequest) returns (RegisterChunkServerResponse);
+}
+
+service ChunkServerService {
+  rpc WriteBlock (WriteBlockRequest) returns (WriteBlockResponse);
+  rpc ReadBlock (ReadBlockRequest) returns (ReadBlockResponse);
+}
+
+// Messages
+
+message GetFileInfoRequest {
+  string path = 1;
+}
+
+message GetFileInfoResponse {
+  FileMetadata metadata = 1;
+  bool found = 2;
+}
+
+message CreateFileRequest {
+  string path = 1;
+}
+
+message CreateFileResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message AllocateBlockRequest {
+  string path = 1;
+}
+
+message AllocateBlockResponse {
+  BlockInfo block = 1;
+  repeated string chunk_server_addresses = 2;
+}
+
+message CompleteFileRequest {
+  string path = 1;
+}
+
+message CompleteFileResponse {
+  bool success = 1;
+}
+
+message ListFilesRequest {
+  string path = 1;
+}
+
+message ListFilesResponse {
+  repeated string files = 1;
+}
+
+message RegisterChunkServerRequest {
+  string address = 1;
+  uint64 capacity = 2;
+}
+
+message RegisterChunkServerResponse {
+  bool success = 1;
+}
+
+message WriteBlockRequest {
+  string block_id = 1;
+  bytes data = 2;
+}
+
+message WriteBlockResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message ReadBlockRequest {
+  string block_id = 1;
+}
+
+message ReadBlockResponse {
+  bytes data = 1;
+}
+
+message FileMetadata {
+  string path = 1;
+  uint64 size = 2;
+  repeated BlockInfo blocks = 3;
+}
+
+message BlockInfo {
+  string block_id = 1;
+  uint64 size = 2;
+  repeated string locations = 3;
+}
