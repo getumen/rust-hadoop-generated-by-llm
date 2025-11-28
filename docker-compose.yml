@@ -1,0 +1,119 @@
+version: '3.8'
+
+services:
+  master:
+    build: .
+    container_name: dfs-master
+    command: /app/master --addr 0.0.0.0:50051
+    ports:
+      - "50051:50051"
+    networks:
+      - dfs-network
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  chunkserver1:
+    build: .
+    container_name: dfs-chunkserver1
+    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr dfs-master:50051 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1:50052
+    environment:
+      - CHUNKSERVER_ADDR=dfs-chunkserver1:50052
+    ports:
+      - "50052:50052"
+    networks:
+      - dfs-network
+    depends_on:
+      - master
+    volumes:
+      - cs1-data:/data/cs1
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 50052 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  chunkserver2:
+    build: .
+    container_name: dfs-chunkserver2
+    command: /app/chunkserver --addr 0.0.0.0:50053 --master-addr dfs-master:50051 --storage-dir /data/cs2 --advertise-addr dfs-chunkserver2:50053
+    ports:
+      - "50053:50053"
+    networks:
+      - dfs-network
+    depends_on:
+      - master
+    volumes:
+      - cs2-data:/data/cs2
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 50053 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  chunkserver3:
+    build: .
+    container_name: dfs-chunkserver3
+    command: /app/chunkserver --addr 0.0.0.0:50054 --master-addr dfs-master:50051 --storage-dir /data/cs3 --advertise-addr dfs-chunkserver3:50054
+    ports:
+      - "50054:50054"
+    networks:
+      - dfs-network
+    depends_on:
+      - master
+    volumes:
+      - cs3-data:/data/cs3
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 50054 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  chunkserver4:
+    build: .
+    container_name: dfs-chunkserver4
+    command: /app/chunkserver --addr 0.0.0.0:50055 --master-addr dfs-master:50051 --storage-dir /data/cs4 --advertise-addr dfs-chunkserver4:50055
+    ports:
+      - "50055:50055"
+    networks:
+      - dfs-network
+    depends_on:
+      - master
+    volumes:
+      - cs4-data:/data/cs4
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 50055 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  chunkserver5:
+    build: .
+    container_name: dfs-chunkserver5
+    command: /app/chunkserver --addr 0.0.0.0:50056 --master-addr dfs-master:50051 --storage-dir /data/cs5 --advertise-addr dfs-chunkserver5:50056
+    ports:
+      - "50056:50056"
+    networks:
+      - dfs-network
+    depends_on:
+      - master
+    volumes:
+      - cs5-data:/data/cs5
+    healthcheck:
+      test: ["CMD", "sh", "-c", "netstat -an | grep 50056 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+networks:
+  dfs-network:
+    driver: bridge
+
+volumes:
+  cs1-data:
+  cs2-data:
+  cs3-data:
+  cs4-data:
+  cs5-data:

@@ -35,7 +35,8 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let mut master_client = MasterServiceClient::connect(cli.master).await?;
+    let mut master_client = MasterServiceClient::connect(cli.master).await?
+        .max_decoding_message_size(100 * 1024 * 1024);
 
     match cli.command {
         Commands::Ls => {
@@ -76,20 +77,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            // 4. Write to first chunk server (simplified: no replication pipeline)
+            println!("Replicating to {} servers: {:?}", chunk_servers.len(), chunk_servers);
+
+            // 4. Write to first chunk server with replication pipeline
             let chunk_server_addr = format!("http://{}", chunk_servers[0]);
-            let mut chunk_client = ChunkServerServiceClient::connect(chunk_server_addr).await?;
+            let mut chunk_client = ChunkServerServiceClient::connect(chunk_server_addr).await?
+                .max_decoding_message_size(100 * 1024 * 1024);
+            
+            // Pass the remaining servers as next_servers for replication pipeline
+            let next_servers = chunk_servers[1..].to_vec();
             
             let write_req = tonic::Request::new(WriteBlockRequest {
                 block_id: block.block_id,
                 data: buffer, // Sending whole file as one block for simplicity
+                next_servers, // Replication pipeline
             });
             
             let write_resp = chunk_client.write_block(write_req).await?.into_inner();
             if !write_resp.success {
                 eprintln!("Failed to write block: {}", write_resp.error_message);
             } else {
-                println!("File uploaded successfully");
+                println!("File uploaded successfully with replication");
             }
         }
         Commands::Get { source, dest } => {
@@ -119,7 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for location in block.locations {
                     let chunk_server_addr = format!("http://{}", location);
                     match ChunkServerServiceClient::connect(chunk_server_addr).await {
-                        Ok(mut chunk_client) => {
+                        Ok(client) => {
+                            let mut chunk_client = client.max_decoding_message_size(100 * 1024 * 1024);
                             let read_req = tonic::Request::new(ReadBlockRequest {
                                 block_id: block.block_id.clone(),
                             });

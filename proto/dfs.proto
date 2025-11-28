@@ -17,6 +17,7 @@ service MasterService {
 service ChunkServerService {
   rpc WriteBlock (WriteBlockRequest) returns (WriteBlockResponse);
   rpc ReadBlock (ReadBlockRequest) returns (ReadBlockResponse);
+  rpc ReplicateBlock (ReplicateBlockRequest) returns (ReplicateBlockResponse);
 }
 
 // Messages
@@ -76,6 +77,7 @@ message RegisterChunkServerResponse {
 message WriteBlockRequest {
   string block_id = 1;
   bytes data = 2;
+  repeated string next_servers = 3; // For replication pipeline
 }
 
 message WriteBlockResponse {
@@ -102,3 +104,15 @@ message BlockInfo {
   uint64 size = 2;
   repeated string locations = 3;
 }
+
+message ReplicateBlockRequest {
+  string block_id = 1;
+  bytes data = 2;
+  repeated string next_servers = 3; // Remaining servers in the pipeline
+}
+
+message ReplicateBlockResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+

@@ -19,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Master listening on {}", addr);
 
     Server::builder()
-        .add_service(MasterServiceServer::new(master))
+        .add_service(
+            MasterServiceServer::new(master)
+                .max_decoding_message_size(100 * 1024 * 1024)
+        )
         .serve(addr)
         .await?;
 

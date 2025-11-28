@@ -1,0 +1,1 @@
+Hello from Rust Hadoop DFS! This is a test of the replication system.

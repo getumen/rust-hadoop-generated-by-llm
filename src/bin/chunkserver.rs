@@ -17,6 +17,10 @@ struct Args {
 
     #[arg(short, long, default_value = "/tmp/chunkserver_data")]
     storage_dir: PathBuf,
+
+    /// Address to advertise to master (defaults to addr if not specified)
+    #[arg(long)]
+    advertise_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -26,38 +30,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_server = MyChunkServer::new(args.storage_dir);
 
     // Register with Master
-    // We need to spawn this or do it before starting the server.
-    // Since we need to listen for incoming connections, we should start the server.
-    // But we also need to tell the Master we exist.
-    // Let's spawn a task to register.
-    
     let master_addr = format!("http://{}", args.master_addr);
-    let my_addr = args.addr.clone();
+    let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
     
     tokio::spawn(async move {
-        // Wait a bit for the server to start (optional, but good practice if we were checking our own health)
-        // Actually, we just need to connect to the master.
-        
-        // Retry loop could be added here
-        if let Ok(mut client) = MasterServiceClient::connect(master_addr).await {
-             let request = tonic::Request::new(RegisterChunkServerRequest {
-                address: my_addr,
-                capacity: 1024 * 1024 * 1024, // 1GB dummy capacity
-            });
+        // Retry loop for master registration
+        for attempt in 1..=10 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(attempt)).await;
             
-            match client.register_chunk_server(request).await {
-                Ok(_) => println!("Registered with Master"),
-                Err(e) => eprintln!("Failed to register with Master: {}", e),
+            match MasterServiceClient::connect(master_addr.clone()).await {
+                Ok(mut client) => {
+                    let request = tonic::Request::new(RegisterChunkServerRequest {
+                        address: my_addr.clone(),
+                        capacity: 1024 * 1024 * 1024, // 1GB dummy capacity
+                    });
+                    
+                    match client.register_chunk_server(request).await {
+                        Ok(_) => {
+                            println!("✓ Registered with Master at {}", master_addr);
+                            return;
+                        }
+                        Err(e) => eprintln!("Attempt {}/10: Failed to register with Master: {}", attempt, e),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Attempt {}/10: Failed to connect to Master: {}", attempt, e);
+                }
             }
-        } else {
-            eprintln!("Failed to connect to Master");
         }
+        eprintln!("✗ Failed to register with Master after 10 attempts");
     });
 
     println!("ChunkServer listening on {}", addr);
 
     Server::builder()
-        .add_service(ChunkServerServiceServer::new(chunk_server))
+        .add_service(
+            ChunkServerServiceServer::new(chunk_server)
+                .max_decoding_message_size(100 * 1024 * 1024)
+        )
         .serve(addr)
         .await?;
 

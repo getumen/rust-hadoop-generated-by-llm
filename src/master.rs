@@ -77,22 +77,36 @@ impl MasterService for MyMaster {
         let req = request.into_inner();
         let mut state = self.state.lock().unwrap();
 
+        // Replication factor (default: 3)
+        const REPLICATION_FACTOR: usize = 3;
+
         // Clone chunk_servers first to avoid borrow conflict
         let chunk_servers = state.chunk_servers.clone();
+
+        if chunk_servers.is_empty() {
+            return Err(Status::unavailable("No chunk servers available"));
+        }
 
         if let Some(metadata) = state.files.get_mut(&req.path) {
             let block_id = Uuid::new_v4().to_string();
 
+            // Select chunk servers for replication (up to REPLICATION_FACTOR)
+            let num_replicas = std::cmp::min(REPLICATION_FACTOR, chunk_servers.len());
+            let selected_servers: Vec<String> = chunk_servers.iter()
+                .take(num_replicas)
+                .cloned()
+                .collect();
+
             let block = BlockInfo {
                 block_id: block_id.clone(),
                 size: 0,
-                locations: chunk_servers.clone(),
+                locations: selected_servers.clone(),
             };
             metadata.blocks.push(block.clone());
 
             Ok(Response::new(AllocateBlockResponse {
                 block: Some(block),
-                chunk_server_addresses: chunk_servers,
+                chunk_server_addresses: selected_servers,
             }))
         } else {
             Err(Status::not_found("File not found"))
@@ -101,7 +115,7 @@ impl MasterService for MyMaster {
 
     async fn complete_file(
         &self,
-        request: Request<CompleteFileRequest>,
+        _request: Request<CompleteFileRequest>,
     ) -> Result<Response<CompleteFileResponse>, Status> {
         // In a real system, we might verify block replication here
         Ok(Response::new(CompleteFileResponse { success: true }))
