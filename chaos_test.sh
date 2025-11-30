@@ -25,8 +25,8 @@ upload_file() {
     echo "📤 Uploading file to DFS..."
     docker run --rm --network rust-hadoop_dfs-network \
         -v $(pwd)/$TEST_FILE:/tmp/$TEST_FILE \
-        rust-hadoop-master \
-        /app/dfs_cli --master http://dfs-master:50051 put /tmp/$TEST_FILE $DFS_PATH
+        rust-hadoop-master1 \
+        /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 put /tmp/$TEST_FILE $DFS_PATH
     echo "✓ File uploaded"
 }
 
@@ -36,8 +36,8 @@ download_file() {
     echo "📥 Downloading file from DFS..."
     docker run --rm --network rust-hadoop_dfs-network \
         -v $(pwd):/output \
-        rust-hadoop-master \
-        /app/dfs_cli --master http://dfs-master:50051 get $DFS_PATH /output/$output_file
+        rust-hadoop-master1 \
+        /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 get $DFS_PATH /output/$output_file
     echo "✓ File downloaded to $output_file"
 }
 
@@ -74,8 +74,8 @@ restart_chunkserver() {
 list_files() {
     echo "📋 Listing files in DFS..."
     docker run --rm --network rust-hadoop_dfs-network \
-        rust-hadoop-master \
-        /app/dfs_cli --master http://dfs-master:50051 ls
+        rust-hadoop-master1 \
+        /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 ls
 }
 
 # Function to get cluster status
@@ -165,8 +165,8 @@ main() {
     echo "Uploading during chaos..."
     docker run --rm --network rust-hadoop_dfs-network \
         -v $(pwd)/chaos_test_data2.txt:/tmp/chaos_test_data2.txt \
-        rust-hadoop-master \
-        /app/dfs_cli --master http://dfs-master:50051 put /tmp/chaos_test_data2.txt /chaos_test2.txt || {
+        rust-hadoop-master1 \
+        /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 put /tmp/chaos_test_data2.txt /chaos_test2.txt || {
         echo "⚠️  Upload failed (expected with insufficient replicas)"
     }
     
@@ -197,3 +197,24 @@ main() {
 
 # Run the test
 main
+
+echo "=== Test 5: Master Failure Test ==="
+echo "Killing a random master..."
+MASTERS=("master1" "master2" "master3")
+RANDOM_MASTER=${MASTERS[$RANDOM % ${#MASTERS[@]}]}
+docker-compose stop $RANDOM_MASTER
+echo "Stopped $RANDOM_MASTER"
+sleep 10 # Wait for election
+
+echo "Attempting to list files (should failover)..."
+list_files
+
+echo "Attempting to upload file during master outage..."
+echo "HA Test Data" > ha_test.txt
+TEST_FILE="ha_test.txt"
+DFS_PATH="/ha_test.txt"
+upload_file
+
+echo "Restarting stopped master..."
+docker-compose start $RANDOM_MASTER
+sleep 10

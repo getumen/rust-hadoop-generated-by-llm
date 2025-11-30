@@ -35,8 +35,25 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let mut master_client = MasterServiceClient::connect(cli.master).await?
-        .max_decoding_message_size(100 * 1024 * 1024);
+    
+    let master_addrs: Vec<String> = cli.master.split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+        
+    let mut master_client = None;
+    for addr in &master_addrs {
+        match MasterServiceClient::connect(addr.clone()).await {
+            Ok(client) => {
+                master_client = Some(client.max_decoding_message_size(100 * 1024 * 1024));
+                break;
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to master {}: {}", addr, e);
+            }
+        }
+    }
+    
+    let mut master_client = master_client.ok_or("Failed to connect to any master node")?;
 
     match cli.command {
         Commands::Ls => {

@@ -30,35 +30,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_server = MyChunkServer::new(args.storage_dir);
 
     // Register with Master
-    let master_addr = format!("http://{}", args.master_addr);
+    let master_addrs: Vec<String> = args.master_addr.split(',')
+        .map(|s| format!("http://{}", s))
+        .collect();
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
     
     tokio::spawn(async move {
         // Retry loop for master registration
-        for attempt in 1..=10 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(attempt)).await;
-            
-            match MasterServiceClient::connect(master_addr.clone()).await {
-                Ok(mut client) => {
-                    let request = tonic::Request::new(RegisterChunkServerRequest {
-                        address: my_addr.clone(),
-                        capacity: 1024 * 1024 * 1024, // 1GB dummy capacity
-                    });
-                    
-                    match client.register_chunk_server(request).await {
-                        Ok(_) => {
-                            println!("✓ Registered with Master at {}", master_addr);
-                            return;
+        loop {
+            let mut registered = false;
+            for master_addr in &master_addrs {
+                match MasterServiceClient::connect(master_addr.clone()).await {
+                    Ok(mut client) => {
+                        let request = tonic::Request::new(RegisterChunkServerRequest {
+                            address: my_addr.clone(),
+                            capacity: 1024 * 1024 * 1024, // 1GB dummy capacity
+                        });
+                        
+                        match client.register_chunk_server(request).await {
+                            Ok(_) => {
+                                println!("✓ Registered with Master at {}", master_addr);
+                                registered = true;
+                                break; // Connected to one master, good for now. 
+                                // In a real system, we might need to register with the active one.
+                                // Since only active master accepts connections (others are waiting on lock), 
+                                // this works naturally.
+                            }
+                            Err(e) => eprintln!("Failed to register with Master {}: {}", master_addr, e),
                         }
-                        Err(e) => eprintln!("Attempt {}/10: Failed to register with Master: {}", attempt, e),
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to connect to Master {}: {}", master_addr, e);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Attempt {}/10: Failed to connect to Master: {}", attempt, e);
-                }
+            }
+
+            if registered {
+                // Keep checking or re-registering periodically? 
+                // For now, just sleep and re-register to ensure we stay connected if master fails over
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            } else {
+                eprintln!("✗ Failed to register with any Master. Retrying...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
         }
-        eprintln!("✗ Failed to register with Master after 10 attempts");
     });
 
     println!("ChunkServer listening on {}", addr);

@@ -4,3 +4,4 @@ pub mod dfs {
 
 pub mod master;
 pub mod chunkserver;
+pub mod simple_raft;
