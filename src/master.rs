@@ -4,20 +4,34 @@ use crate::dfs::{
     CreateFileRequest, CreateFileResponse, FileMetadata, GetFileInfoRequest, GetFileInfoResponse,
     ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
 };
+use crate::simple_raft::{Command, Event};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MasterState {
-    files: HashMap<String, FileMetadata>,
-    chunk_servers: Vec<String>, // List of chunk server addresses
+    pub files: HashMap<String, FileMetadata>,
+    #[serde(skip)]
+    pub chunk_servers: Vec<String>, // List of chunk server addresses (ephemeral)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MyMaster {
     state: Arc<Mutex<MasterState>>,
+    raft_tx: mpsc::Sender<Event>,
+}
+
+impl MyMaster {
+    pub fn new(state: Arc<Mutex<MasterState>>, raft_tx: mpsc::Sender<Event>) -> Self {
+        MyMaster {
+            state,
+            raft_tx,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -47,27 +61,37 @@ impl MasterService for MyMaster {
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.lock().unwrap();
-
-        if state.files.contains_key(&req.path) {
-            return Ok(Response::new(CreateFileResponse {
-                success: false,
-                error_message: "File already exists".to_string(),
-            }));
+        
+        // Check if file exists (read optimization)
+        {
+            let state = self.state.lock().unwrap();
+            if state.files.contains_key(&req.path) {
+                return Ok(Response::new(CreateFileResponse {
+                    success: false,
+                    error_message: "File already exists".to_string(),
+                }));
+            }
         }
 
-        let metadata = FileMetadata {
-            path: req.path.clone(),
-            size: 0,
-            blocks: vec![],
-        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Err(_) = self.raft_tx.send(Event::ClientRequest {
+            command: Command::CreateFile { path: req.path },
+            reply_tx: tx,
+        }).await {
+            return Err(Status::internal("Raft channel closed"));
+        }
 
-        state.files.insert(req.path, metadata);
-
-        Ok(Response::new(CreateFileResponse {
-            success: true,
-            error_message: "".to_string(),
-        }))
+        match rx.await {
+            Ok(true) => Ok(Response::new(CreateFileResponse {
+                success: true,
+                error_message: "".to_string(),
+            })),
+            Ok(false) => Ok(Response::new(CreateFileResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
     }
 
     async fn allocate_block(
@@ -75,35 +99,63 @@ impl MasterService for MyMaster {
         request: Request<AllocateBlockRequest>,
     ) -> Result<Response<AllocateBlockResponse>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.lock().unwrap();
+        
+        // Replication factor (default: 3)
+        const REPLICATION_FACTOR: usize = 3;
+        
+        let (chunk_servers, block_id) = {
+            let state = self.state.lock().unwrap();
+            if !state.files.contains_key(&req.path) {
+                return Err(Status::not_found("File not found"));
+            }
+            
+            let chunk_servers = state.chunk_servers.clone();
+            if chunk_servers.is_empty() {
+                return Err(Status::unavailable("No chunk servers available"));
+            }
+            (chunk_servers, Uuid::new_v4().to_string())
+        };
 
-        // Clone chunk_servers first to avoid borrow conflict
-        let chunk_servers = state.chunk_servers.clone();
+        // Select chunk servers
+        let num_replicas = std::cmp::min(REPLICATION_FACTOR, chunk_servers.len());
+        let selected_servers: Vec<String> = chunk_servers.iter()
+            .take(num_replicas)
+            .cloned()
+            .collect();
 
-        if let Some(metadata) = state.files.get_mut(&req.path) {
-            let block_id = Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Err(_) = self.raft_tx.send(Event::ClientRequest {
+            command: Command::AllocateBlock { 
+                path: req.path, 
+                block_id: block_id.clone(), 
+                locations: selected_servers.clone() 
+            },
+            reply_tx: tx,
+        }).await {
+            return Err(Status::internal("Raft channel closed"));
+        }
 
-            let block = BlockInfo {
-                block_id: block_id.clone(),
-                size: 0,
-                locations: chunk_servers.clone(),
-            };
-            metadata.blocks.push(block.clone());
-
-            Ok(Response::new(AllocateBlockResponse {
-                block: Some(block),
-                chunk_server_addresses: chunk_servers,
-            }))
-        } else {
-            Err(Status::not_found("File not found"))
+        match rx.await {
+            Ok(true) => {
+                let block = BlockInfo {
+                    block_id,
+                    size: 0,
+                    locations: selected_servers.clone(),
+                };
+                Ok(Response::new(AllocateBlockResponse {
+                    block: Some(block),
+                    chunk_server_addresses: selected_servers,
+                }))
+            },
+            Ok(false) => Err(Status::unavailable("Not Leader")),
+            Err(_) => Err(Status::internal("Raft response error")),
         }
     }
 
     async fn complete_file(
         &self,
-        request: Request<CompleteFileRequest>,
+        _request: Request<CompleteFileRequest>,
     ) -> Result<Response<CompleteFileResponse>, Status> {
-        // In a real system, we might verify block replication here
         Ok(Response::new(CompleteFileResponse { success: true }))
     }
 
@@ -121,8 +173,15 @@ impl MasterService for MyMaster {
         request: Request<RegisterChunkServerRequest>,
     ) -> Result<Response<RegisterChunkServerResponse>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.lock().unwrap();
         
+        // We can handle registration locally or via Raft.
+        // For simplicity, let's handle it locally (ephemeral state).
+        // Or via Raft to ensure all masters know about chunkservers?
+        // If we handle locally, only the connected master knows.
+        // But chunkservers connect to ALL masters in our current implementation.
+        // So local registration is fine.
+        
+        let mut state = self.state.lock().unwrap();
         if !state.chunk_servers.contains(&req.address) {
              state.chunk_servers.push(req.address);
         }
