@@ -564,7 +564,7 @@ impl RaftNode {
                                 // Don't log error for heartbeats to avoid spam, unless verbose
                             }
                         }
-                        }
+
                         Err(e) => {
                             // Log error for debugging
                             eprintln!("AppendEntries failed to {}: {}", url, e);
