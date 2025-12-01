@@ -1,42 +1,8 @@
 # Rust Hadoop DFS - TODO List
 
-## 🔴 High Priority (Critical for Production)
-
-### 1. Raft Log Persistence
-**Status**: Completed  
-**Priority**: Critical  
-**Effort**: Large
-
-**Problem**:
-- Raft logs are currently in-memory only
-- If all Masters restart simultaneously, all metadata is lost
-- No durability guarantee
-
-**Solution**:
-- Implement Write-Ahead Log (WAL) to disk
-- Use `sled` or `rocksdb` for persistent storage
-- Implement log compaction/snapshotting
-
-**Tasks**:
-- [x] Add persistent storage backend (sled/rocksdb)
-- [x] Implement WAL for Raft logs
-- [x] Add log entry serialization/deserialization
-- [ ] Implement snapshot creation on log size threshold (Moved to Snapshot Implementation)
-- [ ] Add snapshot restoration on startup (Moved to Snapshot Implementation)
-- [x] Add configuration for log directory path
-- [ ] Implement log compaction (remove applied entries) (Moved to Snapshot Implementation)
-- [x] Add fsync configuration for durability vs performance tradeoff (Using RocksDB defaults)
-
-**Files to modify**:
-- `src/simple_raft.rs` - Add storage layer
-- `src/bin/master.rs` - Add log directory argument
-- `docker-compose.yml` - Add volume for log persistence
-
----
-
 ## 🟡 Medium Priority (Important for Stability)
 
-### 2. Raft Snapshot Implementation
+### 1. Raft Snapshot Implementation
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Large
@@ -62,7 +28,7 @@
 
 ---
 
-### 3. Improved Network Error Handling
+### 2. Improved Network Error Handling
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -82,7 +48,7 @@
 
 ---
 
-### 4. Raft Configuration Management
+### 3. Raft Configuration Management
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Medium
@@ -108,7 +74,7 @@
 
 ---
 
-### 5. Health Checks and Monitoring
+### 4. Health Checks and Monitoring
 **Status**: Basic  
 **Priority**: Medium  
 **Effort**: Small
@@ -135,7 +101,7 @@
 
 ## 🟢 Low Priority (Nice to Have)
 
-### 6. Read Optimization
+### 5. Read Optimization
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Medium
@@ -158,7 +124,7 @@
 
 ---
 
-### 7. Raft Performance Optimizations
+### 6. Raft Performance Optimizations
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Large
@@ -173,7 +139,7 @@
 
 ---
 
-### 8. Testing Infrastructure
+### 7. Testing Infrastructure
 **Status**: Basic (chaos tests exist)  
 **Priority**: Medium  
 **Effort**: Large
@@ -199,7 +165,7 @@
 
 ---
 
-### 9. Documentation
+### 8. Documentation
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -222,7 +188,7 @@
 
 ---
 
-### 10. Security Enhancements
+### 9. Security Enhancements
 **Status**: Not Started  
 **Priority**: Low (for prototype)  
 **Effort**: Large
@@ -237,7 +203,7 @@
 
 ---
 
-### 11. Observability
+### 10. Observability
 **Status**: Minimal  
 **Priority**: Medium  
 **Effort**: Medium
@@ -256,7 +222,7 @@
 
 ---
 
-### 12. ChunkServer Improvements
+### 11. ChunkServer Improvements
 **Status**: Working  
 **Priority**: Low  
 **Effort**: Medium
@@ -272,7 +238,7 @@
 
 ## 🔧 Technical Debt
 
-### 13. Code Quality
+### 12. Code Quality
 - [ ] Remove unused dependencies (`fs2`, `raft_types.rs`, `raft_network.rs`)
 - [ ] Add comprehensive error handling (remove unwrap() calls)
 - [ ] Implement proper async error propagation
@@ -283,7 +249,7 @@
 - [ ] Add rustfmt configuration and enforce formatting
 - [ ] Fix deprecated `rand` usage in `simple_raft.rs`
 
-### 14. Build and Deployment
+### 13. Build and Deployment
 - [ ] Optimize Docker image size (multi-stage builds)
 - [ ] Add CI/CD pipeline
 - [ ] Implement blue-green deployment
@@ -292,7 +258,7 @@
 - [ ] Add Helm chart
 - [ ] Implement backup and restore procedures
 
-### 15. Refactor RPC Responses
+### 14. Refactor RPC Responses
 - [ ] Standardize RPC response formats (consistent success/error/hint fields)
 - [ ] Use gRPC error details for structured error information instead of custom string parsing
 
@@ -317,29 +283,29 @@
 
 ## 🎯 Roadmap
 
-### Phase 1: Stability (Current)
+### Phase 1: Stability (Completed)
 - ✅ Basic Raft implementation
 - ✅ Leader election
 - ✅ Log replication
 - ✅ Basic chaos testing
 - ✅ CLI retry logic
 - ✅ Leader information propagation
+- ✅ Raft log persistence
 
-### Phase 2: Production Readiness (Next 2-4 weeks)
-- Raft log persistence (#1)
-- Snapshot implementation (#2)
-- Improved error handling (#3)
-- Refactor RPC responses (#15)
+### Phase 2: Production Readiness (Current - Next 2-4 weeks)
+- Snapshot implementation (#1)
+- Improved error handling (#2)
+- Refactor RPC responses (#14)
 
 ### Phase 3: Scalability (4-8 weeks)
-- Dynamic cluster membership (#4)
-- Read optimizations (#6)
-- Performance optimizations (#7)
-- Comprehensive testing (#8)
+- Dynamic cluster membership (#3)
+- Read optimizations (#5)
+- Performance optimizations (#6)
+- Comprehensive testing (#7)
 
 ### Phase 4: Enterprise Features (8-12 weeks)
-- Security enhancements (#10)
-- Advanced observability (#11)
+- Security enhancements (#9)
+- Advanced observability (#10)
 - Operational tooling
 - Production documentation
 
