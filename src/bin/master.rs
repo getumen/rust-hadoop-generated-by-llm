@@ -23,6 +23,9 @@ struct Args {
 
     #[arg(long)]
     advertise_addr: Option<String>,
+
+    #[arg(long, default_value = "/tmp/raft-logs")]
+    storage_dir: String,
 }
 
 #[derive(Debug)]
@@ -39,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Peers: {:?}", args.peers);
     println!("HTTP Port: {}", args.http_port);
     println!("Advertise Addr: {}", advertise_addr);
+    println!("Storage Dir: {}", args.storage_dir);
 
     let state = Arc::new(Mutex::new(MasterState::default()));
     let (raft_tx, raft_rx) = tokio::sync::mpsc::channel(100);
@@ -47,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_tx_for_server = raft_tx.clone();
     let raft_tx_for_master = raft_tx.clone();
 
-    let mut raft_node = RaftNode::new(args.id, args.peers.clone(), advertise_addr, state.clone(), raft_rx, raft_tx_for_node);
+    let mut raft_node = RaftNode::new(args.id, args.peers.clone(), advertise_addr, args.storage_dir.clone(), state.clone(), raft_rx, raft_tx_for_node);
     
     // Start Raft Node
     tokio::spawn(async move {

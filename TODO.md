@@ -3,7 +3,7 @@
 ## 🔴 High Priority (Critical for Production)
 
 ### 1. Raft Log Persistence
-**Status**: Not Started  
+**Status**: Completed  
 **Priority**: Critical  
 **Effort**: Large
 
@@ -18,14 +18,14 @@
 - Implement log compaction/snapshotting
 
 **Tasks**:
-- [ ] Add persistent storage backend (sled/rocksdb)
-- [ ] Implement WAL for Raft logs
-- [ ] Add log entry serialization/deserialization
-- [ ] Implement snapshot creation on log size threshold
-- [ ] Add snapshot restoration on startup
-- [ ] Add configuration for log directory path
-- [ ] Implement log compaction (remove applied entries)
-- [ ] Add fsync configuration for durability vs performance tradeoff
+- [x] Add persistent storage backend (sled/rocksdb)
+- [x] Implement WAL for Raft logs
+- [x] Add log entry serialization/deserialization
+- [ ] Implement snapshot creation on log size threshold (Moved to Snapshot Implementation)
+- [ ] Add snapshot restoration on startup (Moved to Snapshot Implementation)
+- [x] Add configuration for log directory path
+- [ ] Implement log compaction (remove applied entries) (Moved to Snapshot Implementation)
+- [x] Add fsync configuration for durability vs performance tradeoff (Using RocksDB defaults)
 
 **Files to modify**:
 - `src/simple_raft.rs` - Add storage layer

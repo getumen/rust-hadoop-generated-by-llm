@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use rand::Rng;
+use rocksdb::DB;
 use crate::master::MasterState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +57,7 @@ pub struct AppendEntriesArgs {
     pub prev_log_term: u64,
     pub entries: Vec<LogEntry>,
     pub leader_commit: usize,
-    pub leader_address: String, // Added: Client-facing address of the leader
+    pub leader_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,14 +77,14 @@ pub enum Event {
         reply_tx: tokio::sync::oneshot::Sender<Result<(), Option<String>>>,
     },
     GetLeaderInfo {
-        reply_tx: tokio::sync::oneshot::Sender<Option<String>>, // Changed: Return address string
+        reply_tx: tokio::sync::oneshot::Sender<Option<String>>,
     },
 }
 
 pub struct RaftNode {
     pub id: usize,
     pub peers: Vec<String>,
-    pub client_address: String, // Added: My client-facing address
+    pub client_address: String,
     pub role: Role,
     pub current_term: u64,
     pub voted_for: Option<usize>,
@@ -93,7 +94,7 @@ pub struct RaftNode {
     pub next_index: Vec<usize>,
     pub match_index: Vec<usize>,
     pub current_leader: Option<usize>,
-    pub current_leader_address: Option<String>, // Added: Address of current leader
+    pub current_leader_address: Option<String>,
     
     pub election_timeout: Duration,
     pub last_election_time: Instant,
@@ -102,6 +103,8 @@ pub struct RaftNode {
     pub self_tx: mpsc::Sender<Event>,
     pub app_state: Arc<Mutex<MasterState>>,
     pub votes_received: usize,
+    
+    pub db: Arc<DB>, // RocksDB instance
 }
 
 impl RaftNode {
@@ -109,19 +112,24 @@ impl RaftNode {
         id: usize,
         peers: Vec<String>,
         client_address: String,
+        storage_dir: String,
         app_state: Arc<Mutex<MasterState>>,
         inbox: mpsc::Receiver<Event>,
         self_tx: mpsc::Sender<Event>,
     ) -> Self {
-        let log = vec![LogEntry { term: 0, command: Command::NoOp }];
+        let path = format!("{}/raft_node_{}", storage_dir, id);
+        let db = DB::open_default(&path).expect("Failed to open RocksDB");
+        let db = Arc::new(db);
+
+        let (current_term, voted_for, log) = Self::load_state(&db);
         
         RaftNode {
             id,
             peers,
             client_address,
             role: Role::Follower,
-            current_term: 0,
-            voted_for: None,
+            current_term,
+            voted_for,
             log,
             commit_index: 0,
             last_applied: 0,
@@ -135,6 +143,64 @@ impl RaftNode {
             self_tx,
             app_state,
             votes_received: 0,
+            db,
+        }
+    }
+
+    fn load_state(db: &DB) -> (u64, Option<usize>, Vec<LogEntry>) {
+        let term = match db.get(b"term") {
+            Ok(Some(val)) => u64::from_be_bytes(val.try_into().unwrap()),
+            _ => 0,
+        };
+        let voted_for = match db.get(b"vote") {
+            Ok(Some(val)) => Some(usize::from_be_bytes(val.try_into().unwrap())),
+            _ => None,
+        };
+        
+        let mut log = vec![LogEntry { term: 0, command: Command::NoOp }];
+        let mut index = 1;
+        loop {
+            let key = format!("log:{}", index);
+            match db.get(key.as_bytes()) {
+                Ok(Some(val)) => {
+                    let entry: LogEntry = serde_json::from_slice(&val).unwrap();
+                    log.push(entry);
+                    index += 1;
+                }
+                _ => break,
+            }
+        }
+        
+        (term, voted_for, log)
+    }
+
+    fn save_term(&self) {
+        self.db.put(b"term", self.current_term.to_be_bytes()).unwrap();
+    }
+
+    fn save_vote(&self) {
+        if let Some(vote) = self.voted_for {
+            self.db.put(b"vote", vote.to_be_bytes()).unwrap();
+        } else {
+            self.db.delete(b"vote").unwrap();
+        }
+    }
+
+    fn save_log_entry(&self, index: usize, entry: &LogEntry) {
+        let key = format!("log:{}", index);
+        let val = serde_json::to_vec(entry).unwrap();
+        self.db.put(key.as_bytes(), val).unwrap();
+    }
+
+    fn delete_log_entries_from(&self, start_index: usize) {
+        let mut index = start_index;
+        loop {
+            let key = format!("log:{}", index);
+            if self.db.get(key.as_bytes()).unwrap().is_none() {
+                break;
+            }
+            self.db.delete(key.as_bytes()).unwrap();
+            index += 1;
         }
     }
 
@@ -174,7 +240,11 @@ impl RaftNode {
     async fn start_election(&mut self) {
         self.role = Role::Candidate;
         self.current_term += 1;
+        self.save_term(); // Persist term
+        
         self.voted_for = Some(self.id);
+        self.save_vote(); // Persist vote
+        
         self.votes_received = 1;
         self.last_election_time = Instant::now();
         self.election_timeout = Duration::from_millis(rand::thread_rng().gen_range(1500..3000));
@@ -287,7 +357,9 @@ impl RaftNode {
                     term: self.current_term,
                     command,
                 };
-                self.log.push(entry);
+                self.log.push(entry.clone());
+                self.save_log_entry(self.log.len() - 1, &entry); // Persist log entry
+                
                 self.commit_index = self.log.len() - 1;
                 self.apply_logs();
                 
@@ -306,8 +378,12 @@ impl RaftNode {
                 if args.term >= self.current_term {
                     if args.term > self.current_term {
                         self.current_term = args.term;
+                        self.save_term(); // Persist term
+                        
                         self.role = Role::Follower;
                         self.voted_for = None;
+                        self.save_vote(); // Persist vote (None)
+                        
                         self.current_leader = None;
                         self.current_leader_address = None;
                     }
@@ -316,6 +392,8 @@ impl RaftNode {
                         && args.last_log_index >= self.log.len() - 1 
                     {
                         self.voted_for = Some(args.candidate_id);
+                        self.save_vote(); // Persist vote
+                        
                         self.last_election_time = Instant::now();
                         vote_granted = true;
                     }
@@ -334,8 +412,12 @@ impl RaftNode {
                     }
                 } else if reply.term > self.current_term {
                     self.current_term = reply.term;
+                    self.save_term(); // Persist term
+                    
                     self.role = Role::Follower;
                     self.voted_for = None;
+                    self.save_vote(); // Persist vote
+                    
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
@@ -347,6 +429,8 @@ impl RaftNode {
                 
                 if args.term >= self.current_term {
                     self.current_term = args.term;
+                    self.save_term(); // Persist term
+                    
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
                     self.current_leader_address = Some(args.leader_address.clone());
@@ -361,10 +445,14 @@ impl RaftNode {
                                 if log_insert_index < self.log.len() {
                                     if self.log[log_insert_index].term != entry.term {
                                         self.log.truncate(log_insert_index);
-                                        self.log.push(entry);
+                                        self.delete_log_entries_from(log_insert_index); // Persist truncate
+                                        
+                                        self.log.push(entry.clone());
+                                        self.save_log_entry(log_insert_index, &entry); // Persist new entry
                                     }
                                 } else {
-                                    self.log.push(entry);
+                                    self.log.push(entry.clone());
+                                    self.save_log_entry(log_insert_index, &entry); // Persist new entry
                                 }
                                 log_insert_index += 1;
                             }
