@@ -74,6 +74,7 @@ pub struct AppendEntriesReply {
     pub term: u64,
     pub success: bool,
     pub match_index: usize,
+    pub peer_id: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +89,8 @@ pub struct InstallSnapshotArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallSnapshotReply {
     pub term: u64,
+    pub last_included_index: usize,
+    pub peer_id: usize,
 }
 
 pub enum Event {
@@ -764,6 +767,7 @@ impl RaftNode {
                     term: self.current_term,
                     success,
                     match_index,
+                    peer_id: self.id,
                 })
             }
             RpcMessage::AppendEntriesResponse(reply) => {
@@ -791,11 +795,33 @@ impl RaftNode {
                 }
                 RpcMessage::InstallSnapshotResponse(InstallSnapshotReply {
                     term: self.current_term,
+                    last_included_index: self.last_included_index,
+                    peer_id: self.id,
                 })
             }
-            RpcMessage::InstallSnapshotResponse(_reply) => {
+            RpcMessage::InstallSnapshotResponse(reply) => {
                 // Leader receives this - snapshot transfer completed
-                RpcMessage::InstallSnapshotResponse(_reply)
+                if self.role == Role::Leader && reply.term == self.current_term {
+                    // Find the peer index
+                    if let Some(peer_idx) = self.peers.iter().position(|p| {
+                        // Extract peer ID from address (this is a simplification)
+                        // In a real implementation, we'd need a better way to map addresses to IDs
+                        p.contains(&reply.peer_id.to_string())
+                    }) {
+                        // Update next_index and match_index
+                        self.next_index[peer_idx] = reply.last_included_index + 1;
+                        self.match_index[peer_idx] = reply.last_included_index;
+                    }
+                } else if reply.term > self.current_term {
+                    self.current_term = reply.term;
+                    self.save_term();
+                    self.role = Role::Follower;
+                    self.voted_for = None;
+                    self.save_vote();
+                    self.current_leader = None;
+                    self.current_leader_address = None;
+                }
+                RpcMessage::InstallSnapshotResponse(reply)
             }
         }
     }
