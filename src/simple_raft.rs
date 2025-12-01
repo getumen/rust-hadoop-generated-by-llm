@@ -28,11 +28,20 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub last_included_index: usize,
+    pub last_included_term: u64,
+    pub data: Vec<u8>, // Serialized MasterState
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcMessage {
     RequestVote(RequestVoteArgs),
     RequestVoteResponse(RequestVoteReply),
     AppendEntries(AppendEntriesArgs),
     AppendEntriesResponse(AppendEntriesReply),
+    InstallSnapshot(InstallSnapshotArgs),
+    InstallSnapshotResponse(InstallSnapshotReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +76,20 @@ pub struct AppendEntriesReply {
     pub match_index: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotArgs {
+    pub term: u64,
+    pub leader_id: usize,
+    pub last_included_index: usize,
+    pub last_included_term: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReply {
+    pub term: u64,
+}
+
 pub enum Event {
     Rpc {
         msg: RpcMessage,
@@ -96,6 +119,10 @@ pub struct RaftNode {
     pub current_leader: Option<usize>,
     pub current_leader_address: Option<String>,
     
+    // Snapshot metadata
+    pub last_included_index: usize,
+    pub last_included_term: u64,
+    
     pub election_timeout: Duration,
     pub last_election_time: Instant,
     
@@ -121,7 +148,7 @@ impl RaftNode {
         let db = DB::open_default(&path).expect("Failed to open RocksDB");
         let db = Arc::new(db);
 
-        let (current_term, voted_for, log) = Self::load_state(&db);
+        let (current_term, voted_for, log, last_included_index, last_included_term) = Self::load_state(&db, &app_state);
         
         RaftNode {
             id,
@@ -131,12 +158,14 @@ impl RaftNode {
             current_term,
             voted_for,
             log,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: last_included_index,
+            last_applied: last_included_index,
             next_index: vec![],
             match_index: vec![],
             current_leader: None,
             current_leader_address: None,
+            last_included_index,
+            last_included_term,
             election_timeout: Duration::from_millis(rand::thread_rng().gen_range(1500..3000)),
             last_election_time: Instant::now(),
             inbox,
@@ -147,7 +176,7 @@ impl RaftNode {
         }
     }
 
-    fn load_state(db: &DB) -> (u64, Option<usize>, Vec<LogEntry>) {
+    fn load_state(db: &DB, app_state: &Arc<Mutex<MasterState>>) -> (u64, Option<usize>, Vec<LogEntry>, usize, u64) {
         let term = match db.get(b"term") {
             Ok(Some(val)) => u64::from_be_bytes(val.try_into().unwrap()),
             _ => 0,
@@ -157,8 +186,22 @@ impl RaftNode {
             _ => None,
         };
         
-        let mut log = vec![LogEntry { term: 0, command: Command::NoOp }];
-        let mut index = 1;
+        // Load snapshot if exists
+        let (last_included_index, last_included_term) = match db.get(b"snapshot_meta") {
+            Ok(Some(val)) => {
+                let meta: (usize, u64) = serde_json::from_slice(&val).unwrap();
+                // Load snapshot data and restore app state
+                if let Ok(Some(snapshot_data)) = db.get(b"snapshot_data") {
+                    let state: MasterState = serde_json::from_slice(&snapshot_data).unwrap();
+                    *app_state.lock().unwrap() = state;
+                }
+                meta
+            }
+            _ => (0, 0),
+        };
+        
+        let mut log = vec![LogEntry { term: last_included_term, command: Command::NoOp }];
+        let mut index = last_included_index + 1;
         loop {
             let key = format!("log:{}", index);
             match db.get(key.as_bytes()) {
@@ -171,7 +214,7 @@ impl RaftNode {
             }
         }
         
-        (term, voted_for, log)
+        (term, voted_for, log, last_included_index, last_included_term)
     }
 
     fn save_term(&self) {
@@ -204,12 +247,73 @@ impl RaftNode {
         }
     }
 
+    fn create_snapshot(&mut self) {
+        // Serialize current app state
+        let state = self.app_state.lock().unwrap();
+        let snapshot_data = serde_json::to_vec(&*state).unwrap();
+        drop(state);
+        
+        // Save snapshot metadata
+        let meta = (self.last_applied, self.log[self.last_applied - self.last_included_index].term);
+        let meta_bytes = serde_json::to_vec(&meta).unwrap();
+        self.db.put(b"snapshot_meta", meta_bytes).unwrap();
+        
+        // Save snapshot data
+        self.db.put(b"snapshot_data", snapshot_data).unwrap();
+        
+        // Delete old log entries
+        for i in (self.last_included_index + 1)..=self.last_applied {
+            let key = format!("log:{}", i);
+            self.db.delete(key.as_bytes()).unwrap();
+        }
+        
+        // Update snapshot metadata
+        self.last_included_term = self.log[self.last_applied - self.last_included_index].term;
+        
+        // Truncate log, keeping only entries after snapshot
+        let new_log_start = self.last_applied - self.last_included_index + 1;
+        let new_log = self.log[new_log_start..].to_vec();
+        self.log = vec![LogEntry { term: self.last_included_term, command: Command::NoOp }];
+        self.log.extend(new_log);
+        
+        self.last_included_index = self.last_applied;
+        
+        println!("Node {} created snapshot at index {}", self.id, self.last_included_index);
+    }
+
+    fn install_snapshot(&mut self, snapshot: Snapshot) {
+        // Save snapshot to disk
+        let meta = (snapshot.last_included_index, snapshot.last_included_term);
+        let meta_bytes = serde_json::to_vec(&meta).unwrap();
+        self.db.put(b"snapshot_meta", meta_bytes).unwrap();
+        self.db.put(b"snapshot_data", &snapshot.data).unwrap();
+        
+        // Restore app state
+        let state: MasterState = serde_json::from_slice(&snapshot.data).unwrap();
+        *self.app_state.lock().unwrap() = state;
+        
+        // Delete old log entries
+        for i in (self.last_included_index + 1)..=snapshot.last_included_index {
+            let key = format!("log:{}", i);
+            self.db.delete(key.as_bytes()).unwrap();
+        }
+        
+        // Update state
+        self.last_included_index = snapshot.last_included_index;
+        self.last_included_term = snapshot.last_included_term;
+        self.log = vec![LogEntry { term: self.last_included_term, command: Command::NoOp }];
+        self.commit_index = snapshot.last_included_index;
+        self.last_applied = snapshot.last_included_index;
+        
+        println!("Node {} installed snapshot at index {}", self.id, self.last_included_index);
+    }
+
     pub async fn run(&mut self) {
         let tick_rate = Duration::from_millis(100);
         let mut tick_interval = tokio::time::interval(tick_rate);
 
-        self.next_index = vec![1; self.peers.len()];
-        self.match_index = vec![0; self.peers.len()];
+        self.next_index = vec![self.log.len() + self.last_included_index; self.peers.len()];
+        self.match_index = vec![self.last_included_index; self.peers.len()];
 
         loop {
             tokio::select! {
@@ -235,6 +339,12 @@ impl RaftNode {
             }
         }
         self.apply_logs();
+        
+        // Create snapshot if log is too large (threshold: 100 entries)
+        const SNAPSHOT_THRESHOLD: usize = 100;
+        if self.log.len() > SNAPSHOT_THRESHOLD && self.last_applied > self.last_included_index {
+            self.create_snapshot();
+        }
     }
 
     async fn start_election(&mut self) {
@@ -300,11 +410,47 @@ impl RaftNode {
 
     async fn send_heartbeats(&mut self) {
         for (i, peer) in self.peers.iter().enumerate() {
-            let prev_log_index = self.next_index[i] - 1;
+            // Check if follower needs a snapshot
+            if self.next_index[i] <= self.last_included_index {
+                // Send snapshot instead of AppendEntries
+                let state = self.app_state.lock().unwrap();
+                let snapshot_data = serde_json::to_vec(&*state).unwrap();
+                drop(state);
+                
+                let args = InstallSnapshotArgs {
+                    term: self.current_term,
+                    leader_id: self.id,
+                    last_included_index: self.last_included_index,
+                    last_included_term: self.last_included_term,
+                    data: snapshot_data,
+                };
+                
+                let url = format!("{}/raft/snapshot", peer);
+                let tx = self.self_tx.clone();
+                
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    match client.post(url).json(&args).send().await {
+                        Ok(resp) => {
+                            if let Ok(reply) = resp.json::<InstallSnapshotReply>().await {
+                                let _ = tx.send(Event::Rpc {
+                                    msg: RpcMessage::InstallSnapshotResponse(reply),
+                                    reply_tx: None
+                                }).await;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                });
+                continue;
+            }
+            
+            let prev_log_index = self.next_index[i] - 1 - self.last_included_index;
             let prev_log_term = self.log[prev_log_index].term;
             
-            let entries = if self.log.len() > self.next_index[i] {
-                self.log[self.next_index[i]..].to_vec()
+            let next_log_index = self.next_index[i] - self.last_included_index;
+            let entries = if self.log.len() > next_log_index {
+                self.log[next_log_index..].to_vec()
             } else {
                 vec![]
             };
@@ -312,7 +458,7 @@ impl RaftNode {
             let args = AppendEntriesArgs {
                 term: self.current_term,
                 leader_id: self.id,
-                prev_log_index,
+                prev_log_index: self.next_index[i] - 1,
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
@@ -358,9 +504,10 @@ impl RaftNode {
                     command,
                 };
                 self.log.push(entry.clone());
-                self.save_log_entry(self.log.len() - 1, &entry); // Persist log entry
+                let absolute_index = self.log.len() - 1 + self.last_included_index;
+                self.save_log_entry(absolute_index, &entry); // Persist log entry
                 
-                self.commit_index = self.log.len() - 1;
+                self.commit_index = absolute_index;
                 self.apply_logs();
                 
                 let _ = reply_tx.send(Ok(()));
@@ -429,41 +576,74 @@ impl RaftNode {
                 
                 if args.term >= self.current_term {
                     self.current_term = args.term;
-                    self.save_term(); // Persist term
+                    self.save_term();
                     
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
                     self.current_leader_address = Some(args.leader_address.clone());
                     self.last_election_time = Instant::now();
                     
-                    if args.prev_log_index < self.log.len() {
-                        if self.log[args.prev_log_index].term == args.prev_log_term {
-                            success = true;
-                            
-                            let mut log_insert_index = args.prev_log_index + 1;
-                            for entry in args.entries {
-                                if log_insert_index < self.log.len() {
-                                    if self.log[log_insert_index].term != entry.term {
-                                        self.log.truncate(log_insert_index);
-                                        self.delete_log_entries_from(log_insert_index); // Persist truncate
+                    // Check if prev_log_index is in snapshot
+                    if args.prev_log_index < self.last_included_index {
+                        // Follower is ahead, reject
+                        success = false;
+                    } else if args.prev_log_index == self.last_included_index {
+                        // Prev log is the snapshot point
+                        success = args.prev_log_term == self.last_included_term;
+                        if success {
+                            // Append all entries
+                            for (i, entry) in args.entries.iter().enumerate() {
+                                let absolute_index = args.prev_log_index + 1 + i;
+                                let log_index = absolute_index - self.last_included_index;
+                                
+                                if log_index < self.log.len() {
+                                    if self.log[log_index].term != entry.term {
+                                        self.log.truncate(log_index);
+                                        self.delete_log_entries_from(absolute_index);
                                         
                                         self.log.push(entry.clone());
-                                        self.save_log_entry(log_insert_index, &entry); // Persist new entry
+                                        self.save_log_entry(absolute_index, entry);
                                     }
                                 } else {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(log_insert_index, &entry); // Persist new entry
+                                    self.save_log_entry(absolute_index, entry);
                                 }
-                                log_insert_index += 1;
                             }
-                            
-                            match_index = self.log.len() - 1;
-
-                            if args.leader_commit > self.commit_index {
-                                self.commit_index = args.leader_commit.min(self.log.len() - 1);
-                                self.apply_logs();
+                            match_index = args.prev_log_index + args.entries.len();
+                        }
+                    } else {
+                        // Normal case
+                        let prev_log_index_local = args.prev_log_index - self.last_included_index;
+                        if prev_log_index_local < self.log.len() {
+                            if self.log[prev_log_index_local].term == args.prev_log_term {
+                                success = true;
+                                
+                                for (i, entry) in args.entries.iter().enumerate() {
+                                    let absolute_index = args.prev_log_index + 1 + i;
+                                    let log_index = absolute_index - self.last_included_index;
+                                    
+                                    if log_index < self.log.len() {
+                                        if self.log[log_index].term != entry.term {
+                                            self.log.truncate(log_index);
+                                            self.delete_log_entries_from(absolute_index);
+                                            
+                                            self.log.push(entry.clone());
+                                            self.save_log_entry(absolute_index, entry);
+                                        }
+                                    } else {
+                                        self.log.push(entry.clone());
+                                        self.save_log_entry(absolute_index, entry);
+                                    }
+                                }
+                                
+                                match_index = args.prev_log_index + args.entries.len();
                             }
                         }
+                    }
+
+                    if success && args.leader_commit > self.commit_index {
+                        self.commit_index = args.leader_commit.min(self.log.len() - 1 + self.last_included_index);
+                        self.apply_logs();
                     }
                 }
                 RpcMessage::AppendEntriesResponse(AppendEntriesReply {
@@ -476,14 +656,44 @@ impl RaftNode {
                 // Leader receives this - could update next_index/match_index here
                 RpcMessage::AppendEntriesResponse(reply)
             }
+            RpcMessage::InstallSnapshot(args) => {
+                if args.term >= self.current_term {
+                    self.current_term = args.term;
+                    self.save_term();
+                    
+                    self.role = Role::Follower;
+                    self.current_leader = Some(args.leader_id);
+                    self.last_election_time = Instant::now();
+                    
+                    // Only install if snapshot is newer than our current state
+                    if args.last_included_index > self.last_included_index {
+                        let snapshot = Snapshot {
+                            last_included_index: args.last_included_index,
+                            last_included_term: args.last_included_term,
+                            data: args.data,
+                        };
+                        self.install_snapshot(snapshot);
+                    }
+                }
+                RpcMessage::InstallSnapshotResponse(InstallSnapshotReply {
+                    term: self.current_term,
+                })
+            }
+            RpcMessage::InstallSnapshotResponse(_reply) => {
+                // Leader receives this - snapshot transfer completed
+                RpcMessage::InstallSnapshotResponse(_reply)
+            }
         }
     }
 
     fn apply_logs(&mut self) {
         while self.commit_index > self.last_applied {
             self.last_applied += 1;
-            let command = &self.log[self.last_applied].command;
-            self.apply_command(command);
+            let log_index = self.last_applied - self.last_included_index;
+            if log_index < self.log.len() {
+                let command = &self.log[log_index].command;
+                self.apply_command(command);
+            }
         }
     }
 
