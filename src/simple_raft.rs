@@ -172,7 +172,7 @@ impl RaftNode {
             current_leader_address: None,
             last_included_index,
             last_included_term,
-            election_timeout: Duration::from_millis(rand::thread_rng().gen_range(1500..3000)),
+            election_timeout: Duration::from_millis(rand::rng().random_range(1500..3000)),
             last_election_time: Instant::now(),
             inbox,
             self_tx,
@@ -364,7 +364,7 @@ impl RaftNode {
         
         self.votes_received = 1;
         self.last_election_time = Instant::now();
-        self.election_timeout = Duration::from_millis(rand::thread_rng().gen_range(1500..3000));
+        self.election_timeout = Duration::from_millis(rand::rng().random_range(1500..3000));
         
         println!("Node {} starting election for term {}", self.id, self.current_term);
 
@@ -679,30 +679,29 @@ impl RaftNode {
                     } else {
                         // Normal case
                         let prev_log_index_local = args.prev_log_index - self.last_included_index;
-                        if prev_log_index_local < self.log.len() {
-                            if self.log[prev_log_index_local].term == args.prev_log_term {
-                                success = true;
+                        if prev_log_index_local < self.log.len() 
+                            && self.log[prev_log_index_local].term == args.prev_log_term {
+                            success = true;
+                            
+                            for (i, entry) in args.entries.iter().enumerate() {
+                                let absolute_index = args.prev_log_index + 1 + i;
+                                let log_index = absolute_index - self.last_included_index;
                                 
-                                for (i, entry) in args.entries.iter().enumerate() {
-                                    let absolute_index = args.prev_log_index + 1 + i;
-                                    let log_index = absolute_index - self.last_included_index;
-                                    
-                                    if log_index < self.log.len() {
-                                        if self.log[log_index].term != entry.term {
-                                            self.log.truncate(log_index);
-                                            self.delete_log_entries_from(absolute_index);
-                                            
-                                            self.log.push(entry.clone());
-                                            self.save_log_entry(absolute_index, entry);
-                                        }
-                                    } else {
+                                if log_index < self.log.len() {
+                                    if self.log[log_index].term != entry.term {
+                                        self.log.truncate(log_index);
+                                        self.delete_log_entries_from(absolute_index);
+                                        
                                         self.log.push(entry.clone());
                                         self.save_log_entry(absolute_index, entry);
                                     }
+                                } else {
+                                    self.log.push(entry.clone());
+                                    self.save_log_entry(absolute_index, entry);
                                 }
-                                
-                                match_index = args.prev_log_index + args.entries.len();
                             }
+                            
+                            match_index = args.prev_log_index + args.entries.len();
                         }
                     }
 

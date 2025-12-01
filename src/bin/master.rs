@@ -105,10 +105,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_vote(args: RequestVoteArgs, tx: tokio::sync::mpsc::Sender<Event>) -> Result<impl warp::Reply, warp::Rejection> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if let Err(_) = tx.send(Event::Rpc {
+    if tx.send(Event::Rpc {
         msg: RpcMessage::RequestVote(args),
         reply_tx: Some(reply_tx),
-    }).await {
+    }).await.is_err() {
         return Err(warp::reject::custom(InternalError));
     }
     
@@ -120,10 +120,10 @@ async fn handle_vote(args: RequestVoteArgs, tx: tokio::sync::mpsc::Sender<Event>
 
 async fn handle_append(args: AppendEntriesArgs, tx: tokio::sync::mpsc::Sender<Event>) -> Result<impl warp::Reply, warp::Rejection> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if let Err(_) = tx.send(Event::Rpc {
+    if tx.send(Event::Rpc {
         msg: RpcMessage::AppendEntries(args),
         reply_tx: Some(reply_tx),
-    }).await {
+    }).await.is_err() {
         return Err(warp::reject::custom(InternalError));
     }
     
@@ -135,10 +135,10 @@ async fn handle_append(args: AppendEntriesArgs, tx: tokio::sync::mpsc::Sender<Ev
 
 async fn handle_snapshot(args: InstallSnapshotArgs, tx: tokio::sync::mpsc::Sender<Event>) -> Result<impl warp::Reply, warp::Rejection> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if let Err(_) = tx.send(Event::Rpc {
+    if tx.send(Event::Rpc {
         msg: RpcMessage::InstallSnapshot(args),
         reply_tx: Some(reply_tx),
-    }).await {
+    }).await.is_err() {
         return Err(warp::reject::custom(InternalError));
     }
     
