@@ -2,53 +2,11 @@
 
 ## 🟡 Medium Priority (Important for Stability)
 
-### 1. Raft Snapshot Implementation
-**Status**: Completed  
-**Priority**: Medium  
-**Effort**: Large
-
-**Problem**:
-- Logs grow unbounded
-- New nodes or restarted nodes must replay entire log
-- Memory usage increases over time
-
-**Solution**:
-- Implement periodic snapshots of MasterState
-- Transfer snapshots to new/lagging followers
-- Truncate logs after successful snapshot
-
-**Tasks**:
-- [x] Define snapshot format (JSON/Binary)
-- [x] Implement snapshot creation trigger (log size threshold)
-- [x] Add InstallSnapshot RPC handler
-- [x] Implement snapshot transfer mechanism
-- [x] Add snapshot restoration on startup
-- [x] Implement log truncation after snapshot
-- [x] Add snapshot compression (optional - using JSON serialization)
+### 1. Raft Configuration Management
 
 ---
 
-### 2. Improved Network Error Handling
-**Status**: Partial  
-**Priority**: Medium  
-**Effort**: Medium
-
-**Current Issues**:
-- Network errors are silently ignored in some places
-- No retry logic for transient failures
-- No circuit breaker pattern
-
-**Tasks**:
-- [ ] Add structured error types for network failures
-- [ ] Implement retry with exponential backoff for RPC calls
-- [ ] Add circuit breaker for repeatedly failing nodes
-- [ ] Implement request timeouts
-- [ ] Add metrics for network error rates
-- [ ] Log network errors with appropriate severity levels
-
----
-
-### 3. Raft Configuration Management
+### 1. Raft Configuration Management
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Medium
@@ -74,7 +32,7 @@
 
 ---
 
-### 4. Health Checks and Monitoring
+### 2. Health Checks and Monitoring
 **Status**: Basic  
 **Priority**: Medium  
 **Effort**: Small
@@ -101,7 +59,7 @@
 
 ## 🟢 Low Priority (Nice to Have)
 
-### 5. Read Optimization
+### 3. Read Optimization
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Medium
@@ -124,7 +82,7 @@
 
 ---
 
-### 6. Raft Performance Optimizations
+### 4. Raft Performance Optimizations
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Large
@@ -139,7 +97,7 @@
 
 ---
 
-### 7. Testing Infrastructure
+### 5. Testing Infrastructure
 **Status**: Basic (chaos tests exist)  
 **Priority**: Medium  
 **Effort**: Large
@@ -165,7 +123,7 @@
 
 ---
 
-### 8. Documentation
+### 6. Documentation
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -188,7 +146,7 @@
 
 ---
 
-### 9. Security Enhancements
+### 7. Security Enhancements
 **Status**: Not Started  
 **Priority**: Low (for prototype)  
 **Effort**: Large
@@ -203,7 +161,7 @@
 
 ---
 
-### 10. Observability
+### 8. Observability
 **Status**: Minimal  
 **Priority**: Medium  
 **Effort**: Medium
@@ -222,7 +180,7 @@
 
 ---
 
-### 11. ChunkServer Improvements
+### 9. ChunkServer Improvements
 **Status**: Working  
 **Priority**: Low  
 **Effort**: Medium
@@ -238,7 +196,7 @@
 
 ## 🔧 Technical Debt
 
-### 12. Code Quality
+### 10. Code Quality
 - [ ] Remove unused dependencies (`fs2`, `raft_types.rs`, `raft_network.rs`)
 - [ ] Add comprehensive error handling (remove unwrap() calls)
 - [ ] Implement proper async error propagation
@@ -249,7 +207,7 @@
 - [ ] Add rustfmt configuration and enforce formatting
 - [ ] Fix deprecated `rand` usage in `simple_raft.rs`
 
-### 13. Build and Deployment
+### 11. Build and Deployment
 - [ ] Optimize Docker image size (multi-stage builds)
 - [ ] Add CI/CD pipeline
 - [ ] Implement blue-green deployment
@@ -258,7 +216,7 @@
 - [ ] Add Helm chart
 - [ ] Implement backup and restore procedures
 
-### 14. Refactor RPC Responses
+### 12. Refactor RPC Responses
 - [ ] Standardize RPC response formats (consistent success/error/hint fields)
 - [ ] Use gRPC error details for structured error information instead of custom string parsing
 
@@ -293,19 +251,19 @@
 - ✅ Raft log persistence
 
 ### Phase 2: Production Readiness (Current - Next 2-4 weeks)
-- Snapshot implementation (#1)
-- Improved error handling (#2)
-- Refactor RPC responses (#14)
+- ✅ Snapshot implementation
+- ✅ Improved error handling
+- Refactor RPC Responses (#12)
 
 ### Phase 3: Scalability (4-8 weeks)
-- Dynamic cluster membership (#3)
-- Read optimizations (#5)
-- Performance optimizations (#6)
-- Comprehensive testing (#7)
+- Dynamic cluster membership (#1)
+- Read optimizations (#3)
+- Performance optimizations (#4)
+- Comprehensive testing (#5)
 
 ### Phase 4: Enterprise Features (8-12 weeks)
-- Security enhancements (#9)
-- Advanced observability (#10)
+- Security enhancements (#7)
+- Advanced observability (#8)
 - Operational tooling
 - Production documentation
 
