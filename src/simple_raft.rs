@@ -293,7 +293,15 @@ impl RaftNode {
         drop(state);
         
         // Save snapshot metadata
-        let meta = (self.last_applied, self.log[self.last_applied - self.last_included_index].term);
+        // Save snapshot metadata
+        let term = if self.last_applied >= self.last_included_index {
+            let index = self.last_applied - self.last_included_index;
+            self.log.get(index).map(|e| e.term).unwrap_or(self.last_included_term)
+        } else {
+            eprintln!("Warning: last_applied {} < last_included_index {} during snapshot creation", self.last_applied, self.last_included_index);
+            self.last_included_term
+        };
+        let meta = (self.last_applied, term);
         let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
         self.db.put(b"snapshot_meta", meta_bytes).expect("Failed to save snapshot metadata to DB");
         
