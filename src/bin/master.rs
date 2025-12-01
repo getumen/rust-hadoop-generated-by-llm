@@ -20,6 +20,9 @@ struct Args {
 
     #[arg(long, default_value = "8080")]
     http_port: u16,
+
+    #[arg(long)]
+    advertise_addr: Option<String>,
 }
 
 #[derive(Debug)]
@@ -30,10 +33,12 @@ impl warp::reject::Reject for InternalError {}
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = args.addr.parse()?;
+    let advertise_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
     
     println!("Master node {} starting...", args.id);
     println!("Peers: {:?}", args.peers);
     println!("HTTP Port: {}", args.http_port);
+    println!("Advertise Addr: {}", advertise_addr);
 
     let state = Arc::new(Mutex::new(MasterState::default()));
     let (raft_tx, raft_rx) = tokio::sync::mpsc::channel(100);
@@ -42,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_tx_for_server = raft_tx.clone();
     let raft_tx_for_master = raft_tx.clone();
 
-    let mut raft_node = RaftNode::new(args.id, args.peers.clone(), state.clone(), raft_rx, raft_tx_for_node);
+    let mut raft_node = RaftNode::new(args.id, args.peers.clone(), advertise_addr, state.clone(), raft_rx, raft_tx_for_node);
     
     // Start Raft Node
     tokio::spawn(async move {

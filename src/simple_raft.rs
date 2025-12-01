@@ -56,6 +56,7 @@ pub struct AppendEntriesArgs {
     pub prev_log_term: u64,
     pub entries: Vec<LogEntry>,
     pub leader_commit: usize,
+    pub leader_address: String, // Added: Client-facing address of the leader
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,16 +73,17 @@ pub enum Event {
     },
     ClientRequest {
         command: Command,
-        reply_tx: tokio::sync::oneshot::Sender<bool>,
+        reply_tx: tokio::sync::oneshot::Sender<Result<(), Option<String>>>,
     },
     GetLeaderInfo {
-        reply_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+        reply_tx: tokio::sync::oneshot::Sender<Option<String>>, // Changed: Return address string
     },
 }
 
 pub struct RaftNode {
     pub id: usize,
     pub peers: Vec<String>,
+    pub client_address: String, // Added: My client-facing address
     pub role: Role,
     pub current_term: u64,
     pub voted_for: Option<usize>,
@@ -90,7 +92,8 @@ pub struct RaftNode {
     pub last_applied: usize,
     pub next_index: Vec<usize>,
     pub match_index: Vec<usize>,
-    pub current_leader: Option<usize>, // Track the current leader
+    pub current_leader: Option<usize>,
+    pub current_leader_address: Option<String>, // Added: Address of current leader
     
     pub election_timeout: Duration,
     pub last_election_time: Instant,
@@ -105,6 +108,7 @@ impl RaftNode {
     pub fn new(
         id: usize,
         peers: Vec<String>,
+        client_address: String,
         app_state: Arc<Mutex<MasterState>>,
         inbox: mpsc::Receiver<Event>,
         self_tx: mpsc::Sender<Event>,
@@ -114,6 +118,7 @@ impl RaftNode {
         RaftNode {
             id,
             peers,
+            client_address,
             role: Role::Follower,
             current_term: 0,
             voted_for: None,
@@ -123,6 +128,7 @@ impl RaftNode {
             next_index: vec![],
             match_index: vec![],
             current_leader: None,
+            current_leader_address: None,
             election_timeout: Duration::from_millis(rand::thread_rng().gen_range(1500..3000)),
             last_election_time: Instant::now(),
             inbox,
@@ -217,6 +223,7 @@ impl RaftNode {
         println!("Node {} becoming LEADER for term {}", self.id, self.current_term);
         self.role = Role::Leader;
         self.current_leader = Some(self.id);
+        self.current_leader_address = Some(self.client_address.clone());
         self.next_index = vec![self.log.len(); self.peers.len()];
         self.match_index = vec![0; self.peers.len()];
     }
@@ -239,6 +246,7 @@ impl RaftNode {
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
+                leader_address: self.client_address.clone(),
             };
 
             let url = format!("{}/raft/append", peer);
@@ -271,7 +279,7 @@ impl RaftNode {
             }
             Event::ClientRequest { command, reply_tx } => {
                 if self.role != Role::Leader {
-                    let _ = reply_tx.send(false);
+                    let _ = reply_tx.send(Err(self.current_leader_address.clone()));
                     return;
                 }
                 
@@ -283,10 +291,10 @@ impl RaftNode {
                 self.commit_index = self.log.len() - 1;
                 self.apply_logs();
                 
-                let _ = reply_tx.send(true);
+                let _ = reply_tx.send(Ok(()));
             }
             Event::GetLeaderInfo { reply_tx } => {
-                let _ = reply_tx.send(self.current_leader);
+                let _ = reply_tx.send(self.current_leader_address.clone());
             }
         }
     }
@@ -300,6 +308,8 @@ impl RaftNode {
                         self.current_term = args.term;
                         self.role = Role::Follower;
                         self.voted_for = None;
+                        self.current_leader = None;
+                        self.current_leader_address = None;
                     }
                     
                     if (self.voted_for.is_none() || self.voted_for == Some(args.candidate_id))
@@ -326,6 +336,8 @@ impl RaftNode {
                     self.current_term = reply.term;
                     self.role = Role::Follower;
                     self.voted_for = None;
+                    self.current_leader = None;
+                    self.current_leader_address = None;
                 }
                 RpcMessage::RequestVoteResponse(reply)
             }
@@ -337,6 +349,7 @@ impl RaftNode {
                     self.current_term = args.term;
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
+                    self.current_leader_address = Some(args.leader_address.clone());
                     self.last_election_time = Instant::now();
                     
                     if args.prev_log_index < self.log.len() {

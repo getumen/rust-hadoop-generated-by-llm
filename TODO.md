@@ -2,57 +2,7 @@
 
 ## 🔴 High Priority (Critical for Production)
 
-### 1. CLI Leader Discovery & Retry Logic
-**Status**: Completed  
-**Priority**: Critical  
-**Effort**: Medium
-
-**Problem**: 
-- CLI connects to the first available Master but doesn't retry if that Master is not the Leader
-- Users get "Not Leader" errors and operations fail
-
-**Solution**:
-- Implemented retry logic in `dfs_cli.rs`
-- Added exponential backoff
-- Added CLI arguments for max retries and backoff
-
-**Tasks**:
-- [x] Add retry logic for all write operations (create_file, allocate_block)
-- [x] Implement exponential backoff for retries
-- [x] Add timeout configuration
-- [x] Update CLI help text with retry behavior documentation
-
----
-
-### 2. Leader Information Propagation
-**Status**: Not Started  
-**Priority**: High  
-**Effort**: Small
-
-**Problem**:
-- Followers return "Not Leader" but don't tell clients who the Leader is
-- Clients must try all Masters sequentially
-
-**Solution**:
-- Modify `CreateFileResponse` and `AllocateBlockResponse` to include optional `leader_hint` field
-- Update proto definitions:
-```protobuf
-message CreateFileResponse {
-    bool success = 1;
-    string error_message = 2;
-    string leader_hint = 3;  // Add this
-}
-```
-
-**Tasks**:
-- [ ] Update `proto/dfs.proto` with leader_hint fields
-- [ ] Modify Master service to include current leader in error responses
-- [ ] Update CLI to use leader_hint for faster failover
-- [ ] Add leader discovery cache in CLI
-
----
-
-### 3. Raft Log Persistence
+### 1. Raft Log Persistence
 **Status**: Not Started  
 **Priority**: Critical  
 **Effort**: Large
@@ -86,7 +36,7 @@ message CreateFileResponse {
 
 ## 🟡 Medium Priority (Important for Stability)
 
-### 4. Raft Snapshot Implementation
+### 2. Raft Snapshot Implementation
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Large
@@ -112,7 +62,7 @@ message CreateFileResponse {
 
 ---
 
-### 5. Improved Network Error Handling
+### 3. Improved Network Error Handling
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -132,7 +82,7 @@ message CreateFileResponse {
 
 ---
 
-### 6. Raft Configuration Management
+### 4. Raft Configuration Management
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Medium
@@ -158,7 +108,7 @@ message CreateFileResponse {
 
 ---
 
-### 7. Health Checks and Monitoring
+### 5. Health Checks and Monitoring
 **Status**: Basic  
 **Priority**: Medium  
 **Effort**: Small
@@ -185,7 +135,7 @@ message CreateFileResponse {
 
 ## 🟢 Low Priority (Nice to Have)
 
-### 8. Read Optimization
+### 6. Read Optimization
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Medium
@@ -208,7 +158,7 @@ message CreateFileResponse {
 
 ---
 
-### 9. Raft Performance Optimizations
+### 7. Raft Performance Optimizations
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Large
@@ -223,7 +173,7 @@ message CreateFileResponse {
 
 ---
 
-### 10. Testing Infrastructure
+### 8. Testing Infrastructure
 **Status**: Basic (chaos tests exist)  
 **Priority**: Medium  
 **Effort**: Large
@@ -249,7 +199,7 @@ message CreateFileResponse {
 
 ---
 
-### 11. Documentation
+### 9. Documentation
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -272,7 +222,7 @@ message CreateFileResponse {
 
 ---
 
-### 12. Security Enhancements
+### 10. Security Enhancements
 **Status**: Not Started  
 **Priority**: Low (for prototype)  
 **Effort**: Large
@@ -287,7 +237,7 @@ message CreateFileResponse {
 
 ---
 
-### 13. Observability
+### 11. Observability
 **Status**: Minimal  
 **Priority**: Medium  
 **Effort**: Medium
@@ -306,7 +256,7 @@ message CreateFileResponse {
 
 ---
 
-### 14. ChunkServer Improvements
+### 12. ChunkServer Improvements
 **Status**: Working  
 **Priority**: Low  
 **Effort**: Medium
@@ -322,7 +272,7 @@ message CreateFileResponse {
 
 ## 🔧 Technical Debt
 
-### 15. Code Quality
+### 13. Code Quality
 - [ ] Remove unused dependencies (`fs2`, `raft_types.rs`, `raft_network.rs`)
 - [ ] Add comprehensive error handling (remove unwrap() calls)
 - [ ] Implement proper async error propagation
@@ -331,8 +281,9 @@ message CreateFileResponse {
 - [ ] Add code comments for complex logic
 - [ ] Run clippy and fix all warnings
 - [ ] Add rustfmt configuration and enforce formatting
+- [ ] Fix deprecated `rand` usage in `simple_raft.rs`
 
-### 16. Build and Deployment
+### 14. Build and Deployment
 - [ ] Optimize Docker image size (multi-stage builds)
 - [ ] Add CI/CD pipeline
 - [ ] Implement blue-green deployment
@@ -340,6 +291,10 @@ message CreateFileResponse {
 - [ ] Create Kubernetes manifests
 - [ ] Add Helm chart
 - [ ] Implement backup and restore procedures
+
+### 15. Refactor RPC Responses
+- [ ] Standardize RPC response formats (consistent success/error/hint fields)
+- [ ] Use gRPC error details for structured error information instead of custom string parsing
 
 ---
 
@@ -367,23 +322,24 @@ message CreateFileResponse {
 - ✅ Leader election
 - ✅ Log replication
 - ✅ Basic chaos testing
+- ✅ CLI retry logic
+- ✅ Leader information propagation
 
 ### Phase 2: Production Readiness (Next 2-4 weeks)
-- CLI retry logic (#1)
-- Leader information propagation (#2)
-- Raft log persistence (#3)
-- Snapshot implementation (#4)
-- Improved error handling (#5)
+- Raft log persistence (#1)
+- Snapshot implementation (#2)
+- Improved error handling (#3)
+- Refactor RPC responses (#15)
 
 ### Phase 3: Scalability (4-8 weeks)
-- Dynamic cluster membership (#6)
-- Read optimizations (#8)
-- Performance optimizations (#9)
-- Comprehensive testing (#10)
+- Dynamic cluster membership (#4)
+- Read optimizations (#6)
+- Performance optimizations (#7)
+- Comprehensive testing (#8)
 
 ### Phase 4: Enterprise Features (8-12 weeks)
-- Security enhancements (#12)
-- Advanced observability (#13)
+- Security enhancements (#10)
+- Advanced observability (#11)
 - Operational tooling
 - Production documentation
 
@@ -396,5 +352,5 @@ message CreateFileResponse {
 - Some tasks can be parallelized
 - Security features are marked low priority for prototype but would be critical for production
 
-**Last Updated**: 2025-11-30
+**Last Updated**: 2025-12-01
 **Maintainer**: Development Team

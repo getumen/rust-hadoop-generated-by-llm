@@ -73,7 +73,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let create_req = tonic::Request::new(CreateFileRequest {
                         path: dest,
                     });
-                    client.create_file(create_req).await
+                    let response = client.create_file(create_req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!("Not Leader|{}", inner.leader_hint)));
+                    }
+                    Ok(response)
                 }
             }).await?.into_inner();
 
@@ -94,7 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let alloc_req = tonic::Request::new(AllocateBlockRequest {
                         path: dest,
                     });
-                    client.allocate_block(alloc_req).await
+                    let response = client.allocate_block(alloc_req).await?;
+                    let inner = response.get_ref();
+                    if inner.block.is_none() {
+                         return Err(tonic::Status::unavailable(format!("Not Leader|{}", inner.leader_hint)));
+                    }
+                    Ok(response)
                 }
             }).await?.into_inner();
 
@@ -204,10 +214,27 @@ where
 {
     let mut attempt = 0;
     let mut backoff = Duration::from_millis(initial_backoff_ms);
+    let mut leader_hint: Option<String> = None;
 
     loop {
         attempt += 1;
-        for master_addr in masters {
+        
+        let mut targets = if let Some(hint) = leader_hint.take() {
+            let mut t = vec![hint];
+            // Add original masters as fallback, avoiding duplicates if possible, but simple append is fine for now
+            t.extend_from_slice(masters);
+            t
+        } else {
+            masters.to_vec()
+        };
+
+        // Remove duplicates to avoid trying same server multiple times in one attempt
+        targets.sort();
+        targets.dedup();
+
+        for master_addr in targets {
+            if master_addr.is_empty() { continue; }
+
             let client = match MasterServiceClient::connect(master_addr.clone()).await {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -217,7 +244,17 @@ where
             match f(client).await {
                 Ok(res) => return Ok(res),
                 Err(status) => {
-                    if status.message().contains("Not Leader") || status.code() == tonic::Code::Unavailable {
+                    let msg = status.message();
+                    if msg.starts_with("Not Leader|") {
+                        let parts: Vec<&str> = msg.split('|').collect();
+                        if parts.len() > 1 && !parts[1].is_empty() {
+                            leader_hint = Some(parts[1].to_string());
+                            eprintln!("Received leader hint: {}", parts[1]);
+                            break; // Break inner loop to retry immediately with hint
+                        }
+                    }
+                    
+                    if msg.contains("Not Leader") || status.code() == tonic::Code::Unavailable {
                         continue;
                     }
                     return Err(Box::new(status));
@@ -229,9 +266,15 @@ where
             break;
         }
         
-        eprintln!("No leader found, retrying in {:?}...", backoff);
-        sleep(backoff).await;
-        backoff = std::cmp::min(backoff * 2, Duration::from_secs(5));
+        // If we have a hint, we might want to skip backoff or reduce it?
+        // For now, keep backoff to avoid hot loop if hint is wrong.
+        if leader_hint.is_some() {
+             eprintln!("Retrying with leader hint...");
+        } else {
+             eprintln!("No leader found, retrying in {:?}...", backoff);
+             sleep(backoff).await;
+             backoff = std::cmp::min(backoff * 2, Duration::from_secs(5));
+        }
     }
     
     Err("No available leader found after retries".into())
