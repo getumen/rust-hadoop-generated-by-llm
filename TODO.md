@@ -1,12 +1,75 @@
 # Rust Hadoop DFS - TODO List
 
-## 🟡 Medium Priority (Important for Stability)
+## � High Priority (Critical for Production)
 
-### 1. Raft Configuration Management
+### 1. Data Integrity (Checksumming)
+**Status**: Not Started
+**Priority**: High
+**Effort**: Medium
+
+**Problem**:
+- No detection of bit rot or disk corruption
+- Data corruption is silently propagated
+
+**Solution**:
+- Implement CRC32C checksums for each 512-byte chunk
+- Store checksums alongside block data
+- Verify checksums on read and during background scrubbing
+
+**Tasks**:
+- [ ] Define checksum format and storage layout
+- [ ] Implement checksum calculation on write
+- [ ] Implement checksum verification on read
+- [ ] Add background block scanner (scrubber)
+- [ ] Handle checksum errors (trigger replication from healthy replica)
 
 ---
 
-### 1. Raft Configuration Management
+### 2. ChunkServer Liveness (Lease-based)
+**Status**: Working
+**Priority**: High
+**Effort**: Medium
+
+**Potential Improvements**:
+- [ ] Implement Lease-based Liveness Check (etcd-style)
+  - [ ] Add `GrantLease`, `KeepAlive` RPCs
+  - [ ] Implement Lease manager in Master
+  - [ ] Implement KeepAlive loop in ChunkServer
+- [ ] Implement ChunkServer heartbeat to all Masters
+- [ ] Add ChunkServer re-registration on Master failover
+- [ ] Implement ChunkServer load balancing
+- [ ] Add ChunkServer health scoring
+- [ ] Implement automatic replica rebalancing (Balancer)
+
+---
+
+## 🟡 Medium Priority (Important for Stability)
+
+### 3. Safe Mode
+**Status**: Not Started
+**Priority**: Medium
+**Effort**: Medium
+
+**Problem**:
+- Cluster accepts writes immediately upon startup
+- Risk of unnecessary replication before all ChunkServers register
+- Incomplete view of cluster state during startup
+
+**Solution**:
+- Implement Safe Mode state in Master
+- Block write operations during Safe Mode
+- Exit Safe Mode only when threshold of blocks are reported
+
+**Tasks**:
+- [ ] Implement Safe Mode state machine
+- [ ] Add block reporting threshold logic (e.g., 99% of blocks reported)
+- [ ] Block modification RPCs during Safe Mode
+- [ ] Add CLI command to manually enter/leave Safe Mode
+- [ ] Show Safe Mode status in web UI/metrics
+
+---
+
+### 4. Raft Configuration Management
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Medium
@@ -32,7 +95,7 @@
 
 ---
 
-### 2. Health Checks and Monitoring
+### 5. Health Checks and Monitoring
 **Status**: Basic  
 **Priority**: Medium  
 **Effort**: Small
@@ -59,7 +122,7 @@
 
 ## 🟢 Low Priority (Nice to Have)
 
-### 3. Read Optimization
+### 6. Read Optimization
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Medium
@@ -82,7 +145,7 @@
 
 ---
 
-### 4. Raft Performance Optimizations
+### 7. Raft Performance Optimizations
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Large
@@ -97,7 +160,7 @@
 
 ---
 
-### 5. Testing Infrastructure
+### 8. Testing Infrastructure
 **Status**: Basic (chaos tests exist)  
 **Priority**: Medium  
 **Effort**: Large
@@ -123,7 +186,7 @@
 
 ---
 
-### 6. Documentation
+### 9. Documentation
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -146,7 +209,7 @@
 
 ---
 
-### 7. Security Enhancements
+### 10. Security Enhancements
 **Status**: Not Started  
 **Priority**: Low (for prototype)  
 **Effort**: Large
@@ -161,7 +224,7 @@
 
 ---
 
-### 8. Observability
+### 11. Observability
 **Status**: Minimal  
 **Priority**: Medium  
 **Effort**: Medium
@@ -180,23 +243,70 @@
 
 ---
 
-### 9. ChunkServer Improvements
-**Status**: Working  
-**Priority**: Low  
+### 12. ChunkServer Improvements
+**Status**: Working
+**Priority**: High
 **Effort**: Medium
 
 **Potential Improvements**:
+- [ ] Implement Lease-based Liveness Check (etcd-style)
+  - [ ] Add `GrantLease`, `KeepAlive` RPCs
+  - [ ] Implement Lease manager in Master
+  - [ ] Implement KeepAlive loop in ChunkServer
 - [ ] Implement ChunkServer heartbeat to all Masters
 - [ ] Add ChunkServer re-registration on Master failover
 - [ ] Implement ChunkServer load balancing
 - [ ] Add ChunkServer health scoring
-- [ ] Implement automatic replica rebalancing
+- [ ] Implement automatic replica rebalancing (Balancer)
+
+---
+
+### 13. Rack Awareness
+**Status**: Not Started
+**Priority**: Low
+**Effort**: Medium
+
+**Problem**:
+- Replicas might be placed on the same rack (SPOF)
+- No awareness of network topology
+
+**Solution**:
+- Implement rack-aware replica placement policy
+- Configurable topology script (like Hadoop)
+
+**Tasks**:
+- [ ] Add rack configuration to ChunkServer registration
+- [ ] Implement topology mapping logic in Master
+- [ ] Update block placement policy (1 local, 1 remote rack, 1 same remote rack)
+- [ ] Add rack awareness to Balancer
+
+---
+
+### 14. Storage Efficiency (Erasure Coding)
+**Status**: Not Started
+**Priority**: Low
+**Effort**: Large
+
+**Problem**:
+- 3x Replication consumes 300% storage overhead
+- Cost inefficient for cold data
+
+**Solution**:
+- Implement Reed-Solomon Erasure Coding (e.g., 6+3 or 10+4)
+- Reduce storage overhead to 1.5x or 1.4x while maintaining durability
+
+**Tasks**:
+- [ ] Research Rust Erasure Coding libraries (e.g., `reed-solomon-erasure`)
+- [ ] Implement EC encoding/decoding logic in ChunkServer
+- [ ] Update Master to handle EC block placement
+- [ ] Implement background encoding for cold files
+- [ ] Add reconstruction logic for failed EC blocks
 
 ---
 
 ## 🔧 Technical Debt
 
-### 10. Code Quality
+### 15. Code Quality
 - [ ] Remove unused dependencies (`fs2`, `raft_types.rs`, `raft_network.rs`)
 - [ ] Add comprehensive error handling (remove unwrap() calls)
 - [ ] Implement proper async error propagation
@@ -207,7 +317,7 @@
 - [ ] Add rustfmt configuration and enforce formatting
 - [ ] Fix deprecated `rand` usage in `simple_raft.rs`
 
-### 11. Build and Deployment
+### 16. Build and Deployment
 - [ ] Optimize Docker image size (multi-stage builds)
 - [ ] Add CI/CD pipeline
 - [ ] Implement blue-green deployment
@@ -216,7 +326,7 @@
 - [ ] Add Helm chart
 - [ ] Implement backup and restore procedures
 
-### 12. Refactor RPC Responses
+### 17. Refactor RPC Responses
 - [ ] Standardize RPC response formats (consistent success/error/hint fields)
 - [ ] Use gRPC error details for structured error information instead of custom string parsing
 
@@ -253,17 +363,22 @@
 ### Phase 2: Production Readiness (Current - Next 2-4 weeks)
 - ✅ Snapshot implementation
 - ✅ Improved error handling
-- Refactor RPC Responses (#12)
+- ChunkServer Liveness (Lease-based) (#2)
+- Data Integrity (#1)
+- Refactor RPC Responses (#16)
 
 ### Phase 3: Scalability (4-8 weeks)
-- Dynamic cluster membership (#1)
-- Read optimizations (#3)
-- Performance optimizations (#4)
-- Comprehensive testing (#5)
+- Safe Mode (#3)
+- Dynamic cluster membership (#4)
+- Read optimizations (#9)
+- Performance optimizations (#10)
+- Comprehensive testing (#6)
+- Storage Efficiency (Erasure Coding) (#13)
 
 ### Phase 4: Enterprise Features (8-12 weeks)
-- Security enhancements (#7)
-- Advanced observability (#8)
+- Security enhancements (#10)
+- Advanced observability (#11)
+- Rack Awareness (#13)
 - Operational tooling
 - Production documentation
 
