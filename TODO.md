@@ -1,6 +1,6 @@
 # Rust Hadoop DFS - TODO List
 
-## � High Priority (Critical for Production)
+## 🔴 High Priority (Critical for Production)
 
 ### 1. Data Integrity (Checksumming)
 **Status**: Not Started

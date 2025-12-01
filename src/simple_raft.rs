@@ -185,24 +185,49 @@ impl RaftNode {
 
     fn load_state(db: &DB, app_state: &Arc<Mutex<MasterState>>) -> (u64, Option<usize>, Vec<LogEntry>, usize, u64) {
         let term = match db.get(b"term") {
-            Ok(Some(val)) => u64::from_be_bytes(val.try_into().unwrap()),
+            Ok(Some(val)) => match val.try_into() {
+                Ok(bytes) => u64::from_be_bytes(bytes),
+                Err(_) => {
+                    eprintln!("Error: Corrupted term data in DB");
+                    0
+                }
+            },
             _ => 0,
         };
         let voted_for = match db.get(b"vote") {
-            Ok(Some(val)) => Some(usize::from_be_bytes(val.try_into().unwrap())),
+            Ok(Some(val)) => match val.try_into() {
+                Ok(bytes) => Some(usize::from_be_bytes(bytes)),
+                Err(_) => {
+                    eprintln!("Error: Corrupted vote data in DB");
+                    None
+                }
+            },
             _ => None,
         };
         
         // Load snapshot if exists
         let (last_included_index, last_included_term) = match db.get(b"snapshot_meta") {
             Ok(Some(val)) => {
-                let meta: (usize, u64) = serde_json::from_slice(&val).unwrap();
-                // Load snapshot data and restore app state
-                if let Ok(Some(snapshot_data)) = db.get(b"snapshot_data") {
-                    let state: MasterState = serde_json::from_slice(&snapshot_data).unwrap();
-                    *app_state.lock().unwrap() = state;
+                match serde_json::from_slice::<(usize, u64)>(&val) {
+                    Ok(meta) => {
+                        // Load snapshot data and restore app state
+                        if let Ok(Some(snapshot_data)) = db.get(b"snapshot_data") {
+                            match serde_json::from_slice::<MasterState>(&snapshot_data) {
+                                Ok(state) => {
+                                    *app_state.lock().unwrap() = state;
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: Failed to deserialize snapshot data: {}", e);
+                                }
+                            }
+                        }
+                        meta
+                    }
+                    Err(e) => {
+                        eprintln!("Error: Failed to deserialize snapshot metadata: {}", e);
+                        (0, 0)
+                    }
                 }
-                meta
             }
             _ => (0, 0),
         };
@@ -213,9 +238,16 @@ impl RaftNode {
             let key = format!("log:{}", index);
             match db.get(key.as_bytes()) {
                 Ok(Some(val)) => {
-                    let entry: LogEntry = serde_json::from_slice(&val).unwrap();
-                    log.push(entry);
-                    index += 1;
+                    match serde_json::from_slice::<LogEntry>(&val) {
+                        Ok(entry) => {
+                            log.push(entry);
+                            index += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("Error: Failed to deserialize log entry at index {}: {}", index, e);
+                            break;
+                        }
+                    }
                 }
                 _ => break,
             }
@@ -225,31 +257,31 @@ impl RaftNode {
     }
 
     fn save_term(&self) {
-        self.db.put(b"term", self.current_term.to_be_bytes()).unwrap();
+        self.db.put(b"term", self.current_term.to_be_bytes()).expect("Failed to save term to DB");
     }
 
     fn save_vote(&self) {
         if let Some(vote) = self.voted_for {
-            self.db.put(b"vote", vote.to_be_bytes()).unwrap();
+            self.db.put(b"vote", vote.to_be_bytes()).expect("Failed to save vote to DB");
         } else {
-            self.db.delete(b"vote").unwrap();
+            self.db.delete(b"vote").expect("Failed to delete vote from DB");
         }
     }
 
     fn save_log_entry(&self, index: usize, entry: &LogEntry) {
         let key = format!("log:{}", index);
-        let val = serde_json::to_vec(entry).unwrap();
-        self.db.put(key.as_bytes(), val).unwrap();
+        let val = serde_json::to_vec(entry).expect("Failed to serialize log entry");
+        self.db.put(key.as_bytes(), val).expect("Failed to save log entry to DB");
     }
 
     fn delete_log_entries_from(&self, start_index: usize) {
         let mut index = start_index;
         loop {
             let key = format!("log:{}", index);
-            if self.db.get(key.as_bytes()).unwrap().is_none() {
+            if self.db.get(key.as_bytes()).expect("Failed to read from DB").is_none() {
                 break;
             }
-            self.db.delete(key.as_bytes()).unwrap();
+            self.db.delete(key.as_bytes()).expect("Failed to delete from DB");
             index += 1;
         }
     }
@@ -257,21 +289,21 @@ impl RaftNode {
     fn create_snapshot(&mut self) {
         // Serialize current app state
         let state = self.app_state.lock().unwrap();
-        let snapshot_data = serde_json::to_vec(&*state).unwrap();
+        let snapshot_data = serde_json::to_vec(&*state).expect("Failed to serialize app state");
         drop(state);
         
         // Save snapshot metadata
         let meta = (self.last_applied, self.log[self.last_applied - self.last_included_index].term);
-        let meta_bytes = serde_json::to_vec(&meta).unwrap();
-        self.db.put(b"snapshot_meta", meta_bytes).unwrap();
+        let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
+        self.db.put(b"snapshot_meta", meta_bytes).expect("Failed to save snapshot metadata to DB");
         
         // Save snapshot data
-        self.db.put(b"snapshot_data", snapshot_data).unwrap();
+        self.db.put(b"snapshot_data", snapshot_data).expect("Failed to save snapshot data to DB");
         
         // Delete old log entries
         for i in (self.last_included_index + 1)..=self.last_applied {
             let key = format!("log:{}", i);
-            self.db.delete(key.as_bytes()).unwrap();
+            self.db.delete(key.as_bytes()).expect("Failed to delete old log entry from DB");
         }
         
         // Update snapshot metadata
@@ -291,18 +323,18 @@ impl RaftNode {
     fn install_snapshot(&mut self, snapshot: Snapshot) {
         // Save snapshot to disk
         let meta = (snapshot.last_included_index, snapshot.last_included_term);
-        let meta_bytes = serde_json::to_vec(&meta).unwrap();
-        self.db.put(b"snapshot_meta", meta_bytes).unwrap();
-        self.db.put(b"snapshot_data", &snapshot.data).unwrap();
+        let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
+        self.db.put(b"snapshot_meta", meta_bytes).expect("Failed to save snapshot metadata to DB");
+        self.db.put(b"snapshot_data", &snapshot.data).expect("Failed to save snapshot data to DB");
         
         // Restore app state
-        let state: MasterState = serde_json::from_slice(&snapshot.data).unwrap();
+        let state: MasterState = serde_json::from_slice(&snapshot.data).expect("Failed to deserialize snapshot data");
         *self.app_state.lock().unwrap() = state;
         
         // Delete old log entries
         for i in (self.last_included_index + 1)..=snapshot.last_included_index {
             let key = format!("log:{}", i);
-            self.db.delete(key.as_bytes()).unwrap();
+            self.db.delete(key.as_bytes()).expect("Failed to delete old log entry from DB");
         }
         
         // Update state
@@ -532,10 +564,10 @@ impl RaftNode {
                                 // Don't log error for heartbeats to avoid spam, unless verbose
                             }
                         }
-                        Err(_) => {
-                            // Heartbeats fail often in partitions, logging might be noisy
-                            // But for "Improved Network Error Handling", we should probably log at least on debug/warn
-                            // For now, let's log only if it's not a simple timeout
+                        }
+                        Err(e) => {
+                            // Log error for debugging
+                            eprintln!("AppendEntries failed to {}: {}", url, e);
                         }
                     }
                     
@@ -601,7 +633,7 @@ impl RaftNode {
                     }
                     
                     if (self.voted_for.is_none() || self.voted_for == Some(args.candidate_id))
-                        && args.last_log_index >= self.log.len() - 1 
+                        && args.last_log_index >= self.log.len() - 1 + self.last_included_index 
                     {
                         self.voted_for = Some(args.candidate_id);
                         self.save_vote(); // Persist vote
