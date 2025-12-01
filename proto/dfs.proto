@@ -38,6 +38,7 @@ message CreateFileRequest {
 message CreateFileResponse {
   bool success = 1;
   string error_message = 2;
+  string leader_hint = 3; // Optional hint about current leader address
 }
 
 message AllocateBlockRequest {
@@ -47,6 +48,7 @@ message AllocateBlockRequest {
 message AllocateBlockResponse {
   BlockInfo block = 1;
   repeated string chunk_server_addresses = 2;
+  string leader_hint = 3; // Optional hint about current leader address
 }
 
 message CompleteFileRequest {

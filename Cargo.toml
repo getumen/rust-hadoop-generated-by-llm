@@ -13,10 +13,10 @@ uuid = { version = "1.0", features = ["v4"] }
 clap = { version = "4.0", features = ["derive"] }
 futures = "0.3"
 bytes = "1.0"
-fs2 = "0.4.3"
-reqwest = { version = "0.12.24", features = ["json"] }
-warp = { version = "0.4.2", features = ["server"] }
-rand = "0.9.2"
+fs2 = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+warp = { version = "0.4", features = ["server"] }
+rand = "0.9"
 
 [build-dependencies]
 tonic-build = "0.12"

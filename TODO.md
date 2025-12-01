@@ -3,7 +3,7 @@
 ## 🔴 High Priority (Critical for Production)
 
 ### 1. CLI Leader Discovery & Retry Logic
-**Status**: Not Started  
+**Status**: Completed  
 **Priority**: Critical  
 **Effort**: Medium
 
@@ -12,28 +12,15 @@
 - Users get "Not Leader" errors and operations fail
 
 **Solution**:
-```rust
-// Implement retry logic in dfs_cli.rs
-async fn execute_with_retry<T>(
-    masters: &[String],
-    operation: impl Fn(&mut MasterClient) -> Future<Output = Result<T>>
-) -> Result<T> {
-    for master in masters {
-        match operation(master).await {
-            Ok(result) => return Ok(result),
-            Err(Status::Unavailable(msg)) if msg.contains("Not Leader") => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err("No available leader found")
-}
-```
+- Implemented retry logic in `dfs_cli.rs`
+- Added exponential backoff
+- Added CLI arguments for max retries and backoff
 
 **Tasks**:
-- [ ] Add retry logic for all write operations (create_file, allocate_block)
-- [ ] Implement exponential backoff for retries
-- [ ] Add timeout configuration
-- [ ] Update CLI help text with retry behavior documentation
+- [x] Add retry logic for all write operations (create_file, allocate_block)
+- [x] Implement exponential backoff for retries
+- [x] Add timeout configuration
+- [x] Update CLI help text with retry behavior documentation
 
 ---
 

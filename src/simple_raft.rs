@@ -74,6 +74,9 @@ pub enum Event {
         command: Command,
         reply_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    GetLeaderInfo {
+        reply_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+    },
 }
 
 pub struct RaftNode {
@@ -87,6 +90,7 @@ pub struct RaftNode {
     pub last_applied: usize,
     pub next_index: Vec<usize>,
     pub match_index: Vec<usize>,
+    pub current_leader: Option<usize>, // Track the current leader
     
     pub election_timeout: Duration,
     pub last_election_time: Instant,
@@ -118,6 +122,7 @@ impl RaftNode {
             last_applied: 0,
             next_index: vec![],
             match_index: vec![],
+            current_leader: None,
             election_timeout: Duration::from_millis(rand::thread_rng().gen_range(1500..3000)),
             last_election_time: Instant::now(),
             inbox,
@@ -211,6 +216,7 @@ impl RaftNode {
     fn become_leader(&mut self) {
         println!("Node {} becoming LEADER for term {}", self.id, self.current_term);
         self.role = Role::Leader;
+        self.current_leader = Some(self.id);
         self.next_index = vec![self.log.len(); self.peers.len()];
         self.match_index = vec![0; self.peers.len()];
     }
@@ -279,6 +285,9 @@ impl RaftNode {
                 
                 let _ = reply_tx.send(true);
             }
+            Event::GetLeaderInfo { reply_tx } => {
+                let _ = reply_tx.send(self.current_leader);
+            }
         }
     }
 
@@ -327,6 +336,7 @@ impl RaftNode {
                 if args.term >= self.current_term {
                     self.current_term = args.term;
                     self.role = Role::Follower;
+                    self.current_leader = Some(args.leader_id);
                     self.last_election_time = Instant::now();
                     
                     if args.prev_log_index < self.log.len() {
