@@ -472,8 +472,8 @@ impl RaftNode {
         self.role = Role::Leader;
         self.current_leader = Some(self.id);
         self.current_leader_address = Some(self.client_address.clone());
-        self.next_index = vec![self.log.len(); self.peers.len()];
-        self.match_index = vec![0; self.peers.len()];
+        self.next_index = vec![self.log.len() + self.last_included_index; self.peers.len()];
+        self.match_index = vec![self.last_included_index; self.peers.len()];
     }
 
     async fn send_heartbeats(&mut self) {
