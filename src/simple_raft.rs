@@ -438,14 +438,17 @@ impl RaftNode {
                 loop {
                     match client.post(&url).json(&args).send().await {
                         Ok(resp) => {
-                            if let Ok(reply) = resp.json::<RequestVoteReply>().await {
-                                let _ = tx.send(Event::Rpc { 
-                                    msg: RpcMessage::RequestVoteResponse(reply), 
-                                    reply_tx: None 
-                                }).await;
-                                break;
-                            } else {
-                                eprintln!("Failed to parse RequestVoteResponse from {}", url);
+                            match resp.json::<RequestVoteReply>().await {
+                                Ok(reply) => {
+                                    let _ = tx.send(Event::Rpc { 
+                                        msg: RpcMessage::RequestVoteResponse(reply), 
+                                        reply_tx: None 
+                                    }).await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to parse RequestVoteResponse from {}: {}", url, e);
+                                }
                             }
                         }
                         Err(e) => {
@@ -502,14 +505,17 @@ impl RaftNode {
                     loop {
                         match client.post(&url).json(&args).send().await {
                             Ok(resp) => {
-                                if let Ok(reply) = resp.json::<InstallSnapshotReply>().await {
-                                    let _ = tx.send(Event::Rpc {
-                                        msg: RpcMessage::InstallSnapshotResponse(reply),
-                                        reply_tx: None
-                                    }).await;
-                                    break;
-                                } else {
-                                    eprintln!("Failed to parse InstallSnapshotReply from {}", url);
+                                match resp.json::<InstallSnapshotReply>().await {
+                                    Ok(reply) => {
+                                        let _ = tx.send(Event::Rpc {
+                                            msg: RpcMessage::InstallSnapshotResponse(reply),
+                                            reply_tx: None
+                                        }).await;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to parse InstallSnapshotReply from {}: {}", url, e);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -562,14 +568,17 @@ impl RaftNode {
                 loop {
                     match client.post(&url).json(&args).send().await {
                         Ok(resp) => {
-                            if let Ok(reply) = resp.json::<AppendEntriesReply>().await {
-                                let _ = tx.send(Event::Rpc {
-                                    msg: RpcMessage::AppendEntriesResponse(reply),
-                                    reply_tx: None
-                                }).await;
-                                break;
-                            } else {
-                                // Don't log error for heartbeats to avoid spam, unless verbose
+                            match resp.json::<AppendEntriesReply>().await {
+                                Ok(reply) => {
+                                    let _ = tx.send(Event::Rpc {
+                                        msg: RpcMessage::AppendEntriesResponse(reply),
+                                        reply_tx: None
+                                    }).await;
+                                    break;
+                                }
+                                Err(_e) => {
+                                    // Don't log error for heartbeats to avoid spam
+                                }
                             }
                         }
 
