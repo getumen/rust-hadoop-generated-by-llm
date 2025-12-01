@@ -315,7 +315,7 @@ impl RaftNode {
         }
         
         // Update snapshot metadata
-        self.last_included_term = self.log[self.last_applied - self.last_included_index].term;
+        self.last_included_term = term;
         
         // Truncate log, keeping only entries after snapshot
         let new_log_start = self.last_applied - self.last_included_index + 1;
