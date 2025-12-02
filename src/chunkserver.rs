@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use tonic::{Request, Response, Status};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MyChunkServer {
     storage_dir: PathBuf,
 }
@@ -58,8 +58,11 @@ impl MyChunkServer {
         
         let expected_checksums: Vec<u32> = meta_data
             .chunks_exact(4)
-            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
-            .collect();
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk.try_into().map_err(|_| "Invalid checksum size".to_string())?;
+                Ok(u32::from_be_bytes(bytes))
+            })
+            .collect::<Result<Vec<u32>, String>>()?;
             
         let actual_checksums = Self::calculate_checksums(data);
         
@@ -76,33 +79,47 @@ impl MyChunkServer {
         Ok(())
     }
     pub async fn run_background_scrubber(storage_dir: PathBuf, interval: std::time::Duration) {
+        let server = MyChunkServer { storage_dir: storage_dir.clone() };
+        
         loop {
             tokio::time::sleep(interval).await;
             println!("Starting background block scrubber...");
             
-            if let Ok(entries) = fs::read_dir(&storage_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    // Skip meta files and directories
-                    if path.is_dir() || path.extension().map_or(false, |ext| ext == "meta") {
-                        continue;
-                    }
-                    
-                    if let Some(block_id) = path.file_name().and_then(|n| n.to_str()) {
-                        // Read block data
-                        match fs::read(&path) {
-                            Ok(data) => {
-                                let server = MyChunkServer { storage_dir: storage_dir.clone() };
-                                match server.verify_block(block_id, &data) {
-                                    Ok(_) => {},
-                                    Err(e) => eprintln!("Scrubber detected corruption in block {}: {}", block_id, e),
+            let server_clone = server.clone();
+            let storage_dir_clone = storage_dir.clone();
+            
+            let result = tokio::task::spawn_blocking(move || {
+                match fs::read_dir(&storage_dir_clone) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            // Skip meta files and directories
+                            if path.is_dir() || path.extension().map_or(false, |ext| ext == "meta") {
+                                continue;
+                            }
+                            
+                            if let Some(block_id) = path.file_name().and_then(|n| n.to_str()) {
+                                // Read block data
+                                match fs::read(&path) {
+                                    Ok(data) => {
+                                        match server_clone.verify_block(block_id, &data) {
+                                            Ok(_) => {},
+                                            Err(e) => eprintln!("Scrubber detected corruption in block {}: {}", block_id, e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Failed to read block {}: {}", block_id, e),
                                 }
                             }
-                            Err(e) => eprintln!("Failed to read block {}: {}", block_id, e),
                         }
                     }
+                    Err(e) => eprintln!("Failed to read storage directory: {}", e),
                 }
+            }).await;
+
+            if let Err(e) = result {
+                eprintln!("Scrubber task failed: {}", e);
             }
+            
             println!("Background block scrubber finished.");
         }
     }
