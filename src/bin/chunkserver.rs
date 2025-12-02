@@ -27,7 +27,14 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = args.addr.parse()?;
-    let chunk_server = MyChunkServer::new(args.storage_dir);
+    let chunk_server = MyChunkServer::new(args.storage_dir.clone());
+
+    // Start background scrubber
+    let storage_dir = args.storage_dir.clone();
+    tokio::spawn(async move {
+        // Run scrubber every 60 seconds
+        MyChunkServer::run_background_scrubber(storage_dir, std::time::Duration::from_secs(60)).await;
+    });
 
     // Register with Master
     let master_addrs: Vec<String> = args.master_addr.split(',')

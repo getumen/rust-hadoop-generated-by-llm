@@ -18,6 +18,10 @@ reqwest = { version = "0.12", features = ["json"] }
 warp = { version = "0.4", features = ["server"] }
 rand = "0.9"
 rocksdb = "0.21"
+crc32fast = "1.5.0"
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3.23.0"
