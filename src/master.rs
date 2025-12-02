@@ -1,8 +1,9 @@
 use crate::dfs::master_service_server::MasterService;
 use crate::dfs::{
-    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, CreateFileResponse, FileMetadata, GetFileInfoRequest, GetFileInfoResponse,
-    ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
+    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, CompleteFileRequest,
+    CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata, GetFileInfoRequest,
+    GetFileInfoResponse, ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest,
+    RegisterChunkServerResponse,
 };
 use crate::simple_raft::{Command, Event};
 use serde::{Deserialize, Serialize};
@@ -27,10 +28,7 @@ pub struct MyMaster {
 
 impl MyMaster {
     pub fn new(state: Arc<Mutex<MasterState>>, raft_tx: mpsc::Sender<Event>) -> Self {
-        MyMaster {
-            state,
-            raft_tx,
-        }
+        MyMaster { state, raft_tx }
     }
 }
 
@@ -61,7 +59,7 @@ impl MasterService for MyMaster {
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
         let req = request.into_inner();
-        
+
         // Check if file exists (read optimization)
         {
             let state = self.state.lock().unwrap();
@@ -75,10 +73,15 @@ impl MasterService for MyMaster {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if let Err(_) = self.raft_tx.send(Event::ClientRequest {
-            command: Command::CreateFile { path: req.path },
-            reply_tx: tx,
-        }).await {
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::CreateFile { path: req.path },
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
             return Err(Status::internal("Raft channel closed"));
         }
 
@@ -102,16 +105,16 @@ impl MasterService for MyMaster {
         request: Request<AllocateBlockRequest>,
     ) -> Result<Response<AllocateBlockResponse>, Status> {
         let req = request.into_inner();
-        
+
         // Replication factor (default: 3)
         const REPLICATION_FACTOR: usize = 3;
-        
+
         let (chunk_servers, block_id) = {
             let state = self.state.lock().unwrap();
             if !state.files.contains_key(&req.path) {
                 return Err(Status::not_found("File not found"));
             }
-            
+
             let chunk_servers = state.chunk_servers.clone();
             if chunk_servers.is_empty() {
                 return Err(Status::unavailable("No chunk servers available"));
@@ -121,20 +124,23 @@ impl MasterService for MyMaster {
 
         // Select chunk servers
         let num_replicas = std::cmp::min(REPLICATION_FACTOR, chunk_servers.len());
-        let selected_servers: Vec<String> = chunk_servers.iter()
-            .take(num_replicas)
-            .cloned()
-            .collect();
+        let selected_servers: Vec<String> =
+            chunk_servers.iter().take(num_replicas).cloned().collect();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if let Err(_) = self.raft_tx.send(Event::ClientRequest {
-            command: Command::AllocateBlock { 
-                path: req.path, 
-                block_id: block_id.clone(), 
-                locations: selected_servers.clone() 
-            },
-            reply_tx: tx,
-        }).await {
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::AllocateBlock {
+                    path: req.path,
+                    block_id: block_id.clone(),
+                    locations: selected_servers.clone(),
+                },
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
             return Err(Status::internal("Raft channel closed"));
         }
 
@@ -150,17 +156,16 @@ impl MasterService for MyMaster {
                     chunk_server_addresses: selected_servers,
                     leader_hint: "".to_string(),
                 }))
-            },
+            }
             Ok(Err(leader_opt)) => {
                 let leader_hint = leader_opt.unwrap_or_default();
 
-                
                 Ok(Response::new(AllocateBlockResponse {
                     block: None,
                     chunk_server_addresses: vec![],
                     leader_hint,
                 }))
-            },
+            }
             Err(_) => Err(Status::internal("Raft response error")),
         }
     }
@@ -186,17 +191,17 @@ impl MasterService for MyMaster {
         request: Request<RegisterChunkServerRequest>,
     ) -> Result<Response<RegisterChunkServerResponse>, Status> {
         let req = request.into_inner();
-        
+
         // We can handle registration locally or via Raft.
         // For simplicity, let's handle it locally (ephemeral state).
         // Or via Raft to ensure all masters know about chunkservers?
         // If we handle locally, only the connected master knows.
         // But chunkservers connect to ALL masters in our current implementation.
         // So local registration is fine.
-        
+
         let mut state = self.state.lock().unwrap();
         if !state.chunk_servers.contains(&req.address) {
-             state.chunk_servers.push(req.address);
+            state.chunk_servers.push(req.address);
         }
 
         Ok(Response::new(RegisterChunkServerResponse { success: true }))

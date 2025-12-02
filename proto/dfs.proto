@@ -9,7 +9,7 @@ service MasterService {
   rpc AllocateBlock (AllocateBlockRequest) returns (AllocateBlockResponse);
   rpc CompleteFile (CompleteFileRequest) returns (CompleteFileResponse);
   rpc ListFiles (ListFilesRequest) returns (ListFilesResponse);
-  
+
   // DataNode registration (simplified)
   rpc RegisterChunkServer (RegisterChunkServerRequest) returns (RegisterChunkServerResponse);
 }
@@ -117,4 +117,3 @@ message ReplicateBlockResponse {
   bool success = 1;
   string error_message = 2;
 }
-

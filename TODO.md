@@ -71,8 +71,8 @@
 ---
 
 ### 4. Raft Configuration Management
-**Status**: Not Started  
-**Priority**: Medium  
+**Status**: Not Started
+**Priority**: Medium
 **Effort**: Medium
 
 **Problem**:
@@ -97,8 +97,8 @@
 ---
 
 ### 5. Health Checks and Monitoring
-**Status**: Basic  
-**Priority**: Medium  
+**Status**: Basic
+**Priority**: Medium
 **Effort**: Small
 
 **Current State**:
@@ -124,8 +124,8 @@
 ## 🟢 Low Priority (Nice to Have)
 
 ### 6. Read Optimization
-**Status**: Not Started  
-**Priority**: Low  
+**Status**: Not Started
+**Priority**: Low
 **Effort**: Medium
 
 **Problem**:
@@ -147,8 +147,8 @@
 ---
 
 ### 7. Raft Performance Optimizations
-**Status**: Not Started  
-**Priority**: Low  
+**Status**: Not Started
+**Priority**: Low
 **Effort**: Large
 
 **Optimizations**:
@@ -162,8 +162,8 @@
 ---
 
 ### 8. Testing Infrastructure
-**Status**: Basic (chaos tests exist)  
-**Priority**: Medium  
+**Status**: Basic (chaos tests exist)
+**Priority**: Medium
 **Effort**: Large
 
 **Current State**:
@@ -188,8 +188,8 @@
 ---
 
 ### 9. Documentation
-**Status**: Partial  
-**Priority**: Medium  
+**Status**: Partial
+**Priority**: Medium
 **Effort**: Medium
 
 **Existing Docs**:
@@ -211,8 +211,8 @@
 ---
 
 ### 10. Security Enhancements
-**Status**: Not Started  
-**Priority**: Low (for prototype)  
+**Status**: Not Started
+**Priority**: Low (for prototype)
 **Effort**: Large
 
 **Tasks**:
@@ -226,8 +226,8 @@
 ---
 
 ### 11. Observability
-**Status**: Minimal  
-**Priority**: Medium  
+**Status**: Minimal
+**Priority**: Medium
 **Effort**: Medium
 
 **Tasks**:
