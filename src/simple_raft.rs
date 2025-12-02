@@ -1,10 +1,10 @@
+use crate::master::MasterState;
+use rand::Rng;
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
-use rand::Rng;
-use rocksdb::DB;
-use crate::master::MasterState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -21,9 +21,17 @@ pub struct LogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
-    CreateFile { path: String },
-    AllocateBlock { path: String, block_id: String, locations: Vec<String> },
-    RegisterChunkServer { address: String },
+    CreateFile {
+        path: String,
+    },
+    AllocateBlock {
+        path: String,
+        block_id: String,
+        locations: Vec<String>,
+    },
+    RegisterChunkServer {
+        address: String,
+    },
     NoOp,
 }
 
@@ -121,19 +129,19 @@ pub struct RaftNode {
     pub match_index: Vec<usize>,
     pub current_leader: Option<usize>,
     pub current_leader_address: Option<String>,
-    
+
     // Snapshot metadata
     pub last_included_index: usize,
     pub last_included_term: u64,
-    
+
     pub election_timeout: Duration,
     pub last_election_time: Instant,
-    
+
     pub inbox: mpsc::Receiver<Event>,
     pub self_tx: mpsc::Sender<Event>,
     pub app_state: Arc<Mutex<MasterState>>,
     pub votes_received: usize,
-    
+
     pub db: Arc<DB>, // RocksDB instance
     pub http_client: reqwest::Client,
 }
@@ -152,8 +160,9 @@ impl RaftNode {
         let db = DB::open_default(&path).expect("Failed to open RocksDB");
         let db = Arc::new(db);
 
-        let (current_term, voted_for, log, last_included_index, last_included_term) = Self::load_state(&db, &app_state);
-        
+        let (current_term, voted_for, log, last_included_index, last_included_term) =
+            Self::load_state(&db, &app_state);
+
         // Note: 500ms timeout may be aggressive for large snapshot transfers.
         // Consider increasing timeout for InstallSnapshot RPCs if needed.
         let http_client = reqwest::Client::builder()
@@ -177,7 +186,7 @@ impl RaftNode {
             current_leader_address: None,
             last_included_index,
             last_included_term,
-            election_timeout: Duration::from_millis(rand::thread_rng().gen_range(1500..3000)),
+            election_timeout: Duration::from_millis(rand::rng().random_range(1500..3000)),
             last_election_time: Instant::now(),
             inbox,
             self_tx,
@@ -188,7 +197,10 @@ impl RaftNode {
         }
     }
 
-    fn load_state(db: &DB, app_state: &Arc<Mutex<MasterState>>) -> (u64, Option<usize>, Vec<LogEntry>, usize, u64) {
+    fn load_state(
+        db: &DB,
+        app_state: &Arc<Mutex<MasterState>>,
+    ) -> (u64, Option<usize>, Vec<LogEntry>, usize, u64) {
         let term = match db.get(b"term") {
             Ok(Some(val)) => match val.try_into() {
                 Ok(bytes) => u64::from_be_bytes(bytes),
@@ -209,7 +221,7 @@ impl RaftNode {
             },
             _ => None,
         };
-        
+
         // Load snapshot if exists
         let (last_included_index, last_included_term) = match db.get(b"snapshot_meta") {
             Ok(Some(val)) => {
@@ -236,57 +248,82 @@ impl RaftNode {
             }
             _ => (0, 0),
         };
-        
-        let mut log = vec![LogEntry { term: last_included_term, command: Command::NoOp }];
+
+        let mut log = vec![LogEntry {
+            term: last_included_term,
+            command: Command::NoOp,
+        }];
         let mut index = last_included_index + 1;
         loop {
             let key = format!("log:{}", index);
             match db.get(key.as_bytes()) {
-                Ok(Some(val)) => {
-                    match serde_json::from_slice::<LogEntry>(&val) {
-                        Ok(entry) => {
-                            log.push(entry);
-                            index += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("Error: Failed to deserialize log entry at index {}: {}", index, e);
-                            break;
-                        }
+                Ok(Some(val)) => match serde_json::from_slice::<LogEntry>(&val) {
+                    Ok(entry) => {
+                        log.push(entry);
+                        index += 1;
                     }
-                }
+                    Err(e) => {
+                        eprintln!(
+                            "Error: Failed to deserialize log entry at index {}: {}",
+                            index, e
+                        );
+                        break;
+                    }
+                },
                 _ => break,
             }
         }
-        
-        (term, voted_for, log, last_included_index, last_included_term)
+
+        (
+            term,
+            voted_for,
+            log,
+            last_included_index,
+            last_included_term,
+        )
     }
 
     fn save_term(&self) {
-        self.db.put(b"term", self.current_term.to_be_bytes()).expect("Failed to save term to DB");
+        self.db
+            .put(b"term", self.current_term.to_be_bytes())
+            .expect("Failed to save term to DB");
     }
 
     fn save_vote(&self) {
         if let Some(vote) = self.voted_for {
-            self.db.put(b"vote", vote.to_be_bytes()).expect("Failed to save vote to DB");
+            self.db
+                .put(b"vote", vote.to_be_bytes())
+                .expect("Failed to save vote to DB");
         } else {
-            self.db.delete(b"vote").expect("Failed to delete vote from DB");
+            self.db
+                .delete(b"vote")
+                .expect("Failed to delete vote from DB");
         }
     }
 
     fn save_log_entry(&self, index: usize, entry: &LogEntry) {
         let key = format!("log:{}", index);
         let val = serde_json::to_vec(entry).expect("Failed to serialize log entry");
-        self.db.put(key.as_bytes(), val).expect("Failed to save log entry to DB");
+        self.db
+            .put(key.as_bytes(), val)
+            .expect("Failed to save log entry to DB");
     }
 
     fn delete_log_entries_from(&self, start_index: usize) {
         let mut index = start_index;
         loop {
             let key = format!("log:{}", index);
-            if self.db.get(key.as_bytes()).expect("Failed to read from DB").is_none() {
+            if self
+                .db
+                .get(key.as_bytes())
+                .expect("Failed to read from DB")
+                .is_none()
+            {
                 break;
             }
-            self.db.delete(key.as_bytes()).expect("Failed to delete from DB");
+            self.db
+                .delete(key.as_bytes())
+                .expect("Failed to delete from DB");
             index += 1;
         }
     }
@@ -296,67 +333,98 @@ impl RaftNode {
         let state = self.app_state.lock().unwrap();
         let snapshot_data = serde_json::to_vec(&*state).expect("Failed to serialize app state");
         drop(state);
-        
+
         // Save snapshot metadata
         let term = if self.last_applied >= self.last_included_index {
             let index = self.last_applied - self.last_included_index;
-            self.log.get(index).map(|e| e.term).unwrap_or(self.last_included_term)
+            self.log
+                .get(index)
+                .map(|e| e.term)
+                .unwrap_or(self.last_included_term)
         } else {
-            eprintln!("Warning: last_applied {} < last_included_index {} during snapshot creation", self.last_applied, self.last_included_index);
+            eprintln!(
+                "Warning: last_applied {} < last_included_index {} during snapshot creation",
+                self.last_applied, self.last_included_index
+            );
             self.last_included_term
         };
         let meta = (self.last_applied, term);
         let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
-        self.db.put(b"snapshot_meta", meta_bytes).expect("Failed to save snapshot metadata to DB");
-        
+        self.db
+            .put(b"snapshot_meta", meta_bytes)
+            .expect("Failed to save snapshot metadata to DB");
+
         // Save snapshot data
-        self.db.put(b"snapshot_data", snapshot_data).expect("Failed to save snapshot data to DB");
-        
+        self.db
+            .put(b"snapshot_data", snapshot_data)
+            .expect("Failed to save snapshot data to DB");
+
         // Delete old log entries
         for i in (self.last_included_index + 1)..=self.last_applied {
             let key = format!("log:{}", i);
-            self.db.delete(key.as_bytes()).expect("Failed to delete old log entry from DB");
+            self.db
+                .delete(key.as_bytes())
+                .expect("Failed to delete old log entry from DB");
         }
-        
+
         // Update snapshot metadata
         self.last_included_term = term;
-        
+
         // Truncate log, keeping only entries after snapshot
         let new_log_start = self.last_applied - self.last_included_index + 1;
         let new_log = self.log[new_log_start..].to_vec();
-        self.log = vec![LogEntry { term: self.last_included_term, command: Command::NoOp }];
+        self.log = vec![LogEntry {
+            term: self.last_included_term,
+            command: Command::NoOp,
+        }];
         self.log.extend(new_log);
-        
+
         self.last_included_index = self.last_applied;
-        
-        println!("Node {} created snapshot at index {}", self.id, self.last_included_index);
+
+        println!(
+            "Node {} created snapshot at index {}",
+            self.id, self.last_included_index
+        );
     }
 
     fn install_snapshot(&mut self, snapshot: Snapshot) {
         // Save snapshot to disk
         let meta = (snapshot.last_included_index, snapshot.last_included_term);
         let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
-        self.db.put(b"snapshot_meta", meta_bytes).expect("Failed to save snapshot metadata to DB");
-        self.db.put(b"snapshot_data", &snapshot.data).expect("Failed to save snapshot data to DB");
-        
+        self.db
+            .put(b"snapshot_meta", meta_bytes)
+            .expect("Failed to save snapshot metadata to DB");
+        self.db
+            .put(b"snapshot_data", &snapshot.data)
+            .expect("Failed to save snapshot data to DB");
+
         // Restore app state
-        let state: MasterState = serde_json::from_slice(&snapshot.data).expect("Failed to deserialize snapshot data");
+        let state: MasterState =
+            serde_json::from_slice(&snapshot.data).expect("Failed to deserialize snapshot data");
         *self.app_state.lock().unwrap() = state;
-        
+
         // Delete old log entries
         for i in (self.last_included_index + 1)..=snapshot.last_included_index {
             let key = format!("log:{}", i);
-            self.db.delete(key.as_bytes()).expect("Failed to delete old log entry from DB");
+            self.db
+                .delete(key.as_bytes())
+                .expect("Failed to delete old log entry from DB");
         }
-        
+
         // Update state
         self.last_included_index = snapshot.last_included_index;
         self.last_included_term = snapshot.last_included_term;
-        self.log = vec![LogEntry { term: self.last_included_term, command: Command::NoOp }];
+        self.log = vec![LogEntry {
+            term: self.last_included_term,
+            command: Command::NoOp,
+        }];
         self.commit_index = snapshot.last_included_index;
         self.last_applied = snapshot.last_included_index;
-        
-        println!("Node {} installed snapshot at index {}", self.id, self.last_included_index);
+
+        println!(
+            "Node {} installed snapshot at index {}",
+            self.id, self.last_included_index
+        );
     }
 
     pub async fn run(&mut self) {
@@ -390,7 +458,7 @@ impl RaftNode {
             }
         }
         self.apply_logs();
-        
+
         // Create snapshot if log is too large (threshold: 100 entries)
         const SNAPSHOT_THRESHOLD: usize = 100;
         if self.log.len() > SNAPSHOT_THRESHOLD && self.last_applied > self.last_included_index {
@@ -402,15 +470,18 @@ impl RaftNode {
         self.role = Role::Candidate;
         self.current_term += 1;
         self.save_term(); // Persist term
-        
+
         self.voted_for = Some(self.id);
         self.save_vote(); // Persist vote
-        
+
         self.votes_received = 1;
         self.last_election_time = Instant::now();
-        self.election_timeout = Duration::from_millis(rand::thread_rng().gen_range(1500..3000));
-        
-        println!("Node {} starting election for term {}", self.id, self.current_term);
+        self.election_timeout = Duration::from_millis(rand::rng().random_range(1500..3000));
+
+        println!(
+            "Node {} starting election for term {}",
+            self.id, self.current_term
+        );
 
         let last_log_index = self.log.len() - 1;
         let last_log_term = self.log[last_log_index].term;
@@ -433,7 +504,7 @@ impl RaftNode {
             let args = args.clone();
             let tx = self.self_tx.clone();
             let client = self.http_client.clone();
-            
+
             tokio::spawn(async move {
                 let mut attempt = 0;
                 let max_retries = 3;
@@ -441,22 +512,31 @@ impl RaftNode {
 
                 loop {
                     match client.post(&url).json(&args).send().await {
-                        Ok(resp) => {
-                            match resp.json::<RequestVoteReply>().await {
-                                Ok(reply) => {
-                                    let _ = tx.send(Event::Rpc { 
-                                        msg: RpcMessage::RequestVoteResponse(reply), 
-                                        reply_tx: None 
-                                    }).await;
-                                    break;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to parse RequestVoteResponse from {}: {}", url, e);
-                                }
+                        Ok(resp) => match resp.json::<RequestVoteReply>().await {
+                            Ok(reply) => {
+                                let _ = tx
+                                    .send(Event::Rpc {
+                                        msg: RpcMessage::RequestVoteResponse(reply),
+                                        reply_tx: None,
+                                    })
+                                    .await;
+                                break;
                             }
-                        }
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to parse RequestVoteResponse from {}: {}",
+                                    url, e
+                                );
+                            }
+                        },
                         Err(e) => {
-                            eprintln!("RequestVote failed to {} (attempt {}/{}): {}", url, attempt + 1, max_retries, e);
+                            eprintln!(
+                                "RequestVote failed to {} (attempt {}/{}): {}",
+                                url,
+                                attempt + 1,
+                                max_retries,
+                                e
+                            );
                         }
                     }
 
@@ -472,7 +552,10 @@ impl RaftNode {
     }
 
     fn become_leader(&mut self) {
-        println!("Node {} becoming LEADER for term {}", self.id, self.current_term);
+        println!(
+            "Node {} becoming LEADER for term {}",
+            self.id, self.current_term
+        );
         self.role = Role::Leader;
         self.current_leader = Some(self.id);
         self.current_leader_address = Some(self.client_address.clone());
@@ -488,7 +571,7 @@ impl RaftNode {
                 let state = self.app_state.lock().unwrap();
                 let snapshot_data = serde_json::to_vec(&*state).unwrap();
                 drop(state);
-                
+
                 let args = InstallSnapshotArgs {
                     term: self.current_term,
                     leader_id: self.id,
@@ -496,11 +579,11 @@ impl RaftNode {
                     last_included_term: self.last_included_term,
                     data: snapshot_data,
                 };
-                
+
                 let url = format!("{}/raft/snapshot", peer);
                 let tx = self.self_tx.clone();
                 let client = self.http_client.clone();
-                
+
                 tokio::spawn(async move {
                     let mut attempt = 0;
                     let max_retries = 3;
@@ -508,25 +591,34 @@ impl RaftNode {
 
                     loop {
                         match client.post(&url).json(&args).send().await {
-                            Ok(resp) => {
-                                match resp.json::<InstallSnapshotReply>().await {
-                                    Ok(reply) => {
-                                        let _ = tx.send(Event::Rpc {
+                            Ok(resp) => match resp.json::<InstallSnapshotReply>().await {
+                                Ok(reply) => {
+                                    let _ = tx
+                                        .send(Event::Rpc {
                                             msg: RpcMessage::InstallSnapshotResponse(reply),
-                                            reply_tx: None
-                                        }).await;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to parse InstallSnapshotReply from {}: {}", url, e);
-                                    }
+                                            reply_tx: None,
+                                        })
+                                        .await;
+                                    break;
                                 }
-                            }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Failed to parse InstallSnapshotReply from {}: {}",
+                                        url, e
+                                    );
+                                }
+                            },
                             Err(e) => {
-                                eprintln!("InstallSnapshot failed to {} (attempt {}/{}): {}", url, attempt + 1, max_retries, e);
+                                eprintln!(
+                                    "InstallSnapshot failed to {} (attempt {}/{}): {}",
+                                    url,
+                                    attempt + 1,
+                                    max_retries,
+                                    e
+                                );
                             }
                         }
-                        
+
                         attempt += 1;
                         if attempt >= max_retries {
                             break;
@@ -537,10 +629,10 @@ impl RaftNode {
                 });
                 continue;
             }
-            
+
             let prev_log_index = self.next_index[i] - 1 - self.last_included_index;
             let prev_log_term = self.log[prev_log_index].term;
-            
+
             let next_log_index = self.next_index[i] - self.last_included_index;
             let entries = if self.log.len() > next_log_index {
                 self.log[next_log_index..].to_vec()
@@ -561,7 +653,7 @@ impl RaftNode {
             let url = format!("{}/raft/append", peer);
             let tx = self.self_tx.clone();
             let client = self.http_client.clone();
-            
+
             tokio::spawn(async move {
                 // Heartbeats are frequent, so we might want fewer retries or shorter timeout
                 // But for consistency, let's use a small retry loop
@@ -574,10 +666,12 @@ impl RaftNode {
                         Ok(resp) => {
                             match resp.json::<AppendEntriesReply>().await {
                                 Ok(reply) => {
-                                    let _ = tx.send(Event::Rpc {
-                                        msg: RpcMessage::AppendEntriesResponse(reply),
-                                        reply_tx: None
-                                    }).await;
+                                    let _ = tx
+                                        .send(Event::Rpc {
+                                            msg: RpcMessage::AppendEntriesResponse(reply),
+                                            reply_tx: None,
+                                        })
+                                        .await;
                                     break;
                                 }
                                 Err(_) => {
@@ -591,7 +685,7 @@ impl RaftNode {
                             eprintln!("AppendEntries failed to {}: {}", url, e);
                         }
                     }
-                    
+
                     attempt += 1;
                     if attempt >= max_retries {
                         break;
@@ -616,7 +710,7 @@ impl RaftNode {
                     let _ = reply_tx.send(Err(self.current_leader_address.clone()));
                     return;
                 }
-                
+
                 let entry = LogEntry {
                     term: self.current_term,
                     command,
@@ -624,10 +718,10 @@ impl RaftNode {
                 self.log.push(entry.clone());
                 let absolute_index = self.log.len() - 1 + self.last_included_index;
                 self.save_log_entry(absolute_index, &entry); // Persist log entry
-                
+
                 self.commit_index = absolute_index;
                 self.apply_logs();
-                
+
                 let _ = reply_tx.send(Ok(()));
             }
             Event::GetLeaderInfo { reply_tx } => {
@@ -644,21 +738,21 @@ impl RaftNode {
                     if args.term > self.current_term {
                         self.current_term = args.term;
                         self.save_term(); // Persist term
-                        
+
                         self.role = Role::Follower;
                         self.voted_for = None;
                         self.save_vote(); // Persist vote (None)
-                        
+
                         self.current_leader = None;
                         self.current_leader_address = None;
                     }
-                    
+
                     if (self.voted_for.is_none() || self.voted_for == Some(args.candidate_id))
-                        && args.last_log_index >= self.log.len() - 1 + self.last_included_index 
+                        && args.last_log_index >= self.log.len() - 1 + self.last_included_index
                     {
                         self.voted_for = Some(args.candidate_id);
                         self.save_vote(); // Persist vote
-                        
+
                         self.last_election_time = Instant::now();
                         vote_granted = true;
                     }
@@ -669,7 +763,10 @@ impl RaftNode {
                 })
             }
             RpcMessage::RequestVoteResponse(reply) => {
-                if self.role == Role::Candidate && self.current_term == reply.term && reply.vote_granted {
+                if self.role == Role::Candidate
+                    && self.current_term == reply.term
+                    && reply.vote_granted
+                {
                     self.votes_received += 1;
                     let total_nodes = self.peers.len() + 1;
                     if self.votes_received > total_nodes / 2 {
@@ -678,11 +775,11 @@ impl RaftNode {
                 } else if reply.term > self.current_term {
                     self.current_term = reply.term;
                     self.save_term(); // Persist term
-                    
+
                     self.role = Role::Follower;
                     self.voted_for = None;
                     self.save_vote(); // Persist vote
-                    
+
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
@@ -691,16 +788,16 @@ impl RaftNode {
             RpcMessage::AppendEntries(args) => {
                 let mut success = false;
                 let mut match_index = 0;
-                
+
                 if args.term >= self.current_term {
                     self.current_term = args.term;
                     self.save_term();
-                    
+
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
                     self.current_leader_address = Some(args.leader_address.clone());
                     self.last_election_time = Instant::now();
-                    
+
                     // Check if prev_log_index is in snapshot
                     if args.prev_log_index < self.last_included_index {
                         // Follower is ahead, reject
@@ -713,12 +810,12 @@ impl RaftNode {
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
-                                
+
                                 if log_index < self.log.len() {
                                     if self.log[log_index].term != entry.term {
                                         self.log.truncate(log_index);
                                         self.delete_log_entries_from(absolute_index);
-                                        
+
                                         self.log.push(entry.clone());
                                         self.save_log_entry(absolute_index, entry);
                                     }
@@ -732,35 +829,37 @@ impl RaftNode {
                     } else {
                         // Normal case
                         let prev_log_index_local = args.prev_log_index - self.last_included_index;
-                        if prev_log_index_local < self.log.len() {
-                            if self.log[prev_log_index_local].term == args.prev_log_term {
-                                success = true;
-                                
-                                for (i, entry) in args.entries.iter().enumerate() {
-                                    let absolute_index = args.prev_log_index + 1 + i;
-                                    let log_index = absolute_index - self.last_included_index;
-                                    
-                                    if log_index < self.log.len() {
-                                        if self.log[log_index].term != entry.term {
-                                            self.log.truncate(log_index);
-                                            self.delete_log_entries_from(absolute_index);
-                                            
-                                            self.log.push(entry.clone());
-                                            self.save_log_entry(absolute_index, entry);
-                                        }
-                                    } else {
+                        if prev_log_index_local < self.log.len()
+                            && self.log[prev_log_index_local].term == args.prev_log_term
+                        {
+                            success = true;
+
+                            for (i, entry) in args.entries.iter().enumerate() {
+                                let absolute_index = args.prev_log_index + 1 + i;
+                                let log_index = absolute_index - self.last_included_index;
+
+                                if log_index < self.log.len() {
+                                    if self.log[log_index].term != entry.term {
+                                        self.log.truncate(log_index);
+                                        self.delete_log_entries_from(absolute_index);
+
                                         self.log.push(entry.clone());
                                         self.save_log_entry(absolute_index, entry);
                                     }
+                                } else {
+                                    self.log.push(entry.clone());
+                                    self.save_log_entry(absolute_index, entry);
                                 }
-                                
-                                match_index = args.prev_log_index + args.entries.len();
                             }
+
+                            match_index = args.prev_log_index + args.entries.len();
                         }
                     }
 
                     if success && args.leader_commit > self.commit_index {
-                        self.commit_index = args.leader_commit.min(self.log.len() - 1 + self.last_included_index);
+                        self.commit_index = args
+                            .leader_commit
+                            .min(self.log.len() - 1 + self.last_included_index);
                         self.apply_logs();
                     }
                 }
@@ -779,11 +878,11 @@ impl RaftNode {
                 if args.term >= self.current_term {
                     self.current_term = args.term;
                     self.save_term();
-                    
+
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
                     self.last_election_time = Instant::now();
-                    
+
                     // Only install if snapshot is newer than our current state
                     if args.last_included_index > self.last_included_index {
                         let snapshot = Snapshot {
@@ -835,7 +934,7 @@ impl RaftNode {
                 let command = &self.log[log_index].command;
                 self.apply_command(command);
             } else {
-                eprintln!("Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}", 
+                eprintln!("Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}",
                     log_index, self.log.len(), self.last_applied, self.last_included_index);
             }
         }
@@ -845,13 +944,20 @@ impl RaftNode {
         let mut state = self.app_state.lock().unwrap();
         match command {
             Command::CreateFile { path } => {
-                state.files.insert(path.clone(), crate::dfs::FileMetadata {
-                    path: path.clone(),
-                    size: 0,
-                    blocks: vec![],
-                });
+                state.files.insert(
+                    path.clone(),
+                    crate::dfs::FileMetadata {
+                        path: path.clone(),
+                        size: 0,
+                        blocks: vec![],
+                    },
+                );
             }
-            Command::AllocateBlock { path, block_id, locations } => {
+            Command::AllocateBlock {
+                path,
+                block_id,
+                locations,
+            } => {
                 if let Some(meta) = state.files.get_mut(path) {
                     meta.blocks.push(crate::dfs::BlockInfo {
                         block_id: block_id.clone(),

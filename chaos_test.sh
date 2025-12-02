@@ -106,7 +106,7 @@ main() {
     echo ""
     echo "Phase 2: Chaos Testing"
     echo "======================"
-    
+
     # Test 1: Kill one server and download
     echo ""
     echo "Test 1: Single server failure"
@@ -158,10 +158,10 @@ main() {
     echo "----------------------------------------------"
     killed=$(kill_random_chunkserver)
     cluster_status
-    
+
     echo "Creating second test file..."
     dd if=/dev/urandom of=chaos_test_data2.txt bs=1M count=5 2>/dev/null
-    
+
     echo "Uploading during chaos..."
     docker run --rm --network rust-hadoop_dfs-network \
         -v $(pwd)/chaos_test_data2.txt:/tmp/chaos_test_data2.txt \
@@ -169,7 +169,7 @@ main() {
         /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 put /tmp/chaos_test_data2.txt /chaos_test2.txt || {
         echo "⚠️  Upload failed (expected with insufficient replicas)"
     }
-    
+
     restart_chunkserver $killed
     cluster_status
 
@@ -187,7 +187,7 @@ main() {
     echo "  - Original file maintained integrity through multiple server failures"
     echo "  - Replication factor of 3 provided sufficient redundancy"
     echo "  - System recovered gracefully from failures"
-    
+
     # Cleanup
     echo ""
     echo "🧹 Cleaning up test files..."

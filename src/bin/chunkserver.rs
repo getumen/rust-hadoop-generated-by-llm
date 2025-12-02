@@ -33,15 +33,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_dir = args.storage_dir.clone();
     tokio::spawn(async move {
         // Run scrubber every 60 seconds
-        MyChunkServer::run_background_scrubber(storage_dir, std::time::Duration::from_secs(60)).await;
+        MyChunkServer::run_background_scrubber(storage_dir, std::time::Duration::from_secs(60))
+            .await;
     });
 
     // Register with Master
-    let master_addrs: Vec<String> = args.master_addr.split(',')
+    let master_addrs: Vec<String> = args
+        .master_addr
+        .split(',')
         .map(|s| format!("http://{}", s))
         .collect();
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
-    
+
     tokio::spawn(async move {
         // Retry loop for master registration
         loop {
@@ -53,17 +56,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             address: my_addr.clone(),
                             capacity: 1024 * 1024 * 1024, // 1GB dummy capacity
                         });
-                        
+
                         match client.register_chunk_server(request).await {
                             Ok(_) => {
                                 println!("✓ Registered with Master at {}", master_addr);
                                 registered = true;
-                                break; // Connected to one master, good for now. 
-                                // In a real system, we might need to register with the active one.
-                                // Since only active master accepts connections (others are waiting on lock), 
-                                // this works naturally.
+                                break; // Connected to one master, good for now.
+                                       // In a real system, we might need to register with the active one.
+                                       // Since only active master accepts connections (others are waiting on lock),
+                                       // this works naturally.
                             }
-                            Err(e) => eprintln!("Failed to register with Master {}: {}", master_addr, e),
+                            Err(e) => {
+                                eprintln!("Failed to register with Master {}: {}", master_addr, e)
+                            }
                         }
                     }
                     Err(e) => {
@@ -73,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if registered {
-                // Keep checking or re-registering periodically? 
+                // Keep checking or re-registering periodically?
                 // For now, just sleep and re-register to ensure we stay connected if master fails over
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             } else {
@@ -88,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(
             ChunkServerServiceServer::new(chunk_server)
-                .max_decoding_message_size(100 * 1024 * 1024)
+                .max_decoding_message_size(100 * 1024 * 1024),
         )
         .serve(addr)
         .await?;
