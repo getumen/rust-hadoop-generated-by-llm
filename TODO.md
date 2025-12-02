@@ -17,10 +17,11 @@
 - Verify checksums on read and during background scrubbing
 
 **Tasks**:
-- [ ] Define checksum format and storage layout
-- [ ] Implement checksum calculation on write
-- [ ] Implement checksum verification on read
-- [ ] Add background block scanner (scrubber)
+- [x] Define checksum format and storage layout
+- [x] Implement checksum calculation (CRC32C)
+- [x] Update ChunkServer to write checksums
+- [x] Update ChunkServer to verify checksums on read
+- [x] Implement background block scanner (scrubber)
 - [ ] Handle checksum errors (trigger replication from healthy replica)
 
 ---
