@@ -154,8 +154,10 @@ impl RaftNode {
 
         let (current_term, voted_for, log, last_included_index, last_included_term) = Self::load_state(&db, &app_state);
         
+        // Note: 500ms timeout may be aggressive for large snapshot transfers.
+        // Consider increasing timeout for InstallSnapshot RPCs if needed.
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500)) // 500ms timeout for RPCs
+            .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
 
@@ -295,7 +297,6 @@ impl RaftNode {
         let snapshot_data = serde_json::to_vec(&*state).expect("Failed to serialize app state");
         drop(state);
         
-        // Save snapshot metadata
         // Save snapshot metadata
         let term = if self.last_applied >= self.last_included_index {
             let index = self.last_applied - self.last_included_index;
@@ -579,7 +580,7 @@ impl RaftNode {
                                     }).await;
                                     break;
                                 }
-                                Err(_e) => {
+                                Err(_) => {
                                     // Don't log error for heartbeats to avoid spam
                                 }
                             }
@@ -833,6 +834,9 @@ impl RaftNode {
             if log_index < self.log.len() {
                 let command = &self.log[log_index].command;
                 self.apply_command(command);
+            } else {
+                eprintln!("Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}", 
+                    log_index, self.log.len(), self.last_applied, self.last_included_index);
             }
         }
     }
