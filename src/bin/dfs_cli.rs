@@ -9,11 +9,19 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use tokio::time::{sleep, Duration};
+
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = "Rust Hadoop DFS CLI\n\nAutomatically discovers the Leader Master node and retries operations on failure.")]
 struct Cli {
     #[arg(short, long, default_value = "http://127.0.0.1:50051")]
     master: String,
+
+    #[arg(long, default_value_t = 5)]
+    max_retries: usize,
+
+    #[arg(long, default_value_t = 500)]
+    initial_backoff_ms: u64,
 
     #[command(subcommand)]
     command: Commands,
@@ -34,43 +42,46 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ... (main body remains same until execute_with_retry definition)
     let cli = Cli::parse();
     
     let master_addrs: Vec<String> = cli.master.split(',')
         .map(|s| s.trim().to_string())
         .collect();
-        
-    let mut master_client = None;
-    for addr in &master_addrs {
-        match MasterServiceClient::connect(addr.clone()).await {
-            Ok(client) => {
-                master_client = Some(client.max_decoding_message_size(100 * 1024 * 1024));
-                break;
-            }
-            Err(e) => {
-                eprintln!("Failed to connect to master {}: {}", addr, e);
-            }
-        }
-    }
-    
-    let mut master_client = master_client.ok_or("Failed to connect to any master node")?;
+
+    let max_retries = cli.max_retries;
+    let initial_backoff_ms = cli.initial_backoff_ms;
 
     match cli.command {
         Commands::Ls => {
-            let request = tonic::Request::new(ListFilesRequest {
-                path: "/".to_string(),
-            });
-            let response = master_client.list_files(request).await?;
+            let response = execute_with_retry(&master_addrs, max_retries, initial_backoff_ms, |mut client| async move {
+                let request = tonic::Request::new(ListFilesRequest {
+                    path: "/".to_string(),
+                });
+                client.list_files(request).await
+            }).await?;
+
             for file in response.into_inner().files {
                 println!("{}", file);
             }
         }
         Commands::Put { source, dest } => {
             // 1. Create file on Master
-            let create_req = tonic::Request::new(CreateFileRequest {
-                path: dest.clone(),
-            });
-            let create_resp = master_client.create_file(create_req).await?.into_inner();
+            let create_resp = execute_with_retry(&master_addrs, max_retries, initial_backoff_ms, |mut client| {
+                let dest = dest.clone();
+                async move {
+                    let create_req = tonic::Request::new(CreateFileRequest {
+                        path: dest,
+                    });
+                    let response = client.create_file(create_req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!("Not Leader|{}", inner.leader_hint)));
+                    }
+                    Ok(response)
+                }
+            }).await?.into_inner();
+
             if !create_resp.success {
                 eprintln!("Failed to create file: {}", create_resp.error_message);
                 return Ok(());
@@ -82,10 +93,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             file.read_to_end(&mut buffer)?;
 
             // 3. Allocate block
-            let alloc_req = tonic::Request::new(AllocateBlockRequest {
-                path: dest.clone(),
-            });
-            let alloc_resp = master_client.allocate_block(alloc_req).await?.into_inner();
+            let alloc_resp = execute_with_retry(&master_addrs, max_retries, initial_backoff_ms, |mut client| {
+                let dest = dest.clone();
+                async move {
+                    let alloc_req = tonic::Request::new(AllocateBlockRequest {
+                        path: dest,
+                    });
+                    let response = client.allocate_block(alloc_req).await?;
+                    let inner = response.get_ref();
+                    if inner.block.is_none() {
+                         return Err(tonic::Status::unavailable(format!("Not Leader|{}", inner.leader_hint)));
+                    }
+                    Ok(response)
+                }
+            }).await?.into_inner();
+
             let block = alloc_resp.block.unwrap();
             let chunk_servers = alloc_resp.chunk_server_addresses;
 
@@ -119,10 +141,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Get { source, dest } => {
             // 1. Get file info from Master
-            let info_req = tonic::Request::new(GetFileInfoRequest {
-                path: source.clone(),
-            });
-            let info_resp = master_client.get_file_info(info_req).await?.into_inner();
+            let info_resp = execute_with_retry(&master_addrs, max_retries, initial_backoff_ms, |mut client| {
+                let source = source.clone();
+                async move {
+                    let info_req = tonic::Request::new(GetFileInfoRequest {
+                        path: source,
+                    });
+                    client.get_file_info(info_req).await
+                }
+            }).await?.into_inner();
             
             if !info_resp.found {
                 eprintln!("File not found");
@@ -173,4 +200,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn execute_with_retry<F, Fut, T>(
+    masters: &[String],
+    max_retries: usize,
+    initial_backoff_ms: u64,
+    f: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: Fn(MasterServiceClient<tonic::transport::Channel>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+{
+    let mut attempt = 0;
+    let mut backoff = Duration::from_millis(initial_backoff_ms);
+    let mut leader_hint: Option<String> = None;
+
+    loop {
+        attempt += 1;
+        
+        let mut targets = if let Some(hint) = leader_hint.take() {
+            let mut t = vec![hint];
+            // Add original masters as fallback, avoiding duplicates if possible, but simple append is fine for now
+            t.extend_from_slice(masters);
+            t
+        } else {
+            masters.to_vec()
+        };
+
+        // Remove duplicates to avoid trying same server multiple times in one attempt
+        targets.sort();
+        targets.dedup();
+
+        for master_addr in targets {
+            if master_addr.is_empty() { continue; }
+
+            let client = match MasterServiceClient::connect(master_addr.clone()).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let client = client.max_decoding_message_size(100 * 1024 * 1024);
+            
+            match f(client).await {
+                Ok(res) => return Ok(res),
+                Err(status) => {
+                    let msg = status.message();
+                    if msg.starts_with("Not Leader|") {
+                        let parts: Vec<&str> = msg.split('|').collect();
+                        if parts.len() > 1 && !parts[1].is_empty() {
+                            leader_hint = Some(parts[1].to_string());
+                            eprintln!("Received leader hint: {}", parts[1]);
+                            break; // Break inner loop to retry immediately with hint
+                        }
+                    }
+                    
+                    if msg.contains("Not Leader") || status.code() == tonic::Code::Unavailable {
+                        continue;
+                    }
+                    return Err(Box::new(status));
+                }
+            }
+        }
+        
+        if attempt >= max_retries {
+            break;
+        }
+        
+        // If we have a hint, we might want to skip backoff or reduce it?
+        // For now, keep backoff to avoid hot loop if hint is wrong.
+        if leader_hint.is_some() {
+             eprintln!("Retrying with leader hint...");
+        } else {
+             eprintln!("No leader found, retrying in {:?}...", backoff);
+             sleep(backoff).await;
+             backoff = std::cmp::min(backoff * 2, Duration::from_secs(5));
+        }
+    }
+    
+    Err("No available leader found after retries".into())
 }

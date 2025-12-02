@@ -1,9 +1,14 @@
-FROM rust:latest as builder
+FROM rust:1.83-bookworm as builder
 
 WORKDIR /app
 
-# Install protobuf compiler
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+# Install build dependencies for RocksDB and protobuf
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    clang \
+    libclang-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the entire project
 COPY . .
@@ -16,6 +21,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

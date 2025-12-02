@@ -2,150 +2,74 @@
 
 ## 🔴 High Priority (Critical for Production)
 
-### 1. CLI Leader Discovery & Retry Logic
-**Status**: Not Started  
-**Priority**: Critical  
+### 1. Data Integrity (Checksumming)
+**Status**: Not Started
+**Priority**: High
 **Effort**: Medium
 
-**Problem**: 
-- CLI connects to the first available Master but doesn't retry if that Master is not the Leader
-- Users get "Not Leader" errors and operations fail
+**Problem**:
+- No detection of bit rot or disk corruption
+- Data corruption is silently propagated
 
 **Solution**:
-```rust
-// Implement retry logic in dfs_cli.rs
-async fn execute_with_retry<T>(
-    masters: &[String],
-    operation: impl Fn(&mut MasterClient) -> Future<Output = Result<T>>
-) -> Result<T> {
-    for master in masters {
-        match operation(master).await {
-            Ok(result) => return Ok(result),
-            Err(Status::Unavailable(msg)) if msg.contains("Not Leader") => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err("No available leader found")
-}
-```
+- Implement CRC32C checksums for each 512-byte chunk
+- Store checksums alongside block data
+- Verify checksums on read and during background scrubbing
 
 **Tasks**:
-- [ ] Add retry logic for all write operations (create_file, allocate_block)
-- [ ] Implement exponential backoff for retries
-- [ ] Add timeout configuration
-- [ ] Update CLI help text with retry behavior documentation
+- [ ] Define checksum format and storage layout
+- [ ] Implement checksum calculation on write
+- [ ] Implement checksum verification on read
+- [ ] Add background block scanner (scrubber)
+- [ ] Handle checksum errors (trigger replication from healthy replica)
 
 ---
 
-### 2. Leader Information Propagation
-**Status**: Not Started  
-**Priority**: High  
-**Effort**: Small
+### 2. ChunkServer Liveness (Lease-based)
+**Status**: Working
+**Priority**: High
+**Effort**: Medium
 
-**Problem**:
-- Followers return "Not Leader" but don't tell clients who the Leader is
-- Clients must try all Masters sequentially
-
-**Solution**:
-- Modify `CreateFileResponse` and `AllocateBlockResponse` to include optional `leader_hint` field
-- Update proto definitions:
-```protobuf
-message CreateFileResponse {
-    bool success = 1;
-    string error_message = 2;
-    string leader_hint = 3;  // Add this
-}
-```
-
-**Tasks**:
-- [ ] Update `proto/dfs.proto` with leader_hint fields
-- [ ] Modify Master service to include current leader in error responses
-- [ ] Update CLI to use leader_hint for faster failover
-- [ ] Add leader discovery cache in CLI
-
----
-
-### 3. Raft Log Persistence
-**Status**: Not Started  
-**Priority**: Critical  
-**Effort**: Large
-
-**Problem**:
-- Raft logs are currently in-memory only
-- If all Masters restart simultaneously, all metadata is lost
-- No durability guarantee
-
-**Solution**:
-- Implement Write-Ahead Log (WAL) to disk
-- Use `sled` or `rocksdb` for persistent storage
-- Implement log compaction/snapshotting
-
-**Tasks**:
-- [ ] Add persistent storage backend (sled/rocksdb)
-- [ ] Implement WAL for Raft logs
-- [ ] Add log entry serialization/deserialization
-- [ ] Implement snapshot creation on log size threshold
-- [ ] Add snapshot restoration on startup
-- [ ] Add configuration for log directory path
-- [ ] Implement log compaction (remove applied entries)
-- [ ] Add fsync configuration for durability vs performance tradeoff
-
-**Files to modify**:
-- `src/simple_raft.rs` - Add storage layer
-- `src/bin/master.rs` - Add log directory argument
-- `docker-compose.yml` - Add volume for log persistence
+**Potential Improvements**:
+- [ ] Implement Lease-based Liveness Check (etcd-style)
+  - [ ] Add `GrantLease`, `KeepAlive` RPCs
+  - [ ] Implement Lease manager in Master
+  - [ ] Implement KeepAlive loop in ChunkServer
+- [ ] Implement ChunkServer heartbeat to all Masters
+- [ ] Add ChunkServer re-registration on Master failover
+- [ ] Implement ChunkServer load balancing
+- [ ] Add ChunkServer health scoring
+- [ ] Implement automatic replica rebalancing (Balancer)
 
 ---
 
 ## 🟡 Medium Priority (Important for Stability)
 
-### 4. Raft Snapshot Implementation
-**Status**: Not Started  
-**Priority**: Medium  
-**Effort**: Large
-
-**Problem**:
-- Logs grow unbounded
-- New nodes or restarted nodes must replay entire log
-- Memory usage increases over time
-
-**Solution**:
-- Implement periodic snapshots of MasterState
-- Transfer snapshots to new/lagging followers
-- Truncate logs after successful snapshot
-
-**Tasks**:
-- [ ] Define snapshot format (JSON/Binary)
-- [ ] Implement snapshot creation trigger (log size threshold)
-- [ ] Add InstallSnapshot RPC handler
-- [ ] Implement snapshot transfer mechanism
-- [ ] Add snapshot restoration on startup
-- [ ] Implement log truncation after snapshot
-- [ ] Add snapshot compression (optional)
-
----
-
-### 5. Improved Network Error Handling
-**Status**: Partial  
-**Priority**: Medium  
+### 3. Safe Mode
+**Status**: Not Started
+**Priority**: Medium
 **Effort**: Medium
 
-**Current Issues**:
-- Network errors are silently ignored in some places
-- No retry logic for transient failures
-- No circuit breaker pattern
+**Problem**:
+- Cluster accepts writes immediately upon startup
+- Risk of unnecessary replication before all ChunkServers register
+- Incomplete view of cluster state during startup
+
+**Solution**:
+- Implement Safe Mode state in Master
+- Block write operations during Safe Mode
+- Exit Safe Mode only when threshold of blocks are reported
 
 **Tasks**:
-- [ ] Add structured error types for network failures
-- [ ] Implement retry with exponential backoff for RPC calls
-- [ ] Add circuit breaker for repeatedly failing nodes
-- [ ] Implement request timeouts
-- [ ] Add metrics for network error rates
-- [ ] Log network errors with appropriate severity levels
+- [ ] Implement Safe Mode state machine
+- [ ] Add block reporting threshold logic (e.g., 99% of blocks reported)
+- [ ] Block modification RPCs during Safe Mode
+- [ ] Add CLI command to manually enter/leave Safe Mode
+- [ ] Show Safe Mode status in web UI/metrics
 
 ---
 
-### 6. Raft Configuration Management
+### 4. Raft Configuration Management
 **Status**: Not Started  
 **Priority**: Medium  
 **Effort**: Medium
@@ -171,7 +95,7 @@ message CreateFileResponse {
 
 ---
 
-### 7. Health Checks and Monitoring
+### 5. Health Checks and Monitoring
 **Status**: Basic  
 **Priority**: Medium  
 **Effort**: Small
@@ -198,7 +122,7 @@ message CreateFileResponse {
 
 ## 🟢 Low Priority (Nice to Have)
 
-### 8. Read Optimization
+### 6. Read Optimization
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Medium
@@ -221,7 +145,7 @@ message CreateFileResponse {
 
 ---
 
-### 9. Raft Performance Optimizations
+### 7. Raft Performance Optimizations
 **Status**: Not Started  
 **Priority**: Low  
 **Effort**: Large
@@ -236,7 +160,7 @@ message CreateFileResponse {
 
 ---
 
-### 10. Testing Infrastructure
+### 8. Testing Infrastructure
 **Status**: Basic (chaos tests exist)  
 **Priority**: Medium  
 **Effort**: Large
@@ -262,7 +186,7 @@ message CreateFileResponse {
 
 ---
 
-### 11. Documentation
+### 9. Documentation
 **Status**: Partial  
 **Priority**: Medium  
 **Effort**: Medium
@@ -285,7 +209,7 @@ message CreateFileResponse {
 
 ---
 
-### 12. Security Enhancements
+### 10. Security Enhancements
 **Status**: Not Started  
 **Priority**: Low (for prototype)  
 **Effort**: Large
@@ -300,7 +224,7 @@ message CreateFileResponse {
 
 ---
 
-### 13. Observability
+### 11. Observability
 **Status**: Minimal  
 **Priority**: Medium  
 **Effort**: Medium
@@ -319,17 +243,64 @@ message CreateFileResponse {
 
 ---
 
-### 14. ChunkServer Improvements
-**Status**: Working  
-**Priority**: Low  
+### 12. ChunkServer Improvements
+**Status**: Working
+**Priority**: High
 **Effort**: Medium
 
 **Potential Improvements**:
+- [ ] Implement Lease-based Liveness Check (etcd-style)
+  - [ ] Add `GrantLease`, `KeepAlive` RPCs
+  - [ ] Implement Lease manager in Master
+  - [ ] Implement KeepAlive loop in ChunkServer
 - [ ] Implement ChunkServer heartbeat to all Masters
 - [ ] Add ChunkServer re-registration on Master failover
 - [ ] Implement ChunkServer load balancing
 - [ ] Add ChunkServer health scoring
-- [ ] Implement automatic replica rebalancing
+- [ ] Implement automatic replica rebalancing (Balancer)
+
+---
+
+### 13. Rack Awareness
+**Status**: Not Started
+**Priority**: Low
+**Effort**: Medium
+
+**Problem**:
+- Replicas might be placed on the same rack (SPOF)
+- No awareness of network topology
+
+**Solution**:
+- Implement rack-aware replica placement policy
+- Configurable topology script (like Hadoop)
+
+**Tasks**:
+- [ ] Add rack configuration to ChunkServer registration
+- [ ] Implement topology mapping logic in Master
+- [ ] Update block placement policy (1 local, 1 remote rack, 1 same remote rack)
+- [ ] Add rack awareness to Balancer
+
+---
+
+### 14. Storage Efficiency (Erasure Coding)
+**Status**: Not Started
+**Priority**: Low
+**Effort**: Large
+
+**Problem**:
+- 3x Replication consumes 300% storage overhead
+- Cost inefficient for cold data
+
+**Solution**:
+- Implement Reed-Solomon Erasure Coding (e.g., 6+3 or 10+4)
+- Reduce storage overhead to 1.5x or 1.4x while maintaining durability
+
+**Tasks**:
+- [ ] Research Rust Erasure Coding libraries (e.g., `reed-solomon-erasure`)
+- [ ] Implement EC encoding/decoding logic in ChunkServer
+- [ ] Update Master to handle EC block placement
+- [ ] Implement background encoding for cold files
+- [ ] Add reconstruction logic for failed EC blocks
 
 ---
 
@@ -344,6 +315,7 @@ message CreateFileResponse {
 - [ ] Add code comments for complex logic
 - [ ] Run clippy and fix all warnings
 - [ ] Add rustfmt configuration and enforce formatting
+- [ ] Fix deprecated `rand` usage in `simple_raft.rs`
 
 ### 16. Build and Deployment
 - [ ] Optimize Docker image size (multi-stage builds)
@@ -353,6 +325,10 @@ message CreateFileResponse {
 - [ ] Create Kubernetes manifests
 - [ ] Add Helm chart
 - [ ] Implement backup and restore procedures
+
+### 17. Refactor RPC Responses
+- [ ] Standardize RPC response formats (consistent success/error/hint fields)
+- [ ] Use gRPC error details for structured error information instead of custom string parsing
 
 ---
 
@@ -375,28 +351,34 @@ message CreateFileResponse {
 
 ## 🎯 Roadmap
 
-### Phase 1: Stability (Current)
+### Phase 1: Stability (Completed)
 - ✅ Basic Raft implementation
 - ✅ Leader election
 - ✅ Log replication
 - ✅ Basic chaos testing
+- ✅ CLI retry logic
+- ✅ Leader information propagation
+- ✅ Raft log persistence
 
-### Phase 2: Production Readiness (Next 2-4 weeks)
-- CLI retry logic (#1)
-- Leader information propagation (#2)
-- Raft log persistence (#3)
-- Snapshot implementation (#4)
-- Improved error handling (#5)
+### Phase 2: Production Readiness (Current - Next 2-4 weeks)
+- ✅ Snapshot implementation
+- ✅ Improved error handling
+- ChunkServer Liveness (Lease-based) (#2)
+- Data Integrity (#1)
+- Refactor RPC Responses (#16)
 
 ### Phase 3: Scalability (4-8 weeks)
-- Dynamic cluster membership (#6)
-- Read optimizations (#8)
-- Performance optimizations (#9)
-- Comprehensive testing (#10)
+- Safe Mode (#3)
+- Dynamic cluster membership (#4)
+- Read optimizations (#9)
+- Performance optimizations (#10)
+- Comprehensive testing (#6)
+- Storage Efficiency (Erasure Coding) (#13)
 
 ### Phase 4: Enterprise Features (8-12 weeks)
-- Security enhancements (#12)
-- Advanced observability (#13)
+- Security enhancements (#10)
+- Advanced observability (#11)
+- Rack Awareness (#13)
 - Operational tooling
 - Production documentation
 
@@ -409,5 +391,5 @@ message CreateFileResponse {
 - Some tasks can be parallelized
 - Security features are marked low priority for prototype but would be critical for production
 
-**Last Updated**: 2025-11-30
+**Last Updated**: 2025-12-01
 **Maintainer**: Development Team

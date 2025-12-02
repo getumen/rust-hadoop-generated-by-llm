@@ -4,12 +4,14 @@ services:
   master1:
     build: .
     container_name: dfs-master1
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers http://dfs-master2:8080,http://dfs-master3:8080 --http-port 8080
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers http://dfs-master2:8080,http://dfs-master3:8080 --http-port 8080 --storage-dir /data/raft
     ports:
       - "50051:50051"
       - "8081:8080"
     networks:
       - dfs-network
+    volumes:
+      - master1-data:/data/raft
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -19,12 +21,14 @@ services:
   master2:
     build: .
     container_name: dfs-master2
-    command: /app/master --addr 0.0.0.0:50051 --id 2 --peers http://dfs-master1:8080,http://dfs-master3:8080 --http-port 8080
+    command: /app/master --addr 0.0.0.0:50051 --id 2 --peers http://dfs-master1:8080,http://dfs-master3:8080 --http-port 8080 --storage-dir /data/raft
     ports:
       - "50057:50051"
       - "8082:8080"
     networks:
       - dfs-network
+    volumes:
+      - master2-data:/data/raft
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -34,12 +38,14 @@ services:
   master3:
     build: .
     container_name: dfs-master3
-    command: /app/master --addr 0.0.0.0:50051 --id 3 --peers http://dfs-master1:8080,http://dfs-master2:8080 --http-port 8080
+    command: /app/master --addr 0.0.0.0:50051 --id 3 --peers http://dfs-master1:8080,http://dfs-master2:8080 --http-port 8080 --storage-dir /data/raft
     ports:
       - "50058:50051"
       - "8083:8080"
     networks:
       - dfs-network
+    volumes:
+      - master3-data:/data/raft
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -158,4 +164,7 @@ volumes:
   cs3-data:
   cs4-data:
   cs5-data:
+  master1-data:
+  master2-data:
+  master3-data:
   metadata-volume:

@@ -69,6 +69,7 @@ impl MasterService for MyMaster {
                 return Ok(Response::new(CreateFileResponse {
                     success: false,
                     error_message: "File already exists".to_string(),
+                    leader_hint: "".to_string(),
                 }));
             }
         }
@@ -82,13 +83,15 @@ impl MasterService for MyMaster {
         }
 
         match rx.await {
-            Ok(true) => Ok(Response::new(CreateFileResponse {
+            Ok(Ok(())) => Ok(Response::new(CreateFileResponse {
                 success: true,
                 error_message: "".to_string(),
+                leader_hint: "".to_string(),
             })),
-            Ok(false) => Ok(Response::new(CreateFileResponse {
+            Ok(Err(leader_opt)) => Ok(Response::new(CreateFileResponse {
                 success: false,
                 error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
             })),
             Err(_) => Err(Status::internal("Raft response error")),
         }
@@ -136,7 +139,7 @@ impl MasterService for MyMaster {
         }
 
         match rx.await {
-            Ok(true) => {
+            Ok(Ok(())) => {
                 let block = BlockInfo {
                     block_id,
                     size: 0,
@@ -145,9 +148,19 @@ impl MasterService for MyMaster {
                 Ok(Response::new(AllocateBlockResponse {
                     block: Some(block),
                     chunk_server_addresses: selected_servers,
+                    leader_hint: "".to_string(),
                 }))
             },
-            Ok(false) => Err(Status::unavailable("Not Leader")),
+            Ok(Err(leader_opt)) => {
+                let leader_hint = leader_opt.unwrap_or_default();
+
+                
+                Ok(Response::new(AllocateBlockResponse {
+                    block: None,
+                    chunk_server_addresses: vec![],
+                    leader_hint,
+                }))
+            },
             Err(_) => Err(Status::internal("Raft response error")),
         }
     }
