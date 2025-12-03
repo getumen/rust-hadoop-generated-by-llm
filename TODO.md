@@ -3,7 +3,7 @@
 ## 🔴 High Priority (Critical for Production)
 
 ### 1. Data Integrity (Checksumming)
-**Status**: Not Started
+**Status**: Completed
 **Priority**: High
 **Effort**: Medium
 
@@ -22,7 +22,7 @@
 - [x] Update ChunkServer to write checksums
 - [x] Update ChunkServer to verify checksums on read
 - [x] Implement background block scanner (scrubber)
-- [ ] Handle checksum errors (trigger replication from healthy replica)
+- [x] Handle checksum errors (trigger replication from healthy replica)
 
 ---
 

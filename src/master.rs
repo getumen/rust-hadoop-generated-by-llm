@@ -1,9 +1,9 @@
 use crate::dfs::master_service_server::MasterService;
 use crate::dfs::{
     AllocateBlockRequest, AllocateBlockResponse, BlockInfo, CompleteFileRequest,
-    CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata, GetFileInfoRequest,
-    GetFileInfoResponse, ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest,
-    RegisterChunkServerResponse,
+    CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
+    GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileInfoRequest, GetFileInfoResponse,
+    ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
 };
 use crate::simple_raft::{Command, Event};
 use serde::{Deserialize, Serialize};
@@ -205,5 +205,31 @@ impl MasterService for MyMaster {
         }
 
         Ok(Response::new(RegisterChunkServerResponse { success: true }))
+    }
+
+    async fn get_block_locations(
+        &self,
+        request: Request<GetBlockLocationsRequest>,
+    ) -> Result<Response<GetBlockLocationsResponse>, Status> {
+        let req = request.into_inner();
+        let state = self.state.lock().unwrap();
+
+        // Search for the block in all files
+        for file_metadata in state.files.values() {
+            for block in &file_metadata.blocks {
+                if block.block_id == req.block_id {
+                    return Ok(Response::new(GetBlockLocationsResponse {
+                        locations: block.locations.clone(),
+                        found: true,
+                    }));
+                }
+            }
+        }
+
+        // Block not found
+        Ok(Response::new(GetBlockLocationsResponse {
+            locations: vec![],
+            found: false,
+        }))
     }
 }

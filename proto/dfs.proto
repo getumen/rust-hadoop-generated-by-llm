@@ -12,6 +12,9 @@ service MasterService {
 
   // DataNode registration (simplified)
   rpc RegisterChunkServer (RegisterChunkServerRequest) returns (RegisterChunkServerResponse);
+
+  // Block recovery
+  rpc GetBlockLocations (GetBlockLocationsRequest) returns (GetBlockLocationsResponse);
 }
 
 service ChunkServerService {
@@ -116,4 +119,13 @@ message ReplicateBlockRequest {
 message ReplicateBlockResponse {
   bool success = 1;
   string error_message = 2;
+}
+
+message GetBlockLocationsRequest {
+  string block_id = 1;
+}
+
+message GetBlockLocationsResponse {
+  repeated string locations = 1;
+  bool found = 2;
 }

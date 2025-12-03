@@ -8,12 +8,16 @@ use tonic::{Request, Response, Status};
 #[derive(Debug, Clone)]
 pub struct MyChunkServer {
     storage_dir: PathBuf,
+    master_addrs: Vec<String>,
 }
 
 impl MyChunkServer {
-    pub fn new(storage_dir: PathBuf) -> Self {
+    pub fn new(storage_dir: PathBuf, master_addrs: Vec<String>) -> Self {
         fs::create_dir_all(&storage_dir).unwrap();
-        MyChunkServer { storage_dir }
+        MyChunkServer {
+            storage_dir,
+            master_addrs,
+        }
     }
 
     fn calculate_checksums(data: &[u8]) -> Vec<u32> {
@@ -86,9 +90,112 @@ impl MyChunkServer {
 
         Ok(())
     }
-    pub async fn run_background_scrubber(storage_dir: PathBuf, interval: std::time::Duration) {
+
+    async fn recover_block(&self, block_id: &str) -> Result<(), String> {
+        eprintln!(
+            "Attempting to recover block {} from healthy replica",
+            block_id
+        );
+
+        // 1. Query Master for block locations
+        let mut locations = Vec::new();
+        for master_addr in &self.master_addrs {
+            match crate::dfs::master_service_client::MasterServiceClient::connect(format!(
+                "http://{}",
+                master_addr
+            ))
+            .await
+            {
+                Ok(mut client) => {
+                    let request = tonic::Request::new(crate::dfs::GetBlockLocationsRequest {
+                        block_id: block_id.to_string(),
+                    });
+
+                    match client.get_block_locations(request).await {
+                        Ok(response) => {
+                            let resp = response.into_inner();
+                            if resp.found {
+                                locations = resp.locations;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to get block locations from {}: {}", master_addr, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to master {}: {}", master_addr, e);
+                }
+            }
+        }
+
+        if locations.is_empty() {
+            return Err("No replica locations found for block".to_string());
+        }
+
+        // 2. Try to fetch from each replica (excluding ourselves)
+        let my_addr = std::env::var("CHUNK_SERVER_ADDR").unwrap_or_default();
+        for location in locations {
+            if location.contains(&my_addr) {
+                continue; // Skip ourselves
+            }
+
+            eprintln!("Trying to fetch block {} from {}", block_id, location);
+
+            match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
+                format!("http://{}", location),
+            )
+            .await
+            {
+                Ok(mut client) => {
+                    let request = tonic::Request::new(crate::dfs::ReadBlockRequest {
+                        block_id: block_id.to_string(),
+                    });
+
+                    match client.read_block(request).await {
+                        Ok(response) => {
+                            let data = response.into_inner().data;
+
+                            // 3. Verify the fetched data
+                            if self.verify_block(block_id, &data).is_ok() {
+                                // 4. Replace corrupted block
+                                if let Err(e) = self.write_block_local(block_id, &data) {
+                                    eprintln!("Failed to write recovered block: {}", e);
+                                    continue;
+                                }
+
+                                eprintln!(
+                                    "Successfully recovered block {} from {}",
+                                    block_id, location
+                                );
+                                return Ok(());
+                            } else {
+                                eprintln!("Fetched block from {} is also corrupted", location);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to read block from {}: {}", location, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to {}: {}", location, e);
+                }
+            }
+        }
+
+        Err("Failed to recover block from any replica".to_string())
+    }
+
+    pub async fn run_background_scrubber(
+        storage_dir: PathBuf,
+        master_addrs: Vec<String>,
+        interval: std::time::Duration,
+    ) {
         let server = MyChunkServer {
             storage_dir: storage_dir.clone(),
+            master_addrs,
         };
 
         loop {
@@ -99,6 +206,13 @@ impl MyChunkServer {
             let storage_dir_clone = storage_dir.clone();
 
             let result = tokio::task::spawn_blocking(move || {
+                // We need a runtime handle to execute async recover_block from within spawn_blocking
+                // However, recover_block is async and spawn_blocking expects sync closure.
+                // It's better to collect corrupted blocks here and recover them outside the blocking task,
+                // or use a different approach.
+                // For simplicity in this architecture, let's just identify corrupted blocks here.
+                let mut corrupted_blocks = Vec::new();
+
                 match fs::read_dir(&storage_dir_clone) {
                     Ok(entries) => {
                         for entry in entries.flatten() {
@@ -113,10 +227,13 @@ impl MyChunkServer {
                                 match fs::read(&path) {
                                     Ok(data) => match server_clone.verify_block(block_id, &data) {
                                         Ok(_) => {}
-                                        Err(e) => eprintln!(
-                                            "Scrubber detected corruption in block {}: {}",
-                                            block_id, e
-                                        ),
+                                        Err(e) => {
+                                            eprintln!(
+                                                "CRITICAL: Scrubber detected corruption in block {}: {}",
+                                                block_id, e
+                                            );
+                                            corrupted_blocks.push(block_id.to_string());
+                                        }
                                     },
                                     Err(e) => eprintln!("Failed to read block {}: {}", block_id, e),
                                 }
@@ -125,11 +242,20 @@ impl MyChunkServer {
                     }
                     Err(e) => eprintln!("Failed to read storage directory: {}", e),
                 }
+                corrupted_blocks
             })
             .await;
 
-            if let Err(e) = result {
-                eprintln!("Scrubber task failed: {}", e);
+            match result {
+                Ok(corrupted_blocks) => {
+                    for block_id in corrupted_blocks {
+                        eprintln!("Attempting background recovery for block {}", block_id);
+                        if let Err(e) = server.recover_block(&block_id).await {
+                            eprintln!("Background recovery failed for block {}: {}", block_id, e);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Scrubber task failed: {}", e),
             }
 
             println!("Background block scrubber finished.");
@@ -209,11 +335,46 @@ impl ChunkServerService for MyChunkServer {
 
                 // Verify checksums
                 if let Err(e) = self.verify_block(&req.block_id, &data) {
-                    eprintln!("Data corruption detected for block {}: {}", req.block_id, e);
-                    return Err(Status::data_loss(format!(
-                        "Data corruption detected: {}",
-                        e
-                    )));
+                    eprintln!(
+                        "CRITICAL: Data corruption detected for block {}: {}",
+                        req.block_id, e
+                    );
+
+                    // Attempt automatic recovery
+                    eprintln!("Attempting automatic recovery for block {}", req.block_id);
+                    match self.recover_block(&req.block_id).await {
+                        Ok(_) => {
+                            eprintln!(
+                                "Block {} successfully recovered, retrying read",
+                                req.block_id
+                            );
+                            // Re-read the recovered block
+                            let mut file = fs::File::open(&path)
+                                .map_err(|e| Status::internal(e.to_string()))?;
+                            let mut recovered_data = Vec::new();
+                            file.read_to_end(&mut recovered_data)
+                                .map_err(|e| Status::internal(e.to_string()))?;
+
+                            // Verify recovered data
+                            if let Err(e) = self.verify_block(&req.block_id, &recovered_data) {
+                                return Err(Status::data_loss(format!(
+                                    "Recovered block is still corrupted: {}",
+                                    e
+                                )));
+                            }
+
+                            return Ok(Response::new(ReadBlockResponse {
+                                data: recovered_data,
+                            }));
+                        }
+                        Err(recovery_err) => {
+                            eprintln!("Failed to recover block {}: {}", req.block_id, recovery_err);
+                            return Err(Status::data_loss(format!(
+                                "Data corruption detected: {}. Recovery failed: {}",
+                                e, recovery_err
+                            )));
+                        }
+                    }
                 }
 
                 Ok(Response::new(ReadBlockResponse { data }))
@@ -283,7 +444,7 @@ mod tests {
     #[test]
     fn test_checksum_verification() {
         let dir = tempdir().unwrap();
-        let server = MyChunkServer::new(dir.path().to_path_buf());
+        let server = MyChunkServer::new(dir.path().to_path_buf(), vec![]);
         let block_id = "test_block";
         let data = b"Hello, world! This is a test block for checksum verification.";
 
