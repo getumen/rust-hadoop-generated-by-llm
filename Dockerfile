@@ -1,4 +1,4 @@
-FROM rust:1.83-bookworm as builder
+FROM rust:1.91-bookworm as builder
 
 WORKDIR /app
 
@@ -22,6 +22,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libstdc++6 \
+    net-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

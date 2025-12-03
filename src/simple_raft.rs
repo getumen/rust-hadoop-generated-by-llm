@@ -706,7 +706,15 @@ impl RaftNode {
                 }
             }
             Event::ClientRequest { command, reply_tx } => {
+                println!(
+                    "Node {} received ClientRequest (role: {:?})",
+                    self.id, self.role
+                );
                 if self.role != Role::Leader {
+                    println!(
+                        "Node {} rejecting ClientRequest because not leader (leader: {:?})",
+                        self.id, self.current_leader_address
+                    );
                     let _ = reply_tx.send(Err(self.current_leader_address.clone()));
                     return;
                 }
@@ -733,9 +741,17 @@ impl RaftNode {
     async fn handle_rpc(&mut self, msg: RpcMessage) -> RpcMessage {
         match msg {
             RpcMessage::RequestVote(args) => {
+                println!(
+                    "Node {} received RequestVote from Node {} for term {}",
+                    self.id, args.candidate_id, args.term
+                );
                 let mut vote_granted = false;
                 if args.term >= self.current_term {
                     if args.term > self.current_term {
+                        println!(
+                            "Node {} updating term to {} (was {})",
+                            self.id, args.term, self.current_term
+                        );
                         self.current_term = args.term;
                         self.save_term(); // Persist term
 
@@ -750,12 +766,29 @@ impl RaftNode {
                     if (self.voted_for.is_none() || self.voted_for == Some(args.candidate_id))
                         && args.last_log_index >= self.log.len() - 1 + self.last_included_index
                     {
+                        println!(
+                            "Node {} granting vote to Node {}",
+                            self.id, args.candidate_id
+                        );
                         self.voted_for = Some(args.candidate_id);
                         self.save_vote(); // Persist vote
 
                         self.last_election_time = Instant::now();
                         vote_granted = true;
+                    } else {
+                        println!(
+                            "Node {} denying vote to Node {} (voted_for: {:?}, log check: {})",
+                            self.id,
+                            args.candidate_id,
+                            self.voted_for,
+                            args.last_log_index >= self.log.len() - 1 + self.last_included_index
+                        );
                     }
+                } else {
+                    println!(
+                        "Node {} denying vote to Node {} (term {} < {})",
+                        self.id, args.candidate_id, args.term, self.current_term
+                    );
                 }
                 RpcMessage::RequestVoteResponse(RequestVoteReply {
                     term: self.current_term,
@@ -767,12 +800,17 @@ impl RaftNode {
                     && self.current_term == reply.term
                     && reply.vote_granted
                 {
+                    println!("Node {} received vote", self.id);
                     self.votes_received += 1;
                     let total_nodes = self.peers.len() + 1;
                     if self.votes_received > total_nodes / 2 {
                         self.become_leader();
                     }
                 } else if reply.term > self.current_term {
+                    println!(
+                        "Node {} received higher term {} in RequestVoteResponse",
+                        self.id, reply.term
+                    );
                     self.current_term = reply.term;
                     self.save_term(); // Persist term
 
