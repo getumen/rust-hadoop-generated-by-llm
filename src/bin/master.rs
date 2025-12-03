@@ -1,3 +1,10 @@
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use clap::Parser;
 use rust_hadoop::dfs::master_service_server::MasterServiceServer;
 use rust_hadoop::master::{MasterState, MyMaster};
@@ -6,7 +13,6 @@ use rust_hadoop::simple_raft::{
 };
 use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
-use warp::Filter;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -30,9 +36,20 @@ struct Args {
     storage_dir: String,
 }
 
-#[derive(Debug)]
+// Axum state for sharing the Raft channel
+#[derive(Clone)]
+struct AppState {
+    raft_tx: tokio::sync::mpsc::Sender<Event>,
+}
+
+// Custom error type for Axum
 struct InternalError;
-impl warp::reject::Reject for InternalError {}
+
+impl IntoResponse for InternalError {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,36 +85,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_node.run().await;
     });
 
+    // Build Axum router for Raft RPC
+    let app_state = AppState {
+        raft_tx: raft_tx_for_server,
+    };
+
+    let app = Router::new()
+        .route("/raft/vote", post(handle_vote))
+        .route("/raft/append", post(handle_append))
+        .route("/raft/snapshot", post(handle_snapshot))
+        .with_state(app_state);
+
     // Start HTTP Server for Raft RPC
-    let raft_tx_filter = warp::any().map(move || raft_tx_for_server.clone());
-
-    let vote_route = warp::post()
-        .and(warp::path("raft"))
-        .and(warp::path("vote"))
-        .and(warp::body::json())
-        .and(raft_tx_filter.clone())
-        .and_then(handle_vote);
-
-    let append_route = warp::post()
-        .and(warp::path("raft"))
-        .and(warp::path("append"))
-        .and(warp::body::json())
-        .and(raft_tx_filter.clone())
-        .and_then(handle_append);
-
-    let snapshot_route = warp::post()
-        .and(warp::path("raft"))
-        .and(warp::path("snapshot"))
-        .and(warp::body::json())
-        .and(raft_tx_filter.clone())
-        .and_then(handle_snapshot);
-
-    let routes = vote_route.or(append_route).or(snapshot_route).boxed();
-
+    let http_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.http_port).into();
     tokio::spawn(async move {
-        warp::serve(routes)
-            .run(([0, 0, 0, 0], args.http_port))
-            .await;
+        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     });
 
     let master = MyMaster::new(state, raft_tx_for_master);
@@ -113,11 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle_vote(
-    args: RequestVoteArgs,
-    tx: tokio::sync::mpsc::Sender<Event>,
-) -> Result<impl warp::Reply, warp::Rejection> {
+    State(app_state): State<AppState>,
+    Json(args): Json<RequestVoteArgs>,
+) -> Result<Json<serde_json::Value>, InternalError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if tx
+    if app_state
+        .raft_tx
         .send(Event::Rpc {
             msg: RpcMessage::RequestVote(args),
             reply_tx: Some(reply_tx),
@@ -125,21 +129,24 @@ async fn handle_vote(
         .await
         .is_err()
     {
-        return Err(warp::reject::custom(InternalError));
+        return Err(InternalError);
     }
 
     match reply_rx.await {
-        Ok(RpcMessage::RequestVoteResponse(reply)) => Ok(warp::reply::json(&reply)),
-        _ => Err(warp::reject::custom(InternalError)),
+        Ok(RpcMessage::RequestVoteResponse(reply)) => {
+            Ok(Json(serde_json::to_value(&reply).unwrap()))
+        }
+        _ => Err(InternalError),
     }
 }
 
 async fn handle_append(
-    args: AppendEntriesArgs,
-    tx: tokio::sync::mpsc::Sender<Event>,
-) -> Result<impl warp::Reply, warp::Rejection> {
+    State(app_state): State<AppState>,
+    Json(args): Json<AppendEntriesArgs>,
+) -> Result<Json<serde_json::Value>, InternalError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if tx
+    if app_state
+        .raft_tx
         .send(Event::Rpc {
             msg: RpcMessage::AppendEntries(args),
             reply_tx: Some(reply_tx),
@@ -147,21 +154,24 @@ async fn handle_append(
         .await
         .is_err()
     {
-        return Err(warp::reject::custom(InternalError));
+        return Err(InternalError);
     }
 
     match reply_rx.await {
-        Ok(RpcMessage::AppendEntriesResponse(reply)) => Ok(warp::reply::json(&reply)),
-        _ => Err(warp::reject::custom(InternalError)),
+        Ok(RpcMessage::AppendEntriesResponse(reply)) => {
+            Ok(Json(serde_json::to_value(&reply).unwrap()))
+        }
+        _ => Err(InternalError),
     }
 }
 
 async fn handle_snapshot(
-    args: InstallSnapshotArgs,
-    tx: tokio::sync::mpsc::Sender<Event>,
-) -> Result<impl warp::Reply, warp::Rejection> {
+    State(app_state): State<AppState>,
+    Json(args): Json<InstallSnapshotArgs>,
+) -> Result<Json<serde_json::Value>, InternalError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if tx
+    if app_state
+        .raft_tx
         .send(Event::Rpc {
             msg: RpcMessage::InstallSnapshot(args),
             reply_tx: Some(reply_tx),
@@ -169,11 +179,13 @@ async fn handle_snapshot(
         .await
         .is_err()
     {
-        return Err(warp::reject::custom(InternalError));
+        return Err(InternalError);
     }
 
     match reply_rx.await {
-        Ok(RpcMessage::InstallSnapshotResponse(reply)) => Ok(warp::reply::json(&reply)),
-        _ => Err(warp::reject::custom(InternalError)),
+        Ok(RpcMessage::InstallSnapshotResponse(reply)) => {
+            Ok(Json(serde_json::to_value(&reply).unwrap()))
+        }
+        _ => Err(InternalError),
     }
 }
