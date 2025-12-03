@@ -2,27 +2,26 @@
 
 ## 🔴 High Priority (Critical for Production)
 
-### 1. Data Integrity (Checksumming)
+### 1. Master Server Sharding
 **Status**: Not Started
 **Priority**: High
-**Effort**: Medium
+**Effort**: Large
 
 **Problem**:
-- No detection of bit rot or disk corruption
-- Data corruption is silently propagated
+- Single Master limits the number of files (metadata fits in RAM)
+- Single Master limits metadata operation throughput
 
 **Solution**:
-- Implement CRC32C checksums for each 512-byte chunk
-- Store checksums alongside block data
-- Verify checksums on read and during background scrubbing
+- Partition the file namespace across multiple Master groups (Shards)
+- Each Shard operates as an independent Raft cluster for HA
+- Implement a mechanism to route client requests to the correct Shard
 
 **Tasks**:
-- [x] Define checksum format and storage layout
-- [x] Implement checksum calculation (CRC32C)
-- [x] Update ChunkServer to write checksums
-- [x] Update ChunkServer to verify checksums on read
-- [x] Implement background block scanner (scrubber)
-- [ ] Handle checksum errors (trigger replication from healthy replica)
+- [ ] Design sharding key strategy (e.g., hash of filename, directory subtrees)
+- [ ] Implement Shard Coordinator (or configuration service) to manage shard mappings
+- [ ] Update Client to cache shard mappings and route requests
+- [ ] Deploy multiple Master Raft groups (Shards)
+- [ ] Implement cross-shard operations (e.g., rename file across shards)
 
 ---
 
@@ -364,11 +363,12 @@
 ### Phase 2: Production Readiness (Current - Next 2-4 weeks)
 - ✅ Snapshot implementation
 - ✅ Improved error handling
+- ✅ Data Integrity
 - ChunkServer Liveness (Lease-based) (#2)
-- Data Integrity (#1)
 - Refactor RPC Responses (#16)
 
 ### Phase 3: Scalability (4-8 weeks)
+- Master Server Sharding (#1)
 - Safe Mode (#3)
 - Dynamic cluster membership (#4)
 - Read optimizations (#9)
