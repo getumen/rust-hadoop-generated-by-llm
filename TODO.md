@@ -31,12 +31,12 @@
 **Effort**: Medium
 
 **Potential Improvements**:
-- [ ] Implement Lease-based Liveness Check (etcd-style)
-  - [ ] Add `GrantLease`, `KeepAlive` RPCs
-  - [ ] Implement Lease manager in Master
-  - [ ] Implement KeepAlive loop in ChunkServer
-- [ ] Implement ChunkServer heartbeat to all Masters
-- [ ] Add ChunkServer re-registration on Master failover
+- [x] Implement Lease-based Liveness Check (Heartbeat)
+  - [x] Add `Heartbeat` RPC
+  - [x] Implement Liveness manager in Master (15s timeout)
+  - [x] Implement Heartbeat loop in ChunkServer (5s interval)
+- [x] Implement ChunkServer heartbeat to all Masters
+- [x] Add ChunkServer re-registration on Master failover (handled by heartbeat)
 - [ ] Implement ChunkServer load balancing
 - [ ] Add ChunkServer health scoring
 - [ ] Implement automatic replica rebalancing (Balancer)

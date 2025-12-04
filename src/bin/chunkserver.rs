@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
 
     tokio::spawn(async move {
-        // Retry loop for master registration
+        // 1. Initial Registration
         loop {
             let mut registered = false;
             for master_addr in &master_addrs {
@@ -70,10 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(_) => {
                                 println!("✓ Registered with Master at {}", master_addr);
                                 registered = true;
-                                break; // Connected to one master, good for now.
-                                       // In a real system, we might need to register with the active one.
-                                       // Since only active master accepts connections (others are waiting on lock),
-                                       // this works naturally.
+                                // We try to register with all masters initially
                             }
                             Err(e) => {
                                 eprintln!("Failed to register with Master {}: {}", master_addr, e)
@@ -87,13 +84,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if registered {
-                // Keep checking or re-registering periodically?
-                // For now, just sleep and re-register to ensure we stay connected if master fails over
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                break;
             } else {
                 eprintln!("✗ Failed to register with any Master. Retrying...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
+        }
+
+        // 2. Heartbeat Loop
+        println!("Starting heartbeat loop...");
+        loop {
+            for master_addr in &master_addrs {
+                match MasterServiceClient::connect(master_addr.clone()).await {
+                    Ok(mut client) => {
+                        let request = tonic::Request::new(rust_hadoop::dfs::HeartbeatRequest {
+                            chunk_server_address: my_addr.clone(),
+                        });
+
+                        if let Err(e) = client.heartbeat(request).await {
+                            eprintln!("Heartbeat failed to {}: {}", master_addr, e);
+                        }
+                    }
+                    Err(_) => {
+                        // Silent failure for connection error (master might be down)
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
 

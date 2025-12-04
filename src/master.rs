@@ -3,7 +3,8 @@ use crate::dfs::{
     AllocateBlockRequest, AllocateBlockResponse, BlockInfo, CompleteFileRequest,
     CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileInfoRequest, GetFileInfoResponse,
-    ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
+    HeartbeatRequest, HeartbeatResponse, ListFilesRequest, ListFilesResponse,
+    RegisterChunkServerRequest, RegisterChunkServerResponse,
 };
 use crate::simple_raft::{Command, Event};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use uuid::Uuid;
 pub struct MasterState {
     pub files: HashMap<String, FileMetadata>,
     #[serde(skip)]
-    pub chunk_servers: Vec<String>, // List of chunk server addresses (ephemeral)
+    pub chunk_servers: HashMap<String, u64>, // address -> last_heartbeat_timestamp (unix millis)
 }
 
 #[derive(Debug)]
@@ -28,6 +29,33 @@ pub struct MyMaster {
 
 impl MyMaster {
     pub fn new(state: Arc<Mutex<MasterState>>, raft_tx: mpsc::Sender<Event>) -> Self {
+        // Spawn liveness check loop
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                let mut state = state_clone.lock().unwrap();
+                // Remove chunk servers that haven't sent heartbeat in 15 seconds
+                let dead_servers: Vec<String> = state
+                    .chunk_servers
+                    .iter()
+                    .filter(|(_, &last_heartbeat)| now - last_heartbeat > 15000)
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+
+                for addr in dead_servers {
+                    println!("ChunkServer {} is dead (no heartbeat), removing...", addr);
+                    state.chunk_servers.remove(&addr);
+                }
+            }
+        });
+
         MyMaster { state, raft_tx }
     }
 }
@@ -115,7 +143,7 @@ impl MasterService for MyMaster {
                 return Err(Status::not_found("File not found"));
             }
 
-            let chunk_servers = state.chunk_servers.clone();
+            let chunk_servers: Vec<String> = state.chunk_servers.keys().cloned().collect();
             if chunk_servers.is_empty() {
                 return Err(Status::unavailable("No chunk servers available"));
             }
@@ -192,19 +220,28 @@ impl MasterService for MyMaster {
     ) -> Result<Response<RegisterChunkServerResponse>, Status> {
         let req = request.into_inner();
 
-        // We can handle registration locally or via Raft.
-        // For simplicity, let's handle it locally (ephemeral state).
-        // Or via Raft to ensure all masters know about chunkservers?
-        // If we handle locally, only the connected master knows.
-        // But chunkservers connect to ALL masters in our current implementation.
-        // So local registration is fine.
-
         let mut state = self.state.lock().unwrap();
-        if !state.chunk_servers.contains(&req.address) {
-            state.chunk_servers.push(req.address);
-        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        state.chunk_servers.insert(req.address, now);
 
         Ok(Response::new(RegisterChunkServerResponse { success: true }))
+    }
+
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let mut state = self.state.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        state.chunk_servers.insert(req.chunk_server_address, now);
+        Ok(Response::new(HeartbeatResponse { success: true }))
     }
 
     async fn get_block_locations(

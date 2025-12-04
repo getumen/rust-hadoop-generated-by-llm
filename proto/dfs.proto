@@ -15,6 +15,17 @@ service MasterService {
 
   // Block recovery
   rpc GetBlockLocations (GetBlockLocationsRequest) returns (GetBlockLocationsResponse);
+
+  // Liveness check
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message HeartbeatRequest {
+  string chunk_server_address = 1;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
 }
 
 service ChunkServerService {
