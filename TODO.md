@@ -39,7 +39,7 @@
 - [x] Add ChunkServer re-registration on Master failover (handled by heartbeat)
 - [x] Implement ChunkServer load balancing (based on available space)
 - [x] Add ChunkServer health scoring (basic stats collection)
-- [ ] Implement automatic replica rebalancing (Balancer)
+- [x] Implement automatic replica rebalancing (Balancer)
 
 ---
 

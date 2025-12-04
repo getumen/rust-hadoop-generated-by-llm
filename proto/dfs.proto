@@ -29,6 +29,18 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   bool success = 1;
+  repeated ChunkServerCommand commands = 2;
+}
+
+message ChunkServerCommand {
+  enum CommandType {
+    UNKNOWN = 0;
+    REPLICATE = 1;
+    DELETE = 2; // Future use
+  }
+  CommandType type = 1;
+  string block_id = 2;
+  string target_chunk_server_address = 3; // For REPLICATE
 }
 
 service ChunkServerService {

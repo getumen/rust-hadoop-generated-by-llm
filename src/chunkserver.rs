@@ -188,6 +188,47 @@ impl MyChunkServer {
         Err("Failed to recover block from any replica".to_string())
     }
 
+    pub async fn initiate_replication(
+        &self,
+        block_id: &str,
+        target_addr: &str,
+    ) -> Result<(), String> {
+        // 1. Read block data locally
+        let path = self.storage_dir.join(block_id);
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => return Err(format!("Failed to read block {}: {}", block_id, e)),
+        };
+
+        // 2. Send ReplicateBlock RPC to target
+        let target_url = format!("http://{}", target_addr);
+        let mut client =
+            match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
+                target_url,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to connect to target {}: {}",
+                        target_addr, e
+                    ))
+                }
+            };
+
+        let request = tonic::Request::new(crate::dfs::ReplicateBlockRequest {
+            block_id: block_id.to_string(),
+            data,
+            next_servers: vec![], // No further forwarding
+        });
+
+        match client.replicate_block(request).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Replication failed: {}", e)),
+        }
+    }
+
     pub async fn run_background_scrubber(
         storage_dir: PathBuf,
         master_addrs: Vec<String>,

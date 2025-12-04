@@ -1,7 +1,7 @@
 use crate::dfs::master_service_server::MasterService;
 use crate::dfs::{
-    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, CompleteFileRequest,
-    CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
+    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, ChunkServerCommand,
+    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileInfoRequest, GetFileInfoResponse,
     HeartbeatRequest, HeartbeatResponse, ListFilesRequest, ListFilesResponse,
     RegisterChunkServerRequest, RegisterChunkServerResponse,
@@ -27,6 +27,8 @@ pub struct MasterState {
     pub files: HashMap<String, FileMetadata>,
     #[serde(skip)]
     pub chunk_servers: HashMap<String, ChunkServerStatus>, // address -> status
+    #[serde(skip)]
+    pub pending_commands: HashMap<String, Vec<ChunkServerCommand>>, // address -> commands
 }
 
 #[derive(Debug)]
@@ -60,6 +62,74 @@ impl MyMaster {
                 for addr in dead_servers {
                     println!("ChunkServer {} is dead (no heartbeat), removing...", addr);
                     state.chunk_servers.remove(&addr);
+                    state.pending_commands.remove(&addr);
+                }
+            }
+        });
+
+        // Spawn balancer task
+        let state_clone_balancer = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30)); // Check every 30s
+            loop {
+                interval.tick().await;
+                let mut state = state_clone_balancer.lock().unwrap();
+
+                let servers: Vec<(String, u64)> = state
+                    .chunk_servers
+                    .iter()
+                    .map(|(addr, status)| (addr.clone(), status.available_space))
+                    .collect();
+
+                if servers.len() < 2 {
+                    continue;
+                }
+
+                let mut sorted_servers = servers;
+                sorted_servers.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending available space (Least available first)
+
+                let (most_full_addr, min_avail) = sorted_servers.first().unwrap();
+                let (least_full_addr, max_avail) = sorted_servers.last().unwrap();
+
+                // If difference is greater than 100MB (arbitrary threshold for demo)
+                // In real world, use percentage or standard deviation
+                if max_avail > min_avail && (max_avail - min_avail) > 100 * 1024 * 1024 {
+                    println!(
+                        "Balancer: Detected imbalance. Moving block from {} to {}",
+                        most_full_addr, least_full_addr
+                    );
+
+                    // Find a block on the most full server to move
+                    let mut block_to_move = None;
+                    'outer: for file in state.files.values() {
+                        for block in &file.blocks {
+                            if block.locations.contains(most_full_addr)
+                                && !block.locations.contains(least_full_addr)
+                            {
+                                block_to_move = Some(block.block_id.clone());
+                                break 'outer;
+                            }
+                        }
+                    }
+
+                    if let Some(block_id) = block_to_move {
+                        let command = ChunkServerCommand {
+                            r#type: 1, // REPLICATE
+                            block_id: block_id.clone(),
+                            target_chunk_server_address: least_full_addr.clone(),
+                        };
+
+                        state
+                            .pending_commands
+                            .entry(most_full_addr.clone())
+                            .or_default()
+                            .push(command);
+
+                        println!(
+                            "Balancer: Scheduled replication of block {} from {} to {}",
+                            block_id, most_full_addr, least_full_addr
+                        );
+                    }
                 }
             }
         });
@@ -70,6 +140,7 @@ impl MyMaster {
 
 #[tonic::async_trait]
 impl MasterService for MyMaster {
+    // ... (existing methods) ...
     async fn get_file_info(
         &self,
         request: Request<GetFileInfoRequest>,
@@ -271,7 +342,7 @@ impl MasterService for MyMaster {
             .as_millis() as u64;
 
         state.chunk_servers.insert(
-            req.chunk_server_address,
+            req.chunk_server_address.clone(),
             ChunkServerStatus {
                 last_heartbeat: now,
                 used_space: req.used_space,
@@ -279,7 +350,17 @@ impl MasterService for MyMaster {
                 chunk_count: req.chunk_count,
             },
         );
-        Ok(Response::new(HeartbeatResponse { success: true }))
+
+        // Retrieve pending commands
+        let commands = state
+            .pending_commands
+            .remove(&req.chunk_server_address)
+            .unwrap_or_default();
+
+        Ok(Response::new(HeartbeatResponse {
+            success: true,
+            commands,
+        }))
     }
 
     async fn get_block_locations(

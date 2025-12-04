@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
     let storage_dir_heartbeat = args.storage_dir.clone();
+    let chunk_server_heartbeat = chunk_server.clone();
 
     tokio::spawn(async move {
         // 1. Initial Registration
@@ -115,8 +116,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chunk_count,
                         });
 
-                        if let Err(e) = client.heartbeat(request).await {
-                            eprintln!("Heartbeat failed to {}: {}", master_addr, e);
+                        match client.heartbeat(request).await {
+                            Ok(response) => {
+                                let resp = response.into_inner();
+                                for command in resp.commands {
+                                    if command.r#type == 1 {
+                                        // REPLICATE
+                                        println!(
+                                            "Received replication command for block {} to {}",
+                                            command.block_id, command.target_chunk_server_address
+                                        );
+                                        let chunk_server_clone = chunk_server_heartbeat.clone();
+                                        let block_id = command.block_id.clone();
+                                        let target = command.target_chunk_server_address.clone();
+
+                                        tokio::spawn(async move {
+                                            if let Err(e) = chunk_server_clone
+                                                .initiate_replication(&block_id, &target)
+                                                .await
+                                            {
+                                                eprintln!("Replication failed: {}", e);
+                                            } else {
+                                                println!(
+                                                    "Replication of block {} to {} completed",
+                                                    block_id, target
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Heartbeat failed to {}: {}", master_addr, e);
+                            }
                         }
                     }
                     Err(_) => {
