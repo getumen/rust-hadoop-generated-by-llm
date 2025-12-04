@@ -6,3 +6,4 @@ pub mod chunkserver;
 pub mod master;
 pub mod sharding;
 pub mod simple_raft;
+pub mod config_server;

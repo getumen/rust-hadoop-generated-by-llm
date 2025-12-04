@@ -155,3 +155,40 @@ message GetBlockLocationsResponse {
   repeated string locations = 1;
   bool found = 2;
 }
+
+service ConfigService {
+  rpc FetchShardMap (FetchShardMapRequest) returns (FetchShardMapResponse);
+  rpc AddShard (AddShardRequest) returns (AddShardResponse);
+  rpc RemoveShard (RemoveShardRequest) returns (RemoveShardResponse);
+}
+
+message FetchShardMapRequest {}
+
+message ShardPeers {
+  repeated string peers = 1;
+}
+
+message FetchShardMapResponse {
+  map<string, ShardPeers> shards = 1;
+}
+
+message AddShardRequest {
+  string shard_id = 1;
+  repeated string peers = 2;
+}
+
+message AddShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message RemoveShardRequest {
+  string shard_id = 1;
+}
+
+message RemoveShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}

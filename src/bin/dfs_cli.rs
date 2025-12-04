@@ -290,7 +290,8 @@ where
                 Err(status) => {
                     let msg = status.message();
                     if msg.starts_with("REDIRECT:") {
-                        let parts: Vec<&str> = msg.split(':').collect();
+                        // Use splitn to split only on the first colon
+                        let parts: Vec<&str> = msg.splitn(2, ':').collect();
                         if parts.len() > 1 && !parts[1].is_empty() {
                             leader_hint = Some(parts[1].to_string());
                             eprintln!("Received SHARD REDIRECT to: {}", parts[1]);

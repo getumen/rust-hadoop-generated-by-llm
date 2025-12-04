@@ -1,4 +1,5 @@
 use crate::master::MasterState;
+use crate::sharding::ShardMap;
 use rand::Rng;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,13 @@ pub struct LogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    Master(MasterCommand),
+    Config(ConfigCommand),
+    NoOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MasterCommand {
     CreateFile {
         path: String,
     },
@@ -32,7 +40,23 @@ pub enum Command {
     RegisterChunkServer {
         address: String,
     },
-    NoOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConfigCommand {
+    AddShard {
+        shard_id: String,
+        peers: Vec<String>,
+    },
+    RemoveShard {
+        shard_id: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum AppState {
+    Master(MasterState),
+    Config(ShardMap),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,7 +163,7 @@ pub struct RaftNode {
 
     pub inbox: mpsc::Receiver<Event>,
     pub self_tx: mpsc::Sender<Event>,
-    pub app_state: Arc<Mutex<MasterState>>,
+    pub app_state: Arc<Mutex<AppState>>,
     pub votes_received: usize,
 
     pub db: Arc<DB>, // RocksDB instance
@@ -152,7 +176,7 @@ impl RaftNode {
         peers: Vec<String>,
         client_address: String,
         storage_dir: String,
-        app_state: Arc<Mutex<MasterState>>,
+        app_state: Arc<Mutex<AppState>>,
         inbox: mpsc::Receiver<Event>,
         self_tx: mpsc::Sender<Event>,
     ) -> Self {
@@ -199,7 +223,7 @@ impl RaftNode {
 
     fn load_state(
         db: &DB,
-        app_state: &Arc<Mutex<MasterState>>,
+        app_state: &Arc<Mutex<AppState>>,
     ) -> (u64, Option<usize>, Vec<LogEntry>, usize, u64) {
         let term = match db.get(b"term") {
             Ok(Some(val)) => match val.try_into() {
@@ -229,12 +253,20 @@ impl RaftNode {
                     Ok(meta) => {
                         // Load snapshot data and restore app state
                         if let Ok(Some(snapshot_data)) = db.get(b"snapshot_data") {
-                            match serde_json::from_slice::<MasterState>(&snapshot_data) {
+                            match serde_json::from_slice::<AppState>(&snapshot_data) {
                                 Ok(state) => {
                                     *app_state.lock().unwrap() = state;
                                 }
-                                Err(e) => {
-                                    eprintln!("Error: Failed to deserialize snapshot data: {}", e);
+                                Err(_) => {
+                                    // Try legacy MasterState
+                                    match serde_json::from_slice::<MasterState>(&snapshot_data) {
+                                        Ok(state) => {
+                                            *app_state.lock().unwrap() = AppState::Master(state);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Error: Failed to deserialize snapshot data: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -399,9 +431,16 @@ impl RaftNode {
             .expect("Failed to save snapshot data to DB");
 
         // Restore app state
-        let state: MasterState =
-            serde_json::from_slice(&snapshot.data).expect("Failed to deserialize snapshot data");
-        *self.app_state.lock().unwrap() = state;
+        match serde_json::from_slice::<AppState>(&snapshot.data) {
+            Ok(state) => *self.app_state.lock().unwrap() = state,
+            Err(_) => {
+                 // Try legacy MasterState
+                 match serde_json::from_slice::<MasterState>(&snapshot.data) {
+                     Ok(state) => *self.app_state.lock().unwrap() = AppState::Master(state),
+                     Err(e) => eprintln!("Error: Failed to deserialize snapshot data: {}", e),
+                 }
+            }
+        }
 
         // Delete old log entries
         for i in (self.last_included_index + 1)..=snapshot.last_included_index {
@@ -981,31 +1020,53 @@ impl RaftNode {
     fn apply_command(&self, command: &Command) {
         let mut state = self.app_state.lock().unwrap();
         match command {
-            Command::CreateFile { path } => {
-                state.files.insert(
-                    path.clone(),
-                    crate::dfs::FileMetadata {
-                        path: path.clone(),
-                        size: 0,
-                        blocks: vec![],
-                    },
-                );
-            }
-            Command::AllocateBlock {
-                path,
-                block_id,
-                locations,
-            } => {
-                if let Some(meta) = state.files.get_mut(path) {
-                    meta.blocks.push(crate::dfs::BlockInfo {
-                        block_id: block_id.clone(),
-                        size: 0,
-                        locations: locations.clone(),
-                    });
+            Command::Master(cmd) => {
+                if let AppState::Master(ref mut master_state) = *state {
+                    match cmd {
+                        MasterCommand::CreateFile { path } => {
+                            master_state.files.insert(
+                                path.clone(),
+                                crate::dfs::FileMetadata {
+                                    path: path.clone(),
+                                    size: 0,
+                                    blocks: vec![],
+                                },
+                            );
+                        }
+                        MasterCommand::AllocateBlock {
+                            path,
+                            block_id,
+                            locations,
+                        } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.blocks.push(crate::dfs::BlockInfo {
+                                    block_id: block_id.clone(),
+                                    size: 0,
+                                    locations: locations.clone(),
+                                });
+                            }
+                        }
+                        MasterCommand::RegisterChunkServer { address: _ } => {
+                            // ChunkServer registration is handled locally, not via Raft
+                        }
+                    }
+                } else {
+                    eprintln!("Error: Received MasterCommand but state is not MasterState");
                 }
             }
-            Command::RegisterChunkServer { address: _ } => {
-                // ChunkServer registration is handled locally, not via Raft
+            Command::Config(cmd) => {
+                if let AppState::Config(ref mut shard_map) = *state {
+                    match cmd {
+                        ConfigCommand::AddShard { shard_id, peers } => {
+                            shard_map.add_shard(shard_id.clone(), peers.clone());
+                        }
+                        ConfigCommand::RemoveShard { shard_id } => {
+                            shard_map.remove_shard(shard_id);
+                        }
+                    }
+                } else {
+                    eprintln!("Error: Received ConfigCommand but state is not ConfigState");
+                }
             }
             Command::NoOp => {}
         }

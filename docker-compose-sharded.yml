@@ -1,6 +1,19 @@
 version: '3.8'
 
 services:
+  # Config Server
+  config-server:
+    build: .
+    container_name: config-server
+    command: /app/config_server --addr 0.0.0.0:50052 --id 0 --peers "" --http-port 8081 --storage-dir /data/config-raft --advertise-addr http://config-server:50052
+    ports:
+      - "50050:50052"
+      - "8080:8081"
+    networks:
+      - dfs-network
+    volumes:
+      - config-server-data:/data/config-raft
+
   # Shard 0
   master-0-0:
     build: .
@@ -115,6 +128,7 @@ networks:
     driver: bridge
 
 volumes:
+  config-server-data:
   master-0-0-data:
   master-0-1-data:
   master-0-2-data:

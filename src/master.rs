@@ -6,7 +6,7 @@ use crate::dfs::{
     HeartbeatRequest, HeartbeatResponse, ListFilesRequest, ListFilesResponse,
     RegisterChunkServerRequest, RegisterChunkServerResponse,
 };
-use crate::simple_raft::{Command, Event};
+use crate::simple_raft::{AppState, Command, Event, MasterCommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ use crate::sharding::{ShardId, ShardMap};
 
 #[derive(Debug)]
 pub struct MyMaster {
-    state: Arc<Mutex<MasterState>>,
+    state: Arc<Mutex<AppState>>,
     raft_tx: mpsc::Sender<Event>,
     shard_map: Arc<Mutex<ShardMap>>,
     shard_id: ShardId,
@@ -43,7 +43,7 @@ pub struct MyMaster {
 
 impl MyMaster {
     pub fn new(
-        state: Arc<Mutex<MasterState>>,
+        state: Arc<Mutex<AppState>>,
         raft_tx: mpsc::Sender<Event>,
         shard_map: Arc<Mutex<ShardMap>>,
         shard_id: ShardId,
@@ -59,19 +59,21 @@ impl MyMaster {
                     .unwrap()
                     .as_millis() as u64;
 
-                let mut state = state_clone.lock().unwrap();
-                // Remove chunk servers that haven't sent heartbeat in 15 seconds
-                let dead_servers: Vec<String> = state
-                    .chunk_servers
-                    .iter()
-                    .filter(|(_, status)| now - status.last_heartbeat > 15000)
-                    .map(|(addr, _)| addr.clone())
-                    .collect();
+                let mut state_lock = state_clone.lock().unwrap();
+                if let AppState::Master(ref mut state) = *state_lock {
+                    // Remove chunk servers that haven't sent heartbeat in 15 seconds
+                    let dead_servers: Vec<String> = state
+                        .chunk_servers
+                        .iter()
+                        .filter(|(_, status)| now - status.last_heartbeat > 15000)
+                        .map(|(addr, _)| addr.clone())
+                        .collect();
 
-                for addr in dead_servers {
-                    println!("ChunkServer {} is dead (no heartbeat), removing...", addr);
-                    state.chunk_servers.remove(&addr);
-                    state.pending_commands.remove(&addr);
+                    for addr in dead_servers {
+                        println!("ChunkServer {} is dead (no heartbeat), removing...", addr);
+                        state.chunk_servers.remove(&addr);
+                        state.pending_commands.remove(&addr);
+                    }
                 }
             }
         });
@@ -82,62 +84,63 @@ impl MyMaster {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30)); // Check every 30s
             loop {
                 interval.tick().await;
-                let mut state = state_clone_balancer.lock().unwrap();
+                let mut state_lock = state_clone_balancer.lock().unwrap();
+                if let AppState::Master(ref mut state) = *state_lock {
+                    let servers: Vec<(String, u64)> = state
+                        .chunk_servers
+                        .iter()
+                        .map(|(addr, status)| (addr.clone(), status.available_space))
+                        .collect();
 
-                let servers: Vec<(String, u64)> = state
-                    .chunk_servers
-                    .iter()
-                    .map(|(addr, status)| (addr.clone(), status.available_space))
-                    .collect();
-
-                if servers.len() < 2 {
-                    continue;
-                }
-
-                let mut sorted_servers = servers;
-                sorted_servers.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending available space (Least available first)
-
-                let (most_full_addr, min_avail) = sorted_servers.first().unwrap();
-                let (least_full_addr, max_avail) = sorted_servers.last().unwrap();
-
-                // If difference is greater than 100MB (arbitrary threshold for demo)
-                // In real world, use percentage or standard deviation
-                if max_avail > min_avail && (max_avail - min_avail) > 100 * 1024 * 1024 {
-                    println!(
-                        "Balancer: Detected imbalance. Moving block from {} to {}",
-                        most_full_addr, least_full_addr
-                    );
-
-                    // Find a block on the most full server to move
-                    let mut block_to_move = None;
-                    'outer: for file in state.files.values() {
-                        for block in &file.blocks {
-                            if block.locations.contains(most_full_addr)
-                                && !block.locations.contains(least_full_addr)
-                            {
-                                block_to_move = Some(block.block_id.clone());
-                                break 'outer;
-                            }
-                        }
+                    if servers.len() < 2 {
+                        continue;
                     }
 
-                    if let Some(block_id) = block_to_move {
-                        let command = ChunkServerCommand {
-                            r#type: 1, // REPLICATE
-                            block_id: block_id.clone(),
-                            target_chunk_server_address: least_full_addr.clone(),
-                        };
+                    let mut sorted_servers = servers;
+                    sorted_servers.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending available space (Least available first)
 
-                        state
-                            .pending_commands
-                            .entry(most_full_addr.clone())
-                            .or_default()
-                            .push(command);
+                    let (most_full_addr, min_avail) = sorted_servers.first().unwrap();
+                    let (least_full_addr, max_avail) = sorted_servers.last().unwrap();
 
+                    // If difference is greater than 100MB (arbitrary threshold for demo)
+                    // In real world, use percentage or standard deviation
+                    if max_avail > min_avail && (max_avail - min_avail) > 100 * 1024 * 1024 {
                         println!(
-                            "Balancer: Scheduled replication of block {} from {} to {}",
-                            block_id, most_full_addr, least_full_addr
+                            "Balancer: Detected imbalance. Moving block from {} to {}",
+                            most_full_addr, least_full_addr
                         );
+
+                        // Find a block on the most full server to move
+                        let mut block_to_move = None;
+                        'outer: for file in state.files.values() {
+                            for block in &file.blocks {
+                                if block.locations.contains(most_full_addr)
+                                    && !block.locations.contains(least_full_addr)
+                                {
+                                    block_to_move = Some(block.block_id.clone());
+                                    break 'outer;
+                                }
+                            }
+                        }
+
+                        if let Some(block_id) = block_to_move {
+                            let command = ChunkServerCommand {
+                                r#type: 1, // REPLICATE
+                                block_id: block_id.clone(),
+                                target_chunk_server_address: least_full_addr.clone(),
+                            };
+
+                            state
+                                .pending_commands
+                                .entry(most_full_addr.clone())
+                                .or_default()
+                                .push(command);
+
+                            println!(
+                                "Balancer: Scheduled replication of block {} from {} to {}",
+                                block_id, most_full_addr, least_full_addr
+                            );
+                        }
                     }
                 }
             }
@@ -183,18 +186,21 @@ impl MasterService for MyMaster {
 
         self.check_shard_ownership(&req.path)?;
 
-        let state = self.state.lock().unwrap();
-
-        if let Some(metadata) = state.files.get(&req.path) {
-            Ok(Response::new(GetFileInfoResponse {
-                metadata: Some(metadata.clone()),
-                found: true,
-            }))
+        let state_lock = self.state.lock().unwrap();
+        if let AppState::Master(ref state) = *state_lock {
+            if let Some(metadata) = state.files.get(&req.path) {
+                Ok(Response::new(GetFileInfoResponse {
+                    metadata: Some(metadata.clone()),
+                    found: true,
+                }))
+            } else {
+                Ok(Response::new(GetFileInfoResponse {
+                    metadata: None,
+                    found: false,
+                }))
+            }
         } else {
-            Ok(Response::new(GetFileInfoResponse {
-                metadata: None,
-                found: false,
-            }))
+            Err(Status::internal("Wrong state type"))
         }
     }
 
@@ -206,13 +212,15 @@ impl MasterService for MyMaster {
 
         // Check if file exists (read optimization)
         {
-            let state = self.state.lock().unwrap();
-            if state.files.contains_key(&req.path) {
-                return Ok(Response::new(CreateFileResponse {
-                    success: false,
-                    error_message: "File already exists".to_string(),
-                    leader_hint: "".to_string(),
-                }));
+            let state_lock = self.state.lock().unwrap();
+            if let AppState::Master(ref state) = *state_lock {
+                if state.files.contains_key(&req.path) {
+                    return Ok(Response::new(CreateFileResponse {
+                        success: false,
+                        error_message: "File already exists".to_string(),
+                        leader_hint: "".to_string(),
+                    }));
+                }
             }
         }
 
@@ -220,7 +228,7 @@ impl MasterService for MyMaster {
         if self
             .raft_tx
             .send(Event::ClientRequest {
-                command: Command::CreateFile { path: req.path },
+                command: Command::Master(MasterCommand::CreateFile { path: req.path }),
                 reply_tx: tx,
             })
             .await
@@ -254,27 +262,31 @@ impl MasterService for MyMaster {
         const REPLICATION_FACTOR: usize = 3;
 
         let (chunk_servers, block_id) = {
-            let state = self.state.lock().unwrap();
-            if !state.files.contains_key(&req.path) {
-                return Err(Status::not_found("File not found"));
+            let state_lock = self.state.lock().unwrap();
+            if let AppState::Master(ref state) = *state_lock {
+                if !state.files.contains_key(&req.path) {
+                    return Err(Status::not_found("File not found"));
+                }
+
+                // Load balancing: Select chunk servers with most available space
+                let mut candidates: Vec<(String, u64)> = state
+                    .chunk_servers
+                    .iter()
+                    .map(|(addr, status)| (addr.clone(), status.available_space))
+                    .collect();
+
+                if candidates.is_empty() {
+                    return Err(Status::unavailable("No chunk servers available"));
+                }
+
+                // Sort by available space descending
+                candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+                let chunk_servers: Vec<String> = candidates.into_iter().map(|(addr, _)| addr).collect();
+                (chunk_servers, Uuid::new_v4().to_string())
+            } else {
+                return Err(Status::internal("Wrong state type"));
             }
-
-            // Load balancing: Select chunk servers with most available space
-            let mut candidates: Vec<(String, u64)> = state
-                .chunk_servers
-                .iter()
-                .map(|(addr, status)| (addr.clone(), status.available_space))
-                .collect();
-
-            if candidates.is_empty() {
-                return Err(Status::unavailable("No chunk servers available"));
-            }
-
-            // Sort by available space descending
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
-
-            let chunk_servers: Vec<String> = candidates.into_iter().map(|(addr, _)| addr).collect();
-            (chunk_servers, Uuid::new_v4().to_string())
         };
 
         // Select chunk servers
@@ -286,11 +298,11 @@ impl MasterService for MyMaster {
         if self
             .raft_tx
             .send(Event::ClientRequest {
-                command: Command::AllocateBlock {
+                command: Command::Master(MasterCommand::AllocateBlock {
                     path: req.path,
                     block_id: block_id.clone(),
                     locations: selected_servers.clone(),
-                },
+                }),
                 reply_tx: tx,
             })
             .await
@@ -336,9 +348,13 @@ impl MasterService for MyMaster {
         &self,
         _request: Request<ListFilesRequest>,
     ) -> Result<Response<ListFilesResponse>, Status> {
-        let state = self.state.lock().unwrap();
-        let files: Vec<String> = state.files.keys().cloned().collect();
-        Ok(Response::new(ListFilesResponse { files }))
+        let state_lock = self.state.lock().unwrap();
+        if let AppState::Master(ref state) = *state_lock {
+            let files: Vec<String> = state.files.keys().cloned().collect();
+            Ok(Response::new(ListFilesResponse { files }))
+        } else {
+            Err(Status::internal("Wrong state type"))
+        }
     }
 
     async fn register_chunk_server(
@@ -347,22 +363,24 @@ impl MasterService for MyMaster {
     ) -> Result<Response<RegisterChunkServerResponse>, Status> {
         let req = request.into_inner();
 
-        let mut state = self.state.lock().unwrap();
+        let mut state_lock = self.state.lock().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        // Initial registration with default stats or provided capacity
-        state.chunk_servers.insert(
-            req.address,
-            ChunkServerStatus {
-                last_heartbeat: now,
-                used_space: 0,
-                available_space: req.capacity,
-                chunk_count: 0,
-            },
-        );
+        if let AppState::Master(ref mut state) = *state_lock {
+            // Initial registration with default stats or provided capacity
+            state.chunk_servers.insert(
+                req.address,
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: req.capacity,
+                    chunk_count: 0,
+                },
+            );
+        }
 
         Ok(Response::new(RegisterChunkServerResponse { success: true }))
     }
@@ -372,32 +390,39 @@ impl MasterService for MyMaster {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.lock().unwrap();
+        let mut state_lock = self.state.lock().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
 
-        state.chunk_servers.insert(
-            req.chunk_server_address.clone(),
-            ChunkServerStatus {
-                last_heartbeat: now,
-                used_space: req.used_space,
-                available_space: req.available_space,
-                chunk_count: req.chunk_count,
-            },
-        );
+        if let AppState::Master(ref mut state) = *state_lock {
+            state.chunk_servers.insert(
+                req.chunk_server_address.clone(),
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: req.used_space,
+                    available_space: req.available_space,
+                    chunk_count: req.chunk_count,
+                },
+            );
 
-        // Retrieve pending commands
-        let commands = state
-            .pending_commands
-            .remove(&req.chunk_server_address)
-            .unwrap_or_default();
+            // Retrieve pending commands
+            let commands = state
+                .pending_commands
+                .remove(&req.chunk_server_address)
+                .unwrap_or_default();
 
-        Ok(Response::new(HeartbeatResponse {
-            success: true,
-            commands,
-        }))
+            Ok(Response::new(HeartbeatResponse {
+                success: true,
+                commands,
+            }))
+        } else {
+            Ok(Response::new(HeartbeatResponse {
+                success: false,
+                commands: vec![],
+            }))
+        }
     }
 
     async fn get_block_locations(
@@ -405,16 +430,17 @@ impl MasterService for MyMaster {
         request: Request<GetBlockLocationsRequest>,
     ) -> Result<Response<GetBlockLocationsResponse>, Status> {
         let req = request.into_inner();
-        let state = self.state.lock().unwrap();
-
-        // Search for the block in all files
-        for file_metadata in state.files.values() {
-            for block in &file_metadata.blocks {
-                if block.block_id == req.block_id {
-                    return Ok(Response::new(GetBlockLocationsResponse {
-                        locations: block.locations.clone(),
-                        found: true,
-                    }));
+        let state_lock = self.state.lock().unwrap();
+        if let AppState::Master(ref state) = *state_lock {
+            // Search for the block in all files
+            for file_metadata in state.files.values() {
+                for block in &file_metadata.blocks {
+                    if block.block_id == req.block_id {
+                        return Ok(Response::new(GetBlockLocationsResponse {
+                            locations: block.locations.clone(),
+                            found: true,
+                        }));
+                    }
                 }
             }
         }

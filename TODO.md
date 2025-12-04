@@ -33,10 +33,10 @@
   - [x] Update Client to handle `Redirect` responses
   - [ ] Implement client-side `ShardMap` caching (Skipped for now, relying on redirect)
   - [ ] Add logic to pre-calculate target shard before sending request (Smart Client) (Skipped for now)
-- [ ] **1.5 Shard Management (Raft-based)**
-  - [ ] Design "Configuration Group" (Meta-Shard) to store authoritative `ShardMap`
-  - [ ] Implement `FetchShardMap` RPC
-  - [ ] Allow dynamic addition/removal of Shards via Config Group
+- [x] **1.5 Shard Management (Raft-based)**
+  - [x] Design "Configuration Group" (Meta-Shard) to store authoritative `ShardMap`
+  - [x] Implement `FetchShardMap` RPC
+  - [x] Allow dynamic addition/removal of Shards via Config Group
 - [ ] **1.6 Cross-Shard Operations**
   - [ ] Identify cross-shard scenarios (e.g., `rename`)
   - [ ] Implement basic 2PC or restrict operations to single shard initially

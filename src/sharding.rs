@@ -5,9 +5,11 @@ use std::hash::{Hash, Hasher};
 /// ShardId is a unique identifier for a Raft Group (Shard).
 pub type ShardId = String;
 
+use serde::{Deserialize, Serialize};
+
 /// ShardMap manages the mapping between keys and Shards using Consistent Hashing.
 /// It uses Virtual Nodes to ensure even distribution of load.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardMap {
     /// The hash ring mapping hash values to ShardIds.
     /// We use BTreeMap to keep keys sorted for efficient lookup.
