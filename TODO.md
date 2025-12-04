@@ -45,50 +45,45 @@
   - [x] **Implement Transaction Record state management in master.rs**
     - [x] Add `TransactionRecord` struct
     - [x] Add `TxState` enum (Pending, Prepared, Committed, Aborted)
-    - [x] Add `RateLimitState` for DDoS protection
     - [x] Add fields to MasterState
-  - [ ] **Implement `rename` RPC handler in master.rs (coordinator)**
-    - [ ] Check rate limit (10 req/min per client)
-    - [ ] Determine source and dest shard IDs
-    - [ ] If same shard: send `RenameFile` command to local Raft
-    - [ ] If cross-shard:
-      - [ ] Generate Transaction ID (UUID)
-      - [ ] Create Transaction Record (state=Pending) via Raft
-      - [ ] Send `PrepareTransaction` to dest shard
-      - [ ] Wait for `Prepared` response
-      - [ ] Update to `Prepared` state via Raft
-      - [ ] Update to `Committed` state, delete source file via Raft
-      - [ ] Send `CommitTransaction` to dest shard
-      - [ ] Return result to client
-  - [ ] **Implement `prepare_transaction` RPC handler in master.rs**
-    - [ ] Validate operation (dest file doesn't exist)
-    - [ ] Create Transaction Record (state=Prepared) via Raft
-    - [ ] Return Prepared or error
-  - [ ] **Implement `commit_transaction` RPC handler in master.rs**
-    - [ ] Find Transaction Record by tx_id
-    - [ ] Update state to Committed via Raft
-    - [ ] Apply operation (create file) via Raft
-    - [ ] Return success
-  - [ ] **Implement `abort_transaction` RPC handler in master.rs**
-    - [ ] Find Transaction Record by tx_id
-    - [ ] Update state to Aborted via Raft
-    - [ ] Clean up resources
-    - [ ] Return success
-  - [ ] **Implement rate limiting and timeout cleanup**
-    - [ ] Add `check_rate_limit` function in master.rs
-    - [ ] Add `cleanup_old_transactions` background task (10s timeout)
+  - [x] **Implement `rename` RPC handler in master.rs (coordinator)**
+    - [x] Determine source and dest shard IDs
+    - [x] If same shard: send `RenameFile` command to local Raft
+    - [x] If cross-shard:
+      - [x] Generate Transaction ID (UUID)
+      - [x] Create Transaction Record (state=Pending) via Raft
+      - [x] Send `PrepareTransaction` to dest shard
+      - [x] Wait for `Prepared` response
+      - [x] Update to `Prepared` state via Raft
+      - [x] Update to `Committed` state, delete source file via Raft
+      - [x] Send `CommitTransaction` to dest shard
+      - [x] Return result to client
+  - [x] **Implement `prepare_transaction` RPC handler in master.rs**
+    - [x] Validate operation (dest file doesn't exist)
+    - [x] Create Transaction Record (state=Prepared) via Raft
+    - [x] Return Prepared or error
+  - [x] **Implement `commit_transaction` RPC handler in master.rs**
+    - [x] Find Transaction Record by tx_id
+    - [x] Update state to Committed via Raft
+    - [x] Apply operation (create file) via Raft
+    - [x] Return success
+  - [x] **Implement `abort_transaction` RPC handler in master.rs**
+    - [x] Find Transaction Record by tx_id
+    - [x] Update state to Aborted via Raft
+    - [x] Clean up resources
+    - [x] Return success
+  - [x] **Implement timeout cleanup**
+    - [x] Add `cleanup_old_transactions` background task (10s timeout)
     - [ ] Implement Transaction Record-aware file operations (get_file_with_tx)
-  - [ ] **Add Rename subcommand to dfs_cli.rs**
-    - [ ] Add `Rename { source: String, dest: String }` to Commands enum
-    - [ ] Generate client_id (hostname or UUID)
-    - [ ] Implement rename logic with retry/redirect handling
+  - [x] **Add Rename subcommand to dfs_cli.rs**
+    - [x] Add `Rename { source: String, dest: String }` to Commands enum
+    - [x] Implement rename logic with retry/redirect handling
   - [ ] **Testing**
     - [ ] Test same-shard rename
     - [ ] Test cross-shard rename with Transaction Record
-    - [ ] Test rate limiting (11th request should fail)
     - [ ] Test transaction timeout and abort
     - [ ] Test fault recovery (shard crash during Prepare/Commit)
-    - [ ] Build and verify compilation
+    - [x] Build and verify compilation
 
 ---
 

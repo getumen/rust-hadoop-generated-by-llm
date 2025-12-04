@@ -3,7 +3,7 @@ use rust_hadoop::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use rust_hadoop::dfs::master_service_client::MasterServiceClient;
 use rust_hadoop::dfs::{
     AllocateBlockRequest, CreateFileRequest, GetFileInfoRequest, ListFilesRequest,
-    ReadBlockRequest, WriteBlockRequest,
+    ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,8 +35,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Ls,
-    Put { source: PathBuf, dest: String },
-    Get { source: String, dest: PathBuf },
+    Put {
+        source: PathBuf,
+        dest: String,
+    },
+    Get {
+        source: String,
+        dest: PathBuf,
+    },
+    /// Rename a file (supports cross-shard rename)
+    Rename {
+        /// Source file path
+        source: String,
+        /// Destination file path
+        dest: String,
+    },
 }
 
 #[tokio::main]
@@ -232,6 +245,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!("File downloaded successfully");
+        }
+        Commands::Rename { source, dest } => {
+            let rename_resp = execute_with_retry(
+                &master_addrs,
+                max_retries,
+                initial_backoff_ms,
+                |mut client| {
+                    let source = source.clone();
+                    let dest = dest.clone();
+                    async move {
+                        let rename_req = tonic::Request::new(RenameRequest {
+                            source_path: source,
+                            dest_path: dest,
+                        });
+                        let response = client.rename(rename_req).await?;
+                        let inner = response.get_ref();
+                        if !inner.success && inner.error_message == "Not Leader" {
+                            return Err(tonic::Status::unavailable(format!(
+                                "Not Leader|{}",
+                                inner.leader_hint
+                            )));
+                        }
+                        if !inner.redirect_hint.is_empty() {
+                            return Err(tonic::Status::out_of_range(format!(
+                                "REDIRECT:{}",
+                                inner.redirect_hint
+                            )));
+                        }
+                        Ok(response)
+                    }
+                },
+            )
+            .await?
+            .into_inner();
+
+            if rename_resp.success {
+                println!("File renamed successfully: {} -> {}", source, dest);
+            } else {
+                eprintln!("Failed to rename file: {}", rename_resp.error_message);
+            }
         }
     }
 
