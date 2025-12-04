@@ -255,18 +255,21 @@ where
     loop {
         attempt += 1;
 
-        let mut targets = if let Some(hint) = leader_hint.take() {
-            let mut t = vec![hint];
+        let targets = if let Some(hint) = leader_hint.take() {
+            // Ensure hint has http:// prefix
+            let hint_with_prefix = if hint.starts_with("http://") {
+                hint
+            } else {
+                format!("http://{}", hint)
+            };
+            eprintln!("Using leader hint with prefix: {}", hint_with_prefix);
+            let mut t = vec![hint_with_prefix];
             // Add original masters as fallback, avoiding duplicates if possible, but simple append is fine for now
             t.extend_from_slice(masters);
             t
         } else {
             masters.to_vec()
         };
-
-        // Remove duplicates to avoid trying same server multiple times in one attempt
-        targets.sort();
-        targets.dedup();
 
         for master_addr in targets {
             if master_addr.is_empty() {
@@ -275,7 +278,10 @@ where
 
             let client = match MasterServiceClient::connect(master_addr.clone()).await {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("Failed to connect to {}: {}", master_addr, e);
+                    continue;
+                }
             };
             let client = client.max_decoding_message_size(100 * 1024 * 1024);
 

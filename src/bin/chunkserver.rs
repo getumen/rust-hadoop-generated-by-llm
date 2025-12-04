@@ -34,12 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_server = MyChunkServer::new(args.storage_dir.clone(), master_addrs_raw.clone());
 
     // Start background scrubber
-    let storage_dir = args.storage_dir.clone();
+    let storage_dir_scrubber = args.storage_dir.clone();
     let master_addrs_for_scrubber = master_addrs_raw.clone();
     tokio::spawn(async move {
         // Run scrubber every 60 seconds
         MyChunkServer::run_background_scrubber(
-            storage_dir,
+            storage_dir_scrubber,
             master_addrs_for_scrubber,
             std::time::Duration::from_secs(60),
         )
@@ -53,9 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| format!("http://{}", s))
         .collect();
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
+    let storage_dir_heartbeat = args.storage_dir.clone();
+    let chunk_server_heartbeat = chunk_server.clone();
 
     tokio::spawn(async move {
-        // Retry loop for master registration
+        // 1. Initial Registration
         loop {
             let mut registered = false;
             for master_addr in &master_addrs {
@@ -70,10 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(_) => {
                                 println!("✓ Registered with Master at {}", master_addr);
                                 registered = true;
-                                break; // Connected to one master, good for now.
-                                       // In a real system, we might need to register with the active one.
-                                       // Since only active master accepts connections (others are waiting on lock),
-                                       // this works naturally.
+                                // We try to register with all masters initially
                             }
                             Err(e) => {
                                 eprintln!("Failed to register with Master {}: {}", master_addr, e)
@@ -87,13 +86,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if registered {
-                // Keep checking or re-registering periodically?
-                // For now, just sleep and re-register to ensure we stay connected if master fails over
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                break;
             } else {
                 eprintln!("✗ Failed to register with any Master. Retrying...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
+        }
+
+        // 2. Heartbeat Loop
+        println!("Starting heartbeat loop...");
+        loop {
+            // Gather stats
+            let available_space = fs2::free_space(&storage_dir_heartbeat).unwrap_or(0);
+            let total_space = fs2::total_space(&storage_dir_heartbeat).unwrap_or(0);
+            let used_space = total_space.saturating_sub(available_space);
+
+            // Count chunks (files in storage dir)
+            let chunk_count = std::fs::read_dir(&storage_dir_heartbeat)
+                .map(|read_dir| read_dir.count())
+                .unwrap_or(0) as u64;
+
+            for master_addr in &master_addrs {
+                match MasterServiceClient::connect(master_addr.clone()).await {
+                    Ok(mut client) => {
+                        let request = tonic::Request::new(rust_hadoop::dfs::HeartbeatRequest {
+                            chunk_server_address: my_addr.clone(),
+                            used_space,
+                            available_space,
+                            chunk_count,
+                        });
+
+                        match client.heartbeat(request).await {
+                            Ok(response) => {
+                                let resp = response.into_inner();
+                                for command in resp.commands {
+                                    if command.r#type == 1 {
+                                        // REPLICATE
+                                        println!(
+                                            "Received replication command for block {} to {}",
+                                            command.block_id, command.target_chunk_server_address
+                                        );
+                                        let chunk_server_clone = chunk_server_heartbeat.clone();
+                                        let block_id = command.block_id.clone();
+                                        let target = command.target_chunk_server_address.clone();
+
+                                        tokio::spawn(async move {
+                                            if let Err(e) = chunk_server_clone
+                                                .initiate_replication(&block_id, &target)
+                                                .await
+                                            {
+                                                eprintln!("Replication failed: {}", e);
+                                            } else {
+                                                println!(
+                                                    "Replication of block {} to {} completed",
+                                                    block_id, target
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Heartbeat failed to {}: {}", master_addr, e);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Silent failure for connection error (master might be down)
+                    }
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
 

@@ -20,7 +20,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 rand = "0.9"
 rocksdb = "0.24"
-crc32fast = "1.5.0"
+crc32fast = "1.5"
 tonic-prost = "0.14"
 
 [build-dependencies]

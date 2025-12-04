@@ -1,9 +1,10 @@
 use crate::dfs::master_service_server::MasterService;
 use crate::dfs::{
-    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, CompleteFileRequest,
-    CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
+    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, ChunkServerCommand,
+    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileInfoRequest, GetFileInfoResponse,
-    ListFilesRequest, ListFilesResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
+    HeartbeatRequest, HeartbeatResponse, ListFilesRequest, ListFilesResponse,
+    RegisterChunkServerRequest, RegisterChunkServerResponse,
 };
 use crate::simple_raft::{Command, Event};
 use serde::{Deserialize, Serialize};
@@ -13,11 +14,21 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkServerStatus {
+    pub last_heartbeat: u64,
+    pub used_space: u64,
+    pub available_space: u64,
+    pub chunk_count: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MasterState {
     pub files: HashMap<String, FileMetadata>,
     #[serde(skip)]
-    pub chunk_servers: Vec<String>, // List of chunk server addresses (ephemeral)
+    pub chunk_servers: HashMap<String, ChunkServerStatus>, // address -> status
+    #[serde(skip)]
+    pub pending_commands: HashMap<String, Vec<ChunkServerCommand>>, // address -> commands
 }
 
 #[derive(Debug)]
@@ -28,12 +39,108 @@ pub struct MyMaster {
 
 impl MyMaster {
     pub fn new(state: Arc<Mutex<MasterState>>, raft_tx: mpsc::Sender<Event>) -> Self {
+        // Spawn liveness check loop
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                let mut state = state_clone.lock().unwrap();
+                // Remove chunk servers that haven't sent heartbeat in 15 seconds
+                let dead_servers: Vec<String> = state
+                    .chunk_servers
+                    .iter()
+                    .filter(|(_, status)| now - status.last_heartbeat > 15000)
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+
+                for addr in dead_servers {
+                    println!("ChunkServer {} is dead (no heartbeat), removing...", addr);
+                    state.chunk_servers.remove(&addr);
+                    state.pending_commands.remove(&addr);
+                }
+            }
+        });
+
+        // Spawn balancer task
+        let state_clone_balancer = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30)); // Check every 30s
+            loop {
+                interval.tick().await;
+                let mut state = state_clone_balancer.lock().unwrap();
+
+                let servers: Vec<(String, u64)> = state
+                    .chunk_servers
+                    .iter()
+                    .map(|(addr, status)| (addr.clone(), status.available_space))
+                    .collect();
+
+                if servers.len() < 2 {
+                    continue;
+                }
+
+                let mut sorted_servers = servers;
+                sorted_servers.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending available space (Least available first)
+
+                let (most_full_addr, min_avail) = sorted_servers.first().unwrap();
+                let (least_full_addr, max_avail) = sorted_servers.last().unwrap();
+
+                // If difference is greater than 100MB (arbitrary threshold for demo)
+                // In real world, use percentage or standard deviation
+                if max_avail > min_avail && (max_avail - min_avail) > 100 * 1024 * 1024 {
+                    println!(
+                        "Balancer: Detected imbalance. Moving block from {} to {}",
+                        most_full_addr, least_full_addr
+                    );
+
+                    // Find a block on the most full server to move
+                    let mut block_to_move = None;
+                    'outer: for file in state.files.values() {
+                        for block in &file.blocks {
+                            if block.locations.contains(most_full_addr)
+                                && !block.locations.contains(least_full_addr)
+                            {
+                                block_to_move = Some(block.block_id.clone());
+                                break 'outer;
+                            }
+                        }
+                    }
+
+                    if let Some(block_id) = block_to_move {
+                        let command = ChunkServerCommand {
+                            r#type: 1, // REPLICATE
+                            block_id: block_id.clone(),
+                            target_chunk_server_address: least_full_addr.clone(),
+                        };
+
+                        state
+                            .pending_commands
+                            .entry(most_full_addr.clone())
+                            .or_default()
+                            .push(command);
+
+                        println!(
+                            "Balancer: Scheduled replication of block {} from {} to {}",
+                            block_id, most_full_addr, least_full_addr
+                        );
+                    }
+                }
+            }
+        });
+
         MyMaster { state, raft_tx }
     }
 }
 
 #[tonic::async_trait]
 impl MasterService for MyMaster {
+    // ... (existing methods) ...
     async fn get_file_info(
         &self,
         request: Request<GetFileInfoRequest>,
@@ -115,10 +222,21 @@ impl MasterService for MyMaster {
                 return Err(Status::not_found("File not found"));
             }
 
-            let chunk_servers = state.chunk_servers.clone();
-            if chunk_servers.is_empty() {
+            // Load balancing: Select chunk servers with most available space
+            let mut candidates: Vec<(String, u64)> = state
+                .chunk_servers
+                .iter()
+                .map(|(addr, status)| (addr.clone(), status.available_space))
+                .collect();
+
+            if candidates.is_empty() {
                 return Err(Status::unavailable("No chunk servers available"));
             }
+
+            // Sort by available space descending
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let chunk_servers: Vec<String> = candidates.into_iter().map(|(addr, _)| addr).collect();
             (chunk_servers, Uuid::new_v4().to_string())
         };
 
@@ -192,19 +310,57 @@ impl MasterService for MyMaster {
     ) -> Result<Response<RegisterChunkServerResponse>, Status> {
         let req = request.into_inner();
 
-        // We can handle registration locally or via Raft.
-        // For simplicity, let's handle it locally (ephemeral state).
-        // Or via Raft to ensure all masters know about chunkservers?
-        // If we handle locally, only the connected master knows.
-        // But chunkservers connect to ALL masters in our current implementation.
-        // So local registration is fine.
-
         let mut state = self.state.lock().unwrap();
-        if !state.chunk_servers.contains(&req.address) {
-            state.chunk_servers.push(req.address);
-        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Initial registration with default stats or provided capacity
+        state.chunk_servers.insert(
+            req.address,
+            ChunkServerStatus {
+                last_heartbeat: now,
+                used_space: 0,
+                available_space: req.capacity,
+                chunk_count: 0,
+            },
+        );
 
         Ok(Response::new(RegisterChunkServerResponse { success: true }))
+    }
+
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let mut state = self.state.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        state.chunk_servers.insert(
+            req.chunk_server_address.clone(),
+            ChunkServerStatus {
+                last_heartbeat: now,
+                used_space: req.used_space,
+                available_space: req.available_space,
+                chunk_count: req.chunk_count,
+            },
+        );
+
+        // Retrieve pending commands
+        let commands = state
+            .pending_commands
+            .remove(&req.chunk_server_address)
+            .unwrap_or_default();
+
+        Ok(Response::new(HeartbeatResponse {
+            success: true,
+            commands,
+        }))
     }
 
     async fn get_block_locations(
