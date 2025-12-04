@@ -37,8 +37,8 @@
   - [x] Implement Heartbeat loop in ChunkServer (5s interval)
 - [x] Implement ChunkServer heartbeat to all Masters
 - [x] Add ChunkServer re-registration on Master failover (handled by heartbeat)
-- [ ] Implement ChunkServer load balancing
-- [ ] Add ChunkServer health scoring
+- [x] Implement ChunkServer load balancing (based on available space)
+- [x] Add ChunkServer health scoring (basic stats collection)
 - [ ] Implement automatic replica rebalancing (Balancer)
 
 ---

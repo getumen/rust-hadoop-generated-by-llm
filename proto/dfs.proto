@@ -22,6 +22,9 @@ service MasterService {
 
 message HeartbeatRequest {
   string chunk_server_address = 1;
+  uint64 used_space = 2;
+  uint64 available_space = 3;
+  uint64 chunk_count = 4;
 }
 
 message HeartbeatResponse {

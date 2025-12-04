@@ -34,12 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk_server = MyChunkServer::new(args.storage_dir.clone(), master_addrs_raw.clone());
 
     // Start background scrubber
-    let storage_dir = args.storage_dir.clone();
+    let storage_dir_scrubber = args.storage_dir.clone();
     let master_addrs_for_scrubber = master_addrs_raw.clone();
     tokio::spawn(async move {
         // Run scrubber every 60 seconds
         MyChunkServer::run_background_scrubber(
-            storage_dir,
+            storage_dir_scrubber,
             master_addrs_for_scrubber,
             std::time::Duration::from_secs(60),
         )
@@ -53,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| format!("http://{}", s))
         .collect();
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
+    let storage_dir_heartbeat = args.storage_dir.clone();
 
     tokio::spawn(async move {
         // 1. Initial Registration
@@ -94,11 +95,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 2. Heartbeat Loop
         println!("Starting heartbeat loop...");
         loop {
+            // Gather stats
+            let available_space = fs2::free_space(&storage_dir_heartbeat).unwrap_or(0);
+            let total_space = fs2::total_space(&storage_dir_heartbeat).unwrap_or(0);
+            let used_space = total_space.saturating_sub(available_space);
+
+            // Count chunks (files in storage dir)
+            let chunk_count = std::fs::read_dir(&storage_dir_heartbeat)
+                .map(|read_dir| read_dir.count())
+                .unwrap_or(0) as u64;
+
             for master_addr in &master_addrs {
                 match MasterServiceClient::connect(master_addr.clone()).await {
                     Ok(mut client) => {
                         let request = tonic::Request::new(rust_hadoop::dfs::HeartbeatRequest {
                             chunk_server_address: my_addr.clone(),
+                            used_space,
+                            available_space,
+                            chunk_count,
                         });
 
                         if let Err(e) = client.heartbeat(request).await {

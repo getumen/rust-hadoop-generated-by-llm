@@ -14,11 +14,19 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkServerStatus {
+    pub last_heartbeat: u64,
+    pub used_space: u64,
+    pub available_space: u64,
+    pub chunk_count: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MasterState {
     pub files: HashMap<String, FileMetadata>,
     #[serde(skip)]
-    pub chunk_servers: HashMap<String, u64>, // address -> last_heartbeat_timestamp (unix millis)
+    pub chunk_servers: HashMap<String, ChunkServerStatus>, // address -> status
 }
 
 #[derive(Debug)]
@@ -45,7 +53,7 @@ impl MyMaster {
                 let dead_servers: Vec<String> = state
                     .chunk_servers
                     .iter()
-                    .filter(|(_, &last_heartbeat)| now - last_heartbeat > 15000)
+                    .filter(|(_, status)| now - status.last_heartbeat > 15000)
                     .map(|(addr, _)| addr.clone())
                     .collect();
 
@@ -143,10 +151,21 @@ impl MasterService for MyMaster {
                 return Err(Status::not_found("File not found"));
             }
 
-            let chunk_servers: Vec<String> = state.chunk_servers.keys().cloned().collect();
-            if chunk_servers.is_empty() {
+            // Load balancing: Select chunk servers with most available space
+            let mut candidates: Vec<(String, u64)> = state
+                .chunk_servers
+                .iter()
+                .map(|(addr, status)| (addr.clone(), status.available_space))
+                .collect();
+
+            if candidates.is_empty() {
                 return Err(Status::unavailable("No chunk servers available"));
             }
+
+            // Sort by available space descending
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let chunk_servers: Vec<String> = candidates.into_iter().map(|(addr, _)| addr).collect();
             (chunk_servers, Uuid::new_v4().to_string())
         };
 
@@ -225,7 +244,17 @@ impl MasterService for MyMaster {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        state.chunk_servers.insert(req.address, now);
+
+        // Initial registration with default stats or provided capacity
+        state.chunk_servers.insert(
+            req.address,
+            ChunkServerStatus {
+                last_heartbeat: now,
+                used_space: 0,
+                available_space: req.capacity,
+                chunk_count: 0,
+            },
+        );
 
         Ok(Response::new(RegisterChunkServerResponse { success: true }))
     }
@@ -240,7 +269,16 @@ impl MasterService for MyMaster {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        state.chunk_servers.insert(req.chunk_server_address, now);
+
+        state.chunk_servers.insert(
+            req.chunk_server_address,
+            ChunkServerStatus {
+                last_heartbeat: now,
+                used_space: req.used_space,
+                available_space: req.available_space,
+                chunk_count: req.chunk_count,
+            },
+        );
         Ok(Response::new(HeartbeatResponse { success: true }))
     }
 
