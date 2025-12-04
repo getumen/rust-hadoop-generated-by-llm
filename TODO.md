@@ -42,11 +42,11 @@
   - [x] Add protocol definitions (Rename, PrepareTransaction, CommitTransaction, AbortTransaction RPCs)
   - [x] Add Raft commands (RenameFile, CreateTransactionRecord, UpdateTransactionState, ApplyTransactionOperation)
   - [x] Update apply_command logic for rename commands
-  - [ ] **Implement Transaction Record state management in master.rs**
-    - [ ] Add `TransactionRecord` struct
-    - [ ] Add `TxState` enum (Pending, Prepared, Committed, Aborted)
-    - [ ] Add `RateLimitState` for DDoS protection
-    - [ ] Add fields to MasterState
+  - [x] **Implement Transaction Record state management in master.rs**
+    - [x] Add `TransactionRecord` struct
+    - [x] Add `TxState` enum (Pending, Prepared, Committed, Aborted)
+    - [x] Add `RateLimitState` for DDoS protection
+    - [x] Add fields to MasterState
   - [ ] **Implement `rename` RPC handler in master.rs (coordinator)**
     - [ ] Check rate limit (10 req/min per client)
     - [ ] Determine source and dest shard IDs

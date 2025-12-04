@@ -14,6 +14,236 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+// ============================================================================
+// Transaction Record Types for Cross-Shard Operations
+// ============================================================================
+
+/// Transaction state for cross-shard operations (Google Spanner style)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxState {
+    /// Transaction started but not yet prepared
+    Pending,
+    /// All participants have validated and are ready to commit
+    Prepared,
+    /// Transaction has been committed successfully
+    Committed,
+    /// Transaction has been aborted
+    Aborted,
+}
+
+/// Type of cross-shard transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TransactionType {
+    /// Rename operation (cross-shard file move)
+    Rename {
+        source_path: String,
+        dest_path: String,
+    },
+}
+
+/// Individual operation within a transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxOperation {
+    /// Target shard ID for this operation
+    pub shard_id: String,
+    /// Operation type
+    pub op_type: TxOpType,
+}
+
+/// Type of operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxOpType {
+    /// Delete a file
+    Delete { path: String },
+    /// Create a file with metadata
+    Create {
+        path: String,
+        metadata: FileMetadata,
+    },
+}
+
+/// Transaction Record for tracking cross-shard operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionRecord {
+    /// Unique transaction ID (UUID)
+    pub tx_id: String,
+    /// Type of transaction
+    pub tx_type: TransactionType,
+    /// Current state of the transaction
+    pub state: TxState,
+    /// Timestamp when transaction started (millis since epoch)
+    pub timestamp: u64,
+    /// List of participating shard IDs
+    pub participants: Vec<String>,
+    /// Operations to be performed on each shard
+    pub operations: Vec<TxOperation>,
+    /// Client ID that initiated the transaction (for rate limiting)
+    pub client_id: String,
+}
+
+impl TransactionRecord {
+    /// Create a new transaction record for a rename operation
+    pub fn new_rename(
+        tx_id: String,
+        source_path: String,
+        dest_path: String,
+        source_shard: String,
+        dest_shard: String,
+        source_metadata: FileMetadata,
+        client_id: String,
+    ) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        TransactionRecord {
+            tx_id,
+            tx_type: TransactionType::Rename {
+                source_path: source_path.clone(),
+                dest_path: dest_path.clone(),
+            },
+            state: TxState::Pending,
+            timestamp: now,
+            participants: vec![source_shard.clone(), dest_shard.clone()],
+            operations: vec![
+                TxOperation {
+                    shard_id: source_shard,
+                    op_type: TxOpType::Delete { path: source_path },
+                },
+                TxOperation {
+                    shard_id: dest_shard,
+                    op_type: TxOpType::Create {
+                        path: dest_path,
+                        metadata: source_metadata,
+                    },
+                },
+            ],
+            client_id,
+        }
+    }
+
+    /// Check if this transaction deletes the specified file
+    pub fn deletes_file(&self, path: &str) -> bool {
+        self.operations
+            .iter()
+            .any(|op| matches!(&op.op_type, TxOpType::Delete { path: p } if p == path))
+    }
+
+    /// Check if this transaction creates the specified file
+    pub fn creates_file(&self, path: &str) -> bool {
+        self.operations
+            .iter()
+            .any(|op| matches!(&op.op_type, TxOpType::Create { path: p, .. } if p == path))
+    }
+
+    /// Get metadata for a file created by this transaction
+    pub fn get_created_metadata(&self, path: &str) -> Option<FileMetadata> {
+        for op in &self.operations {
+            if let TxOpType::Create { path: p, metadata } = &op.op_type {
+                if p == path {
+                    return Some(metadata.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if transaction has timed out (10 second timeout)
+    pub fn is_timed_out(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        now - self.timestamp > 10_000 // 10 seconds
+    }
+
+    /// Check if transaction is stale and can be garbage collected (1 hour)
+    pub fn is_stale(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        now - self.timestamp > 3_600_000 // 1 hour
+    }
+}
+
+// ============================================================================
+// Rate Limiting for DDoS Protection
+// ============================================================================
+
+/// Rate limit state for a single client
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientRateLimit {
+    /// Timestamps of recent requests (within the rate limit window)
+    pub request_timestamps: Vec<u64>,
+}
+
+/// Rate limiting configuration and state
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RateLimitState {
+    /// Rate limit per client: client_id -> rate limit state
+    pub clients: HashMap<String, ClientRateLimit>,
+    /// Maximum requests per minute per client
+    pub max_requests_per_minute: u32,
+}
+
+impl RateLimitState {
+    pub fn new(max_requests_per_minute: u32) -> Self {
+        RateLimitState {
+            clients: HashMap::new(),
+            max_requests_per_minute,
+        }
+    }
+
+    /// Check if a client is rate limited. Returns true if request should be rejected.
+    pub fn check_rate_limit(&mut self, client_id: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let one_minute_ago = now.saturating_sub(60_000);
+
+        let rate_limit = self.clients.entry(client_id.to_string()).or_default();
+
+        // Remove old timestamps outside the window
+        rate_limit
+            .request_timestamps
+            .retain(|&ts| ts > one_minute_ago);
+
+        // Check if limit exceeded
+        if rate_limit.request_timestamps.len() >= self.max_requests_per_minute as usize {
+            return true; // Rate limited
+        }
+
+        // Record this request
+        rate_limit.request_timestamps.push(now);
+        false // Not rate limited
+    }
+
+    /// Clean up old rate limit entries (for clients that haven't made requests recently)
+    pub fn cleanup(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let one_minute_ago = now.saturating_sub(60_000);
+
+        self.clients.retain(|_, rate_limit| {
+            rate_limit
+                .request_timestamps
+                .retain(|&ts| ts > one_minute_ago);
+            !rate_limit.request_timestamps.is_empty()
+        });
+    }
+}
+
+// ============================================================================
+// ChunkServer and Master State
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkServerStatus {
     pub last_heartbeat: u64,
@@ -24,9 +254,21 @@ pub struct ChunkServerStatus {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MasterState {
+    /// File metadata storage: path -> metadata
     pub files: HashMap<String, FileMetadata>,
+
+    /// Transaction records for cross-shard operations: tx_id -> record
+    pub transaction_records: HashMap<String, TransactionRecord>,
+
+    /// Rate limiting state for DDoS protection
+    #[serde(default)]
+    pub rate_limit_state: RateLimitState,
+
+    /// ChunkServer status (not persisted via Raft, local state only)
     #[serde(skip)]
     pub chunk_servers: HashMap<String, ChunkServerStatus>, // address -> status
+
+    /// Pending commands for ChunkServers (not persisted via Raft)
     #[serde(skip)]
     pub pending_commands: HashMap<String, Vec<ChunkServerCommand>>, // address -> commands
 }
@@ -282,7 +524,8 @@ impl MasterService for MyMaster {
                 // Sort by available space descending
                 candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-                let chunk_servers: Vec<String> = candidates.into_iter().map(|(addr, _)| addr).collect();
+                let chunk_servers: Vec<String> =
+                    candidates.into_iter().map(|(addr, _)| addr).collect();
                 (chunk_servers, Uuid::new_v4().to_string())
             } else {
                 return Err(Status::internal("Wrong state type"));
