@@ -37,9 +37,58 @@
   - [x] Design "Configuration Group" (Meta-Shard) to store authoritative `ShardMap`
   - [x] Implement `FetchShardMap` RPC
   - [x] Allow dynamic addition/removal of Shards via Config Group
-- [ ] **1.6 Cross-Shard Operations**
-  - [ ] Identify cross-shard scenarios (e.g., `rename`)
-  - [ ] Implement basic 2PC or restrict operations to single shard initially
+- [/] **1.6 Cross-Shard Operations (Transaction Record方式)**
+  - [x] Design cross-shard rename using Transaction Record pattern (Google Spanner style)
+  - [x] Add protocol definitions (Rename, PrepareTransaction, CommitTransaction, AbortTransaction RPCs)
+  - [x] Add Raft commands (RenameFile, CreateTransactionRecord, UpdateTransactionState, ApplyTransactionOperation)
+  - [x] Update apply_command logic for rename commands
+  - [ ] **Implement Transaction Record state management in master.rs**
+    - [ ] Add `TransactionRecord` struct
+    - [ ] Add `TxState` enum (Pending, Prepared, Committed, Aborted)
+    - [ ] Add `RateLimitState` for DDoS protection
+    - [ ] Add fields to MasterState
+  - [ ] **Implement `rename` RPC handler in master.rs (coordinator)**
+    - [ ] Check rate limit (10 req/min per client)
+    - [ ] Determine source and dest shard IDs
+    - [ ] If same shard: send `RenameFile` command to local Raft
+    - [ ] If cross-shard:
+      - [ ] Generate Transaction ID (UUID)
+      - [ ] Create Transaction Record (state=Pending) via Raft
+      - [ ] Send `PrepareTransaction` to dest shard
+      - [ ] Wait for `Prepared` response
+      - [ ] Update to `Prepared` state via Raft
+      - [ ] Update to `Committed` state, delete source file via Raft
+      - [ ] Send `CommitTransaction` to dest shard
+      - [ ] Return result to client
+  - [ ] **Implement `prepare_transaction` RPC handler in master.rs**
+    - [ ] Validate operation (dest file doesn't exist)
+    - [ ] Create Transaction Record (state=Prepared) via Raft
+    - [ ] Return Prepared or error
+  - [ ] **Implement `commit_transaction` RPC handler in master.rs**
+    - [ ] Find Transaction Record by tx_id
+    - [ ] Update state to Committed via Raft
+    - [ ] Apply operation (create file) via Raft
+    - [ ] Return success
+  - [ ] **Implement `abort_transaction` RPC handler in master.rs**
+    - [ ] Find Transaction Record by tx_id
+    - [ ] Update state to Aborted via Raft
+    - [ ] Clean up resources
+    - [ ] Return success
+  - [ ] **Implement rate limiting and timeout cleanup**
+    - [ ] Add `check_rate_limit` function in master.rs
+    - [ ] Add `cleanup_old_transactions` background task (10s timeout)
+    - [ ] Implement Transaction Record-aware file operations (get_file_with_tx)
+  - [ ] **Add Rename subcommand to dfs_cli.rs**
+    - [ ] Add `Rename { source: String, dest: String }` to Commands enum
+    - [ ] Generate client_id (hostname or UUID)
+    - [ ] Implement rename logic with retry/redirect handling
+  - [ ] **Testing**
+    - [ ] Test same-shard rename
+    - [ ] Test cross-shard rename with Transaction Record
+    - [ ] Test rate limiting (11th request should fail)
+    - [ ] Test transaction timeout and abort
+    - [ ] Test fault recovery (shard crash during Prepare/Commit)
+    - [ ] Build and verify compilation
 
 ---
 
