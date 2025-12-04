@@ -498,6 +498,8 @@ impl MasterService for MyMaster {
         // Replication factor (default: 3)
         const REPLICATION_FACTOR: usize = 3;
 
+        self.check_shard_ownership(&req.path)?;
+
         let (chunk_servers, block_id) = {
             let state_lock = self.state.lock().unwrap();
             if let AppState::Master(ref state) = *state_lock {
@@ -577,8 +579,11 @@ impl MasterService for MyMaster {
 
     async fn complete_file(
         &self,
-        _request: Request<CompleteFileRequest>,
+        request: Request<CompleteFileRequest>,
     ) -> Result<Response<CompleteFileResponse>, Status> {
+        let req = request.into_inner();
+        self.check_shard_ownership(&req.path)?;
+        // No-op for now, but good to have the RPC
         Ok(Response::new(CompleteFileResponse { success: true }))
     }
 
@@ -1216,5 +1221,189 @@ impl MyMaster {
         }
 
         Ok(false)
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tx_state_equality() {
+        assert_eq!(TxState::Pending, TxState::Pending);
+        assert_eq!(TxState::Prepared, TxState::Prepared);
+        assert_eq!(TxState::Committed, TxState::Committed);
+        assert_eq!(TxState::Aborted, TxState::Aborted);
+        assert_ne!(TxState::Pending, TxState::Committed);
+    }
+
+    #[test]
+    fn test_transaction_record_new_rename() {
+        let metadata = FileMetadata {
+            path: "/source/file.txt".to_string(),
+            size: 1024,
+            blocks: vec![],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "test-tx-id".to_string(),
+            "/source/file.txt".to_string(),
+            "/dest/file.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata,
+        );
+
+        assert_eq!(tx_record.tx_id, "test-tx-id");
+        assert_eq!(tx_record.state, TxState::Pending);
+        assert_eq!(tx_record.participants.len(), 2);
+        assert_eq!(tx_record.participants[0], "shard-1");
+        assert_eq!(tx_record.participants[1], "shard-2");
+        assert_eq!(tx_record.operations.len(), 2);
+
+        // First operation should be DELETE
+        match &tx_record.operations[0].op_type {
+            TxOpType::Delete { path } => assert_eq!(path, "/source/file.txt"),
+            _ => panic!("Expected Delete operation"),
+        }
+
+        // Second operation should be CREATE
+        match &tx_record.operations[1].op_type {
+            TxOpType::Create { path, metadata: _ } => assert_eq!(path, "/dest/file.txt"),
+            _ => panic!("Expected Create operation"),
+        }
+    }
+
+    #[test]
+    fn test_transaction_record_deletes_file() {
+        let metadata = FileMetadata {
+            path: "/source/file.txt".to_string(),
+            size: 1024,
+            blocks: vec![],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "test-tx-id".to_string(),
+            "/source/file.txt".to_string(),
+            "/dest/file.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata,
+        );
+
+        assert!(tx_record.deletes_file("/source/file.txt"));
+        assert!(!tx_record.deletes_file("/other/file.txt"));
+    }
+
+    #[test]
+    fn test_transaction_record_creates_file() {
+        let metadata = FileMetadata {
+            path: "/source/file.txt".to_string(),
+            size: 1024,
+            blocks: vec![],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "test-tx-id".to_string(),
+            "/source/file.txt".to_string(),
+            "/dest/file.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata,
+        );
+
+        assert!(tx_record.creates_file("/dest/file.txt"));
+        assert!(!tx_record.creates_file("/other/file.txt"));
+    }
+
+    #[test]
+    fn test_transaction_record_get_created_metadata() {
+        let metadata = FileMetadata {
+            path: "/dest/file.txt".to_string(),
+            size: 1024,
+            blocks: vec![BlockInfo {
+                block_id: "block-1".to_string(),
+                size: 1024,
+                locations: vec!["chunk1:50052".to_string()],
+            }],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "test-tx-id".to_string(),
+            "/source/file.txt".to_string(),
+            "/dest/file.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata.clone(),
+        );
+
+        let created_meta = tx_record.get_created_metadata("/dest/file.txt");
+        assert!(created_meta.is_some());
+        let created_meta = created_meta.unwrap();
+        assert_eq!(created_meta.size, 1024);
+        assert_eq!(created_meta.blocks.len(), 1);
+
+        let not_found = tx_record.get_created_metadata("/other/file.txt");
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_transaction_type_rename() {
+        let tx_type = TransactionType::Rename {
+            source_path: "/source/file.txt".to_string(),
+            dest_path: "/dest/file.txt".to_string(),
+        };
+
+        match tx_type {
+            TransactionType::Rename {
+                source_path,
+                dest_path,
+            } => {
+                assert_eq!(source_path, "/source/file.txt");
+                assert_eq!(dest_path, "/dest/file.txt");
+            }
+        }
+    }
+
+    #[test]
+    fn test_master_state_default() {
+        let state = MasterState::default();
+        assert!(state.files.is_empty());
+        assert!(state.transaction_records.is_empty());
+        assert!(state.chunk_servers.is_empty());
+        assert!(state.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn test_master_state_with_transaction_records() {
+        let mut state = MasterState::default();
+
+        let metadata = FileMetadata {
+            path: "/test.txt".to_string(),
+            size: 100,
+            blocks: vec![],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "tx-1".to_string(),
+            "/source.txt".to_string(),
+            "/dest.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata,
+        );
+
+        state
+            .transaction_records
+            .insert("tx-1".to_string(), tx_record);
+
+        assert_eq!(state.transaction_records.len(), 1);
+        assert!(state.transaction_records.contains_key("tx-1"));
+
+        let record = state.transaction_records.get("tx-1").unwrap();
+        assert_eq!(record.state, TxState::Pending);
     }
 }

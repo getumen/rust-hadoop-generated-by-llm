@@ -1173,3 +1173,168 @@ impl RaftNode {
         }
     }
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::{TransactionRecord, TxOpType, TxOperation, TxState};
+
+    #[test]
+    fn test_master_command_create_file() {
+        let cmd = MasterCommand::CreateFile {
+            path: "/test/file.txt".to_string(),
+        };
+
+        match cmd {
+            MasterCommand::CreateFile { path } => {
+                assert_eq!(path, "/test/file.txt");
+            }
+            _ => panic!("Expected CreateFile command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_rename_file() {
+        let cmd = MasterCommand::RenameFile {
+            source_path: "/source.txt".to_string(),
+            dest_path: "/dest.txt".to_string(),
+        };
+
+        match cmd {
+            MasterCommand::RenameFile {
+                source_path,
+                dest_path,
+            } => {
+                assert_eq!(source_path, "/source.txt");
+                assert_eq!(dest_path, "/dest.txt");
+            }
+            _ => panic!("Expected RenameFile command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_create_transaction_record() {
+        let metadata = crate::dfs::FileMetadata {
+            path: "/dest.txt".to_string(),
+            size: 100,
+            blocks: vec![],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "tx-123".to_string(),
+            "/source.txt".to_string(),
+            "/dest.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata,
+        );
+
+        let cmd = MasterCommand::CreateTransactionRecord {
+            record: tx_record.clone(),
+        };
+
+        match cmd {
+            MasterCommand::CreateTransactionRecord { record } => {
+                assert_eq!(record.tx_id, "tx-123");
+                assert_eq!(record.state, TxState::Pending);
+            }
+            _ => panic!("Expected CreateTransactionRecord command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_update_transaction_state() {
+        let cmd = MasterCommand::UpdateTransactionState {
+            tx_id: "tx-123".to_string(),
+            new_state: TxState::Committed,
+        };
+
+        match cmd {
+            MasterCommand::UpdateTransactionState { tx_id, new_state } => {
+                assert_eq!(tx_id, "tx-123");
+                assert_eq!(new_state, TxState::Committed);
+            }
+            _ => panic!("Expected UpdateTransactionState command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_apply_transaction_operation() {
+        let operation = TxOperation {
+            shard_id: "shard-1".to_string(),
+            op_type: TxOpType::Delete {
+                path: "/old/file.txt".to_string(),
+            },
+        };
+
+        let cmd = MasterCommand::ApplyTransactionOperation {
+            tx_id: "tx-123".to_string(),
+            operation: operation.clone(),
+        };
+
+        match cmd {
+            MasterCommand::ApplyTransactionOperation { tx_id, operation } => {
+                assert_eq!(tx_id, "tx-123");
+                assert_eq!(operation.shard_id, "shard-1");
+            }
+            _ => panic!("Expected ApplyTransactionOperation command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_delete_transaction_record() {
+        let cmd = MasterCommand::DeleteTransactionRecord {
+            tx_id: "tx-123".to_string(),
+        };
+
+        match cmd {
+            MasterCommand::DeleteTransactionRecord { tx_id } => {
+                assert_eq!(tx_id, "tx-123");
+            }
+            _ => panic!("Expected DeleteTransactionRecord command"),
+        }
+    }
+
+    #[test]
+    fn test_command_serialization() {
+        let cmd = Command::Master(MasterCommand::RenameFile {
+            source_path: "/source.txt".to_string(),
+            dest_path: "/dest.txt".to_string(),
+        });
+
+        // Test that it can be serialized and deserialized
+        let serialized = serde_json::to_string(&cmd).expect("Failed to serialize command");
+        let deserialized: Command =
+            serde_json::from_str(&serialized).expect("Failed to deserialize command");
+
+        match deserialized {
+            Command::Master(MasterCommand::RenameFile {
+                source_path,
+                dest_path,
+            }) => {
+                assert_eq!(source_path, "/source.txt");
+                assert_eq!(dest_path, "/dest.txt");
+            }
+            _ => panic!("Deserialization produced wrong command type"),
+        }
+    }
+
+    #[test]
+    fn test_log_entry_serialization() {
+        let entry = LogEntry {
+            term: 1,
+            command: Command::Master(MasterCommand::CreateFile {
+                path: "/test.txt".to_string(),
+            }),
+        };
+
+        let serialized = serde_json::to_string(&entry).expect("Failed to serialize log entry");
+        let deserialized: LogEntry =
+            serde_json::from_str(&serialized).expect("Failed to deserialize log entry");
+
+        assert_eq!(deserialized.term, 1);
+    }
+}
