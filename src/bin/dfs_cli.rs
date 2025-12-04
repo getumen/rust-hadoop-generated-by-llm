@@ -255,7 +255,7 @@ where
     loop {
         attempt += 1;
 
-        let mut targets = if let Some(hint) = leader_hint.take() {
+        let targets = if let Some(hint) = leader_hint.take() {
             // Ensure hint has http:// prefix
             let hint_with_prefix = if hint.starts_with("http://") {
                 hint
