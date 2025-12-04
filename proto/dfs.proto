@@ -15,6 +15,32 @@ service MasterService {
 
   // Block recovery
   rpc GetBlockLocations (GetBlockLocationsRequest) returns (GetBlockLocationsResponse);
+
+  // Liveness check
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message HeartbeatRequest {
+  string chunk_server_address = 1;
+  uint64 used_space = 2;
+  uint64 available_space = 3;
+  uint64 chunk_count = 4;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  repeated ChunkServerCommand commands = 2;
+}
+
+message ChunkServerCommand {
+  enum CommandType {
+    UNKNOWN = 0;
+    REPLICATE = 1;
+    DELETE = 2; // Future use
+  }
+  CommandType type = 1;
+  string block_id = 2;
+  string target_chunk_server_address = 3; // For REPLICATE
 }
 
 service ChunkServerService {
