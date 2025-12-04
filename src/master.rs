@@ -31,14 +31,23 @@ pub struct MasterState {
     pub pending_commands: HashMap<String, Vec<ChunkServerCommand>>, // address -> commands
 }
 
+use crate::sharding::{ShardId, ShardMap};
+
 #[derive(Debug)]
 pub struct MyMaster {
     state: Arc<Mutex<MasterState>>,
     raft_tx: mpsc::Sender<Event>,
+    shard_map: Arc<Mutex<ShardMap>>,
+    shard_id: ShardId,
 }
 
 impl MyMaster {
-    pub fn new(state: Arc<Mutex<MasterState>>, raft_tx: mpsc::Sender<Event>) -> Self {
+    pub fn new(
+        state: Arc<Mutex<MasterState>>,
+        raft_tx: mpsc::Sender<Event>,
+        shard_map: Arc<Mutex<ShardMap>>,
+        shard_id: ShardId,
+    ) -> Self {
         // Spawn liveness check loop
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -134,7 +143,32 @@ impl MyMaster {
             }
         });
 
-        MyMaster { state, raft_tx }
+        MyMaster {
+            state,
+            raft_tx,
+            shard_map,
+            shard_id,
+        }
+    }
+
+    fn check_shard_ownership(&self, path: &str) -> Result<(), Status> {
+        let map = self.shard_map.lock().unwrap();
+        if let Some(target_shard) = map.get_shard(path) {
+            if target_shard != self.shard_id {
+                // Not my shard
+                // Get a hint for the target shard (e.g., first peer)
+                // In a real system, we might want to know the leader of that shard.
+                // For now, just return the first peer of the target shard.
+                let target_peers = map.get_shard_peers(&target_shard).unwrap_or_default();
+                let hint = target_peers.first().cloned().unwrap_or_default();
+
+                // We use AlreadyExists code for Redirect to distinguish from other errors for now,
+                // or we can use a custom error string format.
+                // Let's use `Status::out_of_range` with "REDIRECT:<hint>"
+                return Err(Status::out_of_range(format!("REDIRECT:{}", hint)));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +180,9 @@ impl MasterService for MyMaster {
         request: Request<GetFileInfoRequest>,
     ) -> Result<Response<GetFileInfoResponse>, Status> {
         let req = request.into_inner();
+
+        self.check_shard_ownership(&req.path)?;
+
         let state = self.state.lock().unwrap();
 
         if let Some(metadata) = state.files.get(&req.path) {

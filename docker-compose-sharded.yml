@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  # Shard 0
+  master-0-0:
+    build: .
+    container_name: master-0-0
+    command: /app/master --addr 0.0.0.0:50051 --id 0 --shard-id shard-0 --peers http://master-0-1:8080,http://master-0-2:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://master-0-0:50051 --shard-config /app/shard_config.json
+    ports:
+      - "50051:50051"
+      - "8081:8080"
+    networks:
+      - dfs-network
+    volumes:
+      - master-0-0-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
+
+  master-0-1:
+    build: .
+    container_name: master-0-1
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --shard-id shard-0 --peers http://master-0-0:8080,http://master-0-2:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://master-0-1:50051 --shard-config /app/shard_config.json
+    ports:
+      - "50052:50051"
+      - "8082:8080"
+    networks:
+      - dfs-network
+    volumes:
+      - master-0-1-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
+
+  master-0-2:
+    build: .
+    container_name: master-0-2
+    command: /app/master --addr 0.0.0.0:50051 --id 2 --shard-id shard-0 --peers http://master-0-0:8080,http://master-0-1:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://master-0-2:50051 --shard-config /app/shard_config.json
+    ports:
+      - "50053:50051"
+      - "8083:8080"
+    networks:
+      - dfs-network
+    volumes:
+      - master-0-2-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
+
+  # Shard 1
+  master-1-0:
+    build: .
+    container_name: master-1-0
+    command: /app/master --addr 0.0.0.0:50051 --id 0 --shard-id shard-1 --peers http://master-1-1:8080,http://master-1-2:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://master-1-0:50051 --shard-config /app/shard_config.json
+    ports:
+      - "50061:50051"
+      - "8091:8080"
+    networks:
+      - dfs-network
+    volumes:
+      - master-1-0-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
+
+  master-1-1:
+    build: .
+    container_name: master-1-1
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --shard-id shard-1 --peers http://master-1-0:8080,http://master-1-2:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://master-1-1:50051 --shard-config /app/shard_config.json
+    ports:
+      - "50062:50051"
+      - "8092:8080"
+    networks:
+      - dfs-network
+    volumes:
+      - master-1-1-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
+
+  master-1-2:
+    build: .
+    container_name: master-1-2
+    command: /app/master --addr 0.0.0.0:50051 --id 2 --shard-id shard-1 --peers http://master-1-0:8080,http://master-1-1:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://master-1-2:50051 --shard-config /app/shard_config.json
+    ports:
+      - "50063:50051"
+      - "8093:8080"
+    networks:
+      - dfs-network
+    volumes:
+      - master-1-2-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
+
+  # ChunkServers (Shared)
+  chunkserver1:
+    build: .
+    container_name: chunkserver1
+    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr master-0-0:50051,master-0-1:50051,master-0-2:50051,master-1-0:50051,master-1-1:50051,master-1-2:50051 --storage-dir /data/cs1 --advertise-addr chunkserver1:50052
+    ports:
+      - "50054:50052"
+    networks:
+      - dfs-network
+    depends_on:
+      - master-0-0
+      - master-1-0
+    volumes:
+      - cs1-data:/data/cs1
+
+  chunkserver2:
+    build: .
+    container_name: chunkserver2
+    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr master-0-0:50051,master-0-1:50051,master-0-2:50051,master-1-0:50051,master-1-1:50051,master-1-2:50051 --storage-dir /data/cs2 --advertise-addr chunkserver2:50052
+    ports:
+      - "50055:50052"
+    networks:
+      - dfs-network
+    depends_on:
+      - master-0-0
+      - master-1-0
+    volumes:
+      - cs2-data:/data/cs2
+
+networks:
+  dfs-network:
+    driver: bridge
+
+volumes:
+  master-0-0-data:
+  master-0-1-data:
+  master-0-2-data:
+  master-1-0-data:
+  master-1-1-data:
+  master-1-2-data:
+  cs1-data:
+  cs2-data:

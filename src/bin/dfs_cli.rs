@@ -289,6 +289,15 @@ where
                 Ok(res) => return Ok(res),
                 Err(status) => {
                     let msg = status.message();
+                    if msg.starts_with("REDIRECT:") {
+                        let parts: Vec<&str> = msg.split(':').collect();
+                        if parts.len() > 1 && !parts[1].is_empty() {
+                            leader_hint = Some(parts[1].to_string());
+                            eprintln!("Received SHARD REDIRECT to: {}", parts[1]);
+                            break; // Break inner loop to retry immediately with hint
+                        }
+                    }
+
                     if msg.starts_with("Not Leader|") {
                         let parts: Vec<&str> = msg.split('|').collect();
                         if parts.len() > 1 && !parts[1].is_empty() {

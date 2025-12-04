@@ -34,6 +34,12 @@ struct Args {
 
     #[arg(long, default_value = "/tmp/raft-logs")]
     storage_dir: String,
+
+    #[arg(long, default_value = "shard-0")]
+    shard_id: String,
+
+    #[arg(long)]
+    shard_config: Option<String>,
 }
 
 // Axum state for sharing the Raft channel
@@ -103,7 +109,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let master = MyMaster::new(state, raft_tx_for_master);
+    // Load Shard Map
+    let shard_map =
+        rust_hadoop::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100);
+    let shard_map = Arc::new(Mutex::new(shard_map));
+
+    let master = MyMaster::new(state, raft_tx_for_master, shard_map, args.shard_id.clone());
 
     println!("Master listening on {}", addr);
 

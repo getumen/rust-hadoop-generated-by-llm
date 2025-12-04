@@ -17,22 +17,22 @@
 - Implement a mechanism to route client requests to the correct Shard
 
 **Tasks**:
-- [ ] **1.1 Core Sharding Logic**
-  - [ ] Define `ShardId` and `ShardMap` data structures
-  - [ ] Implement Consistent Hashing with **Virtual Nodes** for balanced load distribution
-  - [ ] Add unit tests for key distribution and rebalancing (verify uniform distribution)
-- [ ] **1.2 Cluster Topology & Configuration**
-  - [ ] Update `MasterConfig` to support `shard_id` and `group_peers`
-  - [ ] Create `docker-compose-sharded.yml` with multiple Master groups (e.g., 2 shards x 3 nodes)
-  - [ ] Implement static `ShardMap` loading from configuration (initial step)
-- [ ] **1.3 Request Routing (Server-Side)**
-  - [ ] Implement `check_shard_ownership(path)` in Master
-  - [ ] Define `Redirect` error type in RPC responses
-  - [ ] Return `Redirect` with target Shard Leader info when request arrives at wrong shard
-- [ ] **1.4 Client-Side Routing**
-  - [ ] Update Client to handle `Redirect` responses
-  - [ ] Implement client-side `ShardMap` caching
-  - [ ] Add logic to pre-calculate target shard before sending request (Smart Client)
+- [x] **1.1 Core Sharding Logic**
+  - [x] Define `ShardId` and `ShardMap` data structures
+  - [x] Implement Consistent Hashing with **Virtual Nodes** for balanced load distribution
+  - [x] Add unit tests for key distribution and rebalancing (verify uniform distribution)
+- [x] **1.2 Cluster Topology & Configuration**
+  - [x] Update `MasterConfig` to support `shard_id` and `group_peers`
+  - [x] Create `docker-compose-sharded.yml` with multiple Master groups (e.g., 2 shards x 3 nodes)
+  - [x] Implement static `ShardMap` loading from configuration (initial step)
+- [x] **1.3 Request Routing (Server-Side)**
+  - [x] Implement `check_shard_ownership(path)` in Master
+  - [x] Define `Redirect` error type in RPC responses (Using `Status::out_of_range` with "REDIRECT:<hint>")
+  - [x] Return `Redirect` with target Shard Leader info when request arrives at wrong shard
+- [x] **1.4 Client-Side Routing**
+  - [x] Update Client to handle `Redirect` responses
+  - [ ] Implement client-side `ShardMap` caching (Skipped for now, relying on redirect)
+  - [ ] Add logic to pre-calculate target shard before sending request (Smart Client) (Skipped for now)
 - [ ] **1.5 Shard Management (Raft-based)**
   - [ ] Design "Configuration Group" (Meta-Shard) to store authoritative `ShardMap`
   - [ ] Implement `FetchShardMap` RPC
