@@ -31,8 +31,6 @@
   - [x] Return `Redirect` with target Shard Leader info when request arrives at wrong shard
 - [x] **1.4 Client-Side Routing**
   - [x] Update Client to handle `Redirect` responses
-  - [ ] Implement client-side `ShardMap` caching (Skipped for now, relying on redirect)
-  - [ ] Add logic to pre-calculate target shard before sending request (Smart Client) (Skipped for now)
 - [x] **1.5 Shard Management (Raft-based)**
   - [x] Design "Configuration Group" (Meta-Shard) to store authoritative `ShardMap`
   - [x] Implement `FetchShardMap` RPC
@@ -79,15 +77,39 @@
     - [x] Add `Rename { source: String, dest: String }` to Commands enum
     - [x] Implement rename logic with retry/redirect handling
   - [ ] **Testing**
-    - [ ] Test same-shard rename
-    - [ ] Test cross-shard rename with Transaction Record
-    - [ ] Test transaction timeout and abort
-    - [ ] Test fault recovery (shard crash during Prepare/Commit)
+    - [x] Test same-shard rename
+    - [x] Test cross-shard rename with Transaction Record
+    - [x] Test transaction timeout and abort
+    - [x] Test fault recovery (shard crash during Prepare/Commit)
     - [x] Build and verify compilation
 
 ---
 
-### 2. ChunkServer Liveness (Lease-based)
+### 2. Client Library Refactoring
+**Status**: Not Started
+**Priority**: High
+**Effort**: Medium
+
+**Problem**:
+- Current `dfs_cli` contains all client logic tightly coupled with CLI argument parsing
+- Cannot easily reuse client logic in other applications (e.g., Fuse client, API server)
+- `ShardMap` caching and smart routing logic belongs in a library, not the CLI tool
+
+**Solution**:
+- Extract client logic into a `rust-hadoop-client` library (or module `src/client`)
+- `dfs_cli` should become a thin wrapper around this library
+
+**Tasks**:
+- [ ] Create `Client` struct in `src/client/mod.rs`
+- [ ] Move RPC connection management (Leader discovery, retry logic) to `Client`
+- [ ] Move `ShardMap` caching and smart routing logic to `Client`
+- [ ] Expose clean async API (`create_file`, `write_file`, `read_file`, `rename`, etc.)
+- [ ] Refactor `dfs_cli.rs` to use the new `Client`
+- [ ] Add integration tests using the usage of `Client` library directly
+
+---
+
+### 3. ChunkServer Liveness (Lease-based)
 **Status**: Working
 **Priority**: High
 **Effort**: Medium
@@ -107,7 +129,7 @@
 
 ## 🟡 Medium Priority (Important for Stability)
 
-### 3. Safe Mode
+### 4. Safe Mode
 **Status**: Not Started
 **Priority**: Medium
 **Effort**: Medium
@@ -131,7 +153,7 @@
 
 ---
 
-### 4. Raft Configuration Management
+### 5. Raft Configuration Management
 **Status**: Not Started
 **Priority**: Medium
 **Effort**: Medium
@@ -157,7 +179,7 @@
 
 ---
 
-### 5. Health Checks and Monitoring
+### 6. Health Checks and Monitoring
 **Status**: Basic
 **Priority**: Medium
 **Effort**: Small
@@ -184,7 +206,7 @@
 
 ## 🟢 Low Priority (Nice to Have)
 
-### 6. Read Optimization
+### 7. Read Optimization
 **Status**: Not Started
 **Priority**: Low
 **Effort**: Medium
@@ -207,7 +229,7 @@
 
 ---
 
-### 7. Raft Performance Optimizations
+### 8. Raft Performance Optimizations
 **Status**: Not Started
 **Priority**: Low
 **Effort**: Large
@@ -222,7 +244,7 @@
 
 ---
 
-### 8. Testing Infrastructure
+### 9. Testing Infrastructure
 **Status**: Basic (chaos tests exist)
 **Priority**: Medium
 **Effort**: Large
@@ -248,7 +270,7 @@
 
 ---
 
-### 9. Documentation
+### 10. Documentation
 **Status**: Partial
 **Priority**: Medium
 **Effort**: Medium
@@ -271,7 +293,7 @@
 
 ---
 
-### 10. Security Enhancements
+### 11. Security Enhancements
 **Status**: Not Started
 **Priority**: Low (for prototype)
 **Effort**: Large
@@ -286,7 +308,7 @@
 
 ---
 
-### 11. Observability
+### 12. Observability
 **Status**: Minimal
 **Priority**: Medium
 **Effort**: Medium
@@ -305,7 +327,7 @@
 
 ---
 
-### 12. ChunkServer Improvements
+### 13. ChunkServer Improvements
 **Status**: Working
 **Priority**: High
 **Effort**: Medium
@@ -323,7 +345,7 @@
 
 ---
 
-### 13. Rack Awareness
+### 14. Rack Awareness
 **Status**: Not Started
 **Priority**: Low
 **Effort**: Medium
@@ -344,7 +366,7 @@
 
 ---
 
-### 14. Storage Efficiency (Erasure Coding)
+### 15. Storage Efficiency (Erasure Coding)
 **Status**: Not Started
 **Priority**: Low
 **Effort**: Large
@@ -368,7 +390,7 @@
 
 ## 🔧 Technical Debt
 
-### 15. Code Quality
+### 16. Code Quality
 - [ ] Remove unused dependencies (`fs2`, `raft_types.rs`, `raft_network.rs`)
 - [ ] Add comprehensive error handling (remove unwrap() calls)
 - [ ] Implement proper async error propagation
@@ -379,7 +401,7 @@
 - [ ] Add rustfmt configuration and enforce formatting
 - [ ] Fix deprecated `rand` usage in `simple_raft.rs`
 
-### 16. Build and Deployment
+### 17. Build and Deployment
 - [ ] Optimize Docker image size (multi-stage builds)
 - [ ] Add CI/CD pipeline
 - [ ] Implement blue-green deployment
@@ -388,7 +410,7 @@
 - [ ] Add Helm chart
 - [ ] Implement backup and restore procedures
 
-### 17. Refactor RPC Responses
+### 18. Refactor RPC Responses
 - [ ] Standardize RPC response formats (consistent success/error/hint fields)
 - [ ] Use gRPC error details for structured error information instead of custom string parsing
 
