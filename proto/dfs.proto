@@ -10,6 +10,14 @@ service MasterService {
   rpc CompleteFile (CompleteFileRequest) returns (CompleteFileResponse);
   rpc ListFiles (ListFilesRequest) returns (ListFilesResponse);
 
+  // Rename operation (supports cross-shard rename via Transaction Record)
+  rpc Rename (RenameRequest) returns (RenameResponse);
+
+  // Cross-shard transaction support
+  rpc PrepareTransaction (PrepareTransactionRequest) returns (PrepareTransactionResponse);
+  rpc CommitTransaction (CommitTransactionRequest) returns (CommitTransactionResponse);
+  rpc AbortTransaction (AbortTransactionRequest) returns (AbortTransactionResponse);
+
   // DataNode registration (simplified)
   rpc RegisterChunkServer (RegisterChunkServerRequest) returns (RegisterChunkServerResponse);
 
@@ -154,4 +162,96 @@ message GetBlockLocationsRequest {
 message GetBlockLocationsResponse {
   repeated string locations = 1;
   bool found = 2;
+}
+
+service ConfigService {
+  rpc FetchShardMap (FetchShardMapRequest) returns (FetchShardMapResponse);
+  rpc AddShard (AddShardRequest) returns (AddShardResponse);
+  rpc RemoveShard (RemoveShardRequest) returns (RemoveShardResponse);
+}
+
+message FetchShardMapRequest {}
+
+message ShardPeers {
+  repeated string peers = 1;
+}
+
+message FetchShardMapResponse {
+  map<string, ShardPeers> shards = 1;
+}
+
+message AddShardRequest {
+  string shard_id = 1;
+  repeated string peers = 2;
+}
+
+message AddShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message RemoveShardRequest {
+  string shard_id = 1;
+}
+
+message RemoveShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+// ============================================================================
+// Rename Operation Messages
+// ============================================================================
+
+message RenameRequest {
+  string source_path = 1;     // Source file path
+  string dest_path = 2;       // Destination file path
+}
+
+message RenameResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;     // Hint for correct leader (if not leader)
+  string redirect_hint = 4;   // Hint for correct shard (if wrong shard)
+}
+
+// ============================================================================
+// Cross-Shard Transaction Messages
+// ============================================================================
+
+message PrepareTransactionRequest {
+  string tx_id = 1;                   // Transaction ID (UUID)
+  string operation_type = 2;          // "CREATE" or "DELETE"
+  string path = 3;                    // Target file path
+  FileMetadata metadata = 4;          // For CREATE operation: file metadata
+  string coordinator_shard = 5;       // Coordinator shard ID (for callback)
+  repeated string coordinator_peers = 6;  // Coordinator shard peers
+}
+
+message PrepareTransactionResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message CommitTransactionRequest {
+  string tx_id = 1;                   // Transaction ID
+}
+
+message CommitTransactionResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message AbortTransactionRequest {
+  string tx_id = 1;                   // Transaction ID
+}
+
+message AbortTransactionResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
 }

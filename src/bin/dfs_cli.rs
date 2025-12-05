@@ -3,7 +3,7 @@ use rust_hadoop::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use rust_hadoop::dfs::master_service_client::MasterServiceClient;
 use rust_hadoop::dfs::{
     AllocateBlockRequest, CreateFileRequest, GetFileInfoRequest, ListFilesRequest,
-    ReadBlockRequest, WriteBlockRequest,
+    ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,8 +35,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Ls,
-    Put { source: PathBuf, dest: String },
-    Get { source: String, dest: PathBuf },
+    Put {
+        source: PathBuf,
+        dest: String,
+    },
+    Get {
+        source: String,
+        dest: PathBuf,
+    },
+    /// Rename a file (supports cross-shard rename)
+    Rename {
+        /// Source file path
+        source: String,
+        /// Destination file path
+        dest: String,
+    },
 }
 
 #[tokio::main]
@@ -55,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Ls => {
-            let response = execute_with_retry(
+            let (response, _) = execute_with_retry(
                 &master_addrs,
                 max_retries,
                 initial_backoff_ms,
@@ -74,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Put { source, dest } => {
             // 1. Create file on Master
-            let create_resp = execute_with_retry(
+            let (create_resp, success_addr) = execute_with_retry(
                 &master_addrs,
                 max_retries,
                 initial_backoff_ms,
@@ -94,8 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
             )
-            .await?
-            .into_inner();
+            .await?;
+            let create_resp = create_resp.into_inner();
 
             if !create_resp.success {
                 eprintln!("Failed to create file: {}", create_resp.error_message);
@@ -108,8 +121,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             file.read_to_end(&mut buffer)?;
 
             // 3. Allocate block
-            let alloc_resp = execute_with_retry(
-                &master_addrs,
+            // Use the master that handled create_file successfully to ensure read-your-writes consistency
+            let mut alloc_masters = vec![success_addr];
+            // Add original masters as fallback
+            for addr in &master_addrs {
+                if !alloc_masters.contains(addr) {
+                    alloc_masters.push(addr.clone());
+                }
+            }
+
+            let (alloc_resp, _) = execute_with_retry(
+                &alloc_masters,
                 max_retries,
                 initial_backoff_ms,
                 |mut client| {
@@ -128,8 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
             )
-            .await?
-            .into_inner();
+            .await?;
+            let alloc_resp = alloc_resp.into_inner();
 
             let block = alloc_resp.block.unwrap();
             let chunk_servers = alloc_resp.chunk_server_addresses;
@@ -169,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Get { source, dest } => {
             // 1. Get file info from Master
-            let info_resp = execute_with_retry(
+            let (info_resp, _) = execute_with_retry(
                 &master_addrs,
                 max_retries,
                 initial_backoff_ms,
@@ -181,8 +203,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
             )
-            .await?
-            .into_inner();
+            .await?;
+            let info_resp = info_resp.into_inner();
 
             if !info_resp.found {
                 eprintln!("File not found");
@@ -233,6 +255,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("File downloaded successfully");
         }
+        Commands::Rename { source, dest } => {
+            let (rename_resp, _) = execute_with_retry(
+                &master_addrs,
+                max_retries,
+                initial_backoff_ms,
+                |mut client| {
+                    let source = source.clone();
+                    let dest = dest.clone();
+                    async move {
+                        let rename_req = tonic::Request::new(RenameRequest {
+                            source_path: source,
+                            dest_path: dest,
+                        });
+                        let response = client.rename(rename_req).await?;
+                        let inner = response.get_ref();
+                        if !inner.success && inner.error_message == "Not Leader" {
+                            return Err(tonic::Status::unavailable(format!(
+                                "Not Leader|{}",
+                                inner.leader_hint
+                            )));
+                        }
+                        if !inner.redirect_hint.is_empty() {
+                            return Err(tonic::Status::out_of_range(format!(
+                                "REDIRECT:{}",
+                                inner.redirect_hint
+                            )));
+                        }
+                        Ok(response)
+                    }
+                },
+            )
+            .await?;
+            let rename_resp = rename_resp.into_inner();
+
+            if rename_resp.success {
+                println!("File renamed successfully: {} -> {}", source, dest);
+            } else {
+                eprintln!("Failed to rename file: {}", rename_resp.error_message);
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
@@ -243,7 +306,7 @@ async fn execute_with_retry<F, Fut, T>(
     max_retries: usize,
     initial_backoff_ms: u64,
     f: F,
-) -> Result<T, Box<dyn std::error::Error>>
+) -> Result<(T, String), Box<dyn std::error::Error>>
 where
     F: Fn(MasterServiceClient<tonic::transport::Channel>) -> Fut,
     Fut: std::future::Future<Output = Result<T, tonic::Status>>,
@@ -286,9 +349,19 @@ where
             let client = client.max_decoding_message_size(100 * 1024 * 1024);
 
             match f(client).await {
-                Ok(res) => return Ok(res),
+                Ok(res) => return Ok((res, master_addr)),
                 Err(status) => {
                     let msg = status.message();
+                    if msg.starts_with("REDIRECT:") {
+                        // Use splitn to split only on the first colon
+                        let parts: Vec<&str> = msg.splitn(2, ':').collect();
+                        if parts.len() > 1 && !parts[1].is_empty() {
+                            leader_hint = Some(parts[1].to_string());
+                            eprintln!("Received SHARD REDIRECT to: {}", parts[1]);
+                            break; // Break inner loop to retry immediately with hint
+                        }
+                    }
+
                     if msg.starts_with("Not Leader|") {
                         let parts: Vec<&str> = msg.split('|').collect();
                         if parts.len() > 1 && !parts[1].is_empty() {

@@ -17,11 +17,73 @@
 - Implement a mechanism to route client requests to the correct Shard
 
 **Tasks**:
-- [ ] Design sharding key strategy (e.g., hash of filename, directory subtrees)
-- [ ] Implement Shard Coordinator (or configuration service) to manage shard mappings
-- [ ] Update Client to cache shard mappings and route requests
-- [ ] Deploy multiple Master Raft groups (Shards)
-- [ ] Implement cross-shard operations (e.g., rename file across shards)
+- [x] **1.1 Core Sharding Logic**
+  - [x] Define `ShardId` and `ShardMap` data structures
+  - [x] Implement Consistent Hashing with **Virtual Nodes** for balanced load distribution
+  - [x] Add unit tests for key distribution and rebalancing (verify uniform distribution)
+- [x] **1.2 Cluster Topology & Configuration**
+  - [x] Update `MasterConfig` to support `shard_id` and `group_peers`
+  - [x] Create `docker-compose-sharded.yml` with multiple Master groups (e.g., 2 shards x 3 nodes)
+  - [x] Implement static `ShardMap` loading from configuration (initial step)
+- [x] **1.3 Request Routing (Server-Side)**
+  - [x] Implement `check_shard_ownership(path)` in Master
+  - [x] Define `Redirect` error type in RPC responses (Using `Status::out_of_range` with "REDIRECT:<hint>")
+  - [x] Return `Redirect` with target Shard Leader info when request arrives at wrong shard
+- [x] **1.4 Client-Side Routing**
+  - [x] Update Client to handle `Redirect` responses
+  - [ ] Implement client-side `ShardMap` caching (Skipped for now, relying on redirect)
+  - [ ] Add logic to pre-calculate target shard before sending request (Smart Client) (Skipped for now)
+- [x] **1.5 Shard Management (Raft-based)**
+  - [x] Design "Configuration Group" (Meta-Shard) to store authoritative `ShardMap`
+  - [x] Implement `FetchShardMap` RPC
+  - [x] Allow dynamic addition/removal of Shards via Config Group
+- [/] **1.6 Cross-Shard Operations (Transaction Record方式)**
+  - [x] Design cross-shard rename using Transaction Record pattern (Google Spanner style)
+  - [x] Add protocol definitions (Rename, PrepareTransaction, CommitTransaction, AbortTransaction RPCs)
+  - [x] Add Raft commands (RenameFile, CreateTransactionRecord, UpdateTransactionState, ApplyTransactionOperation)
+  - [x] Update apply_command logic for rename commands
+  - [x] **Implement Transaction Record state management in master.rs**
+    - [x] Add `TransactionRecord` struct
+    - [x] Add `TxState` enum (Pending, Prepared, Committed, Aborted)
+    - [x] Add fields to MasterState
+  - [x] **Implement `rename` RPC handler in master.rs (coordinator)**
+    - [x] Determine source and dest shard IDs
+    - [x] If same shard: send `RenameFile` command to local Raft
+    - [x] If cross-shard:
+      - [x] Generate Transaction ID (UUID)
+      - [x] Create Transaction Record (state=Pending) via Raft
+      - [x] Send `PrepareTransaction` to dest shard
+      - [x] Wait for `Prepared` response
+      - [x] Update to `Prepared` state via Raft
+      - [x] Update to `Committed` state, delete source file via Raft
+      - [x] Send `CommitTransaction` to dest shard
+      - [x] Return result to client
+  - [x] **Implement `prepare_transaction` RPC handler in master.rs**
+    - [x] Validate operation (dest file doesn't exist)
+    - [x] Create Transaction Record (state=Prepared) via Raft
+    - [x] Return Prepared or error
+  - [x] **Implement `commit_transaction` RPC handler in master.rs**
+    - [x] Find Transaction Record by tx_id
+    - [x] Update state to Committed via Raft
+    - [x] Apply operation (create file) via Raft
+    - [x] Return success
+  - [x] **Implement `abort_transaction` RPC handler in master.rs**
+    - [x] Find Transaction Record by tx_id
+    - [x] Update state to Aborted via Raft
+    - [x] Clean up resources
+    - [x] Return success
+  - [x] **Implement timeout cleanup**
+    - [x] Add `cleanup_old_transactions` background task (10s timeout)
+    - [ ] Implement Transaction Record-aware file operations (get_file_with_tx)
+  - [x] **Add Rename subcommand to dfs_cli.rs**
+    - [x] Add `Rename { source: String, dest: String }` to Commands enum
+    - [x] Implement rename logic with retry/redirect handling
+  - [ ] **Testing**
+    - [ ] Test same-shard rename
+    - [ ] Test cross-shard rename with Transaction Record
+    - [ ] Test transaction timeout and abort
+    - [ ] Test fault recovery (shard crash during Prepare/Commit)
+    - [x] Build and verify compilation
 
 ---
 

@@ -1,4 +1,5 @@
 use crate::master::MasterState;
+use crate::sharding::ShardMap;
 use rand::Rng;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,13 @@ pub struct LogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    Master(MasterCommand),
+    Config(ConfigCommand),
+    NoOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MasterCommand {
     CreateFile {
         path: String,
     },
@@ -32,7 +40,49 @@ pub enum Command {
     RegisterChunkServer {
         address: String,
     },
-    NoOp,
+    // =========================================================================
+    // Transaction Record Commands for Cross-Shard Operations
+    // =========================================================================
+    /// Same-shard rename operation (no transaction record needed)
+    RenameFile {
+        source_path: String,
+        dest_path: String,
+    },
+    /// Create a new transaction record (state = Pending or Prepared)
+    CreateTransactionRecord {
+        record: crate::master::TransactionRecord,
+    },
+    /// Update transaction state (Pending -> Prepared -> Committed/Aborted)
+    UpdateTransactionState {
+        tx_id: String,
+        new_state: crate::master::TxState,
+    },
+    /// Apply transaction operation (create/delete file as part of transaction)
+    ApplyTransactionOperation {
+        tx_id: String,
+        operation: crate::master::TxOperation,
+    },
+    /// Delete transaction record (for garbage collection)
+    DeleteTransactionRecord {
+        tx_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConfigCommand {
+    AddShard {
+        shard_id: String,
+        peers: Vec<String>,
+    },
+    RemoveShard {
+        shard_id: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum AppState {
+    Master(MasterState),
+    Config(ShardMap),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,7 +189,7 @@ pub struct RaftNode {
 
     pub inbox: mpsc::Receiver<Event>,
     pub self_tx: mpsc::Sender<Event>,
-    pub app_state: Arc<Mutex<MasterState>>,
+    pub app_state: Arc<Mutex<AppState>>,
     pub votes_received: usize,
 
     pub db: Arc<DB>, // RocksDB instance
@@ -152,7 +202,7 @@ impl RaftNode {
         peers: Vec<String>,
         client_address: String,
         storage_dir: String,
-        app_state: Arc<Mutex<MasterState>>,
+        app_state: Arc<Mutex<AppState>>,
         inbox: mpsc::Receiver<Event>,
         self_tx: mpsc::Sender<Event>,
     ) -> Self {
@@ -199,7 +249,7 @@ impl RaftNode {
 
     fn load_state(
         db: &DB,
-        app_state: &Arc<Mutex<MasterState>>,
+        app_state: &Arc<Mutex<AppState>>,
     ) -> (u64, Option<usize>, Vec<LogEntry>, usize, u64) {
         let term = match db.get(b"term") {
             Ok(Some(val)) => match val.try_into() {
@@ -229,12 +279,23 @@ impl RaftNode {
                     Ok(meta) => {
                         // Load snapshot data and restore app state
                         if let Ok(Some(snapshot_data)) = db.get(b"snapshot_data") {
-                            match serde_json::from_slice::<MasterState>(&snapshot_data) {
+                            match serde_json::from_slice::<AppState>(&snapshot_data) {
                                 Ok(state) => {
                                     *app_state.lock().unwrap() = state;
                                 }
-                                Err(e) => {
-                                    eprintln!("Error: Failed to deserialize snapshot data: {}", e);
+                                Err(_) => {
+                                    // Try legacy MasterState
+                                    match serde_json::from_slice::<MasterState>(&snapshot_data) {
+                                        Ok(state) => {
+                                            *app_state.lock().unwrap() = AppState::Master(state);
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Error: Failed to deserialize snapshot data: {}",
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -399,9 +460,16 @@ impl RaftNode {
             .expect("Failed to save snapshot data to DB");
 
         // Restore app state
-        let state: MasterState =
-            serde_json::from_slice(&snapshot.data).expect("Failed to deserialize snapshot data");
-        *self.app_state.lock().unwrap() = state;
+        match serde_json::from_slice::<AppState>(&snapshot.data) {
+            Ok(state) => *self.app_state.lock().unwrap() = state,
+            Err(_) => {
+                // Try legacy MasterState
+                match serde_json::from_slice::<MasterState>(&snapshot.data) {
+                    Ok(state) => *self.app_state.lock().unwrap() = AppState::Master(state),
+                    Err(e) => eprintln!("Error: Failed to deserialize snapshot data: {}", e),
+                }
+            }
+        }
 
         // Delete old log entries
         for i in (self.last_included_index + 1)..=snapshot.last_included_index {
@@ -981,33 +1049,292 @@ impl RaftNode {
     fn apply_command(&self, command: &Command) {
         let mut state = self.app_state.lock().unwrap();
         match command {
-            Command::CreateFile { path } => {
-                state.files.insert(
-                    path.clone(),
-                    crate::dfs::FileMetadata {
-                        path: path.clone(),
-                        size: 0,
-                        blocks: vec![],
-                    },
-                );
-            }
-            Command::AllocateBlock {
-                path,
-                block_id,
-                locations,
-            } => {
-                if let Some(meta) = state.files.get_mut(path) {
-                    meta.blocks.push(crate::dfs::BlockInfo {
-                        block_id: block_id.clone(),
-                        size: 0,
-                        locations: locations.clone(),
-                    });
+            Command::Master(cmd) => {
+                if let AppState::Master(ref mut master_state) = *state {
+                    match cmd {
+                        MasterCommand::CreateFile { path } => {
+                            master_state.files.insert(
+                                path.clone(),
+                                crate::dfs::FileMetadata {
+                                    path: path.clone(),
+                                    size: 0,
+                                    blocks: vec![],
+                                },
+                            );
+                        }
+                        MasterCommand::AllocateBlock {
+                            path,
+                            block_id,
+                            locations,
+                        } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.blocks.push(crate::dfs::BlockInfo {
+                                    block_id: block_id.clone(),
+                                    size: 0,
+                                    locations: locations.clone(),
+                                });
+                            }
+                        }
+                        MasterCommand::RegisterChunkServer { address: _ } => {
+                            // ChunkServer registration is handled locally, not via Raft
+                        }
+                        // =================================================================
+                        // Transaction Record Commands
+                        // =================================================================
+                        MasterCommand::RenameFile {
+                            source_path,
+                            dest_path,
+                        } => {
+                            // Same-shard rename: remove source, create dest with same metadata
+                            if let Some(mut metadata) = master_state.files.remove(source_path) {
+                                metadata.path = dest_path.clone();
+                                master_state.files.insert(dest_path.clone(), metadata);
+                                println!(
+                                    "Renamed file from {} to {} (same-shard)",
+                                    source_path, dest_path
+                                );
+                            } else {
+                                eprintln!("RenameFile: source file {} not found", source_path);
+                            }
+                        }
+                        MasterCommand::CreateTransactionRecord { record } => {
+                            master_state
+                                .transaction_records
+                                .insert(record.tx_id.clone(), record.clone());
+                            println!(
+                                "Created transaction record: tx_id={}, state={:?}",
+                                record.tx_id, record.state
+                            );
+                        }
+                        MasterCommand::UpdateTransactionState { tx_id, new_state } => {
+                            if let Some(record) = master_state.transaction_records.get_mut(tx_id) {
+                                let old_state = record.state.clone();
+                                record.state = new_state.clone();
+                                println!(
+                                    "Updated transaction {} state: {:?} -> {:?}",
+                                    tx_id, old_state, new_state
+                                );
+                            } else {
+                                eprintln!(
+                                    "UpdateTransactionState: transaction {} not found",
+                                    tx_id
+                                );
+                            }
+                        }
+                        MasterCommand::ApplyTransactionOperation { tx_id, operation } => {
+                            // Apply the operation as part of a committed transaction
+                            match &operation.op_type {
+                                crate::master::TxOpType::Delete { path } => {
+                                    if master_state.files.remove(path).is_some() {
+                                        println!("Transaction {}: deleted file {}", tx_id, path);
+                                    } else {
+                                        eprintln!(
+                                            "Transaction {}: file {} not found for deletion",
+                                            tx_id, path
+                                        );
+                                    }
+                                }
+                                crate::master::TxOpType::Create { path, metadata } => {
+                                    master_state.files.insert(path.clone(), metadata.clone());
+                                    println!("Transaction {}: created file {}", tx_id, path);
+                                }
+                            }
+                        }
+                        MasterCommand::DeleteTransactionRecord { tx_id } => {
+                            if master_state.transaction_records.remove(tx_id).is_some() {
+                                println!("Deleted transaction record: tx_id={}", tx_id);
+                            } else {
+                                eprintln!(
+                                    "DeleteTransactionRecord: transaction {} not found",
+                                    tx_id
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("Error: Received MasterCommand but state is not MasterState");
                 }
             }
-            Command::RegisterChunkServer { address: _ } => {
-                // ChunkServer registration is handled locally, not via Raft
+            Command::Config(cmd) => {
+                if let AppState::Config(ref mut shard_map) = *state {
+                    match cmd {
+                        ConfigCommand::AddShard { shard_id, peers } => {
+                            shard_map.add_shard(shard_id.clone(), peers.clone());
+                        }
+                        ConfigCommand::RemoveShard { shard_id } => {
+                            shard_map.remove_shard(shard_id);
+                        }
+                    }
+                } else {
+                    eprintln!("Error: Received ConfigCommand but state is not ConfigState");
+                }
             }
             Command::NoOp => {}
         }
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::{TransactionRecord, TxOpType, TxOperation, TxState};
+
+    #[test]
+    fn test_master_command_create_file() {
+        let cmd = MasterCommand::CreateFile {
+            path: "/test/file.txt".to_string(),
+        };
+
+        match cmd {
+            MasterCommand::CreateFile { path } => {
+                assert_eq!(path, "/test/file.txt");
+            }
+            _ => panic!("Expected CreateFile command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_rename_file() {
+        let cmd = MasterCommand::RenameFile {
+            source_path: "/source.txt".to_string(),
+            dest_path: "/dest.txt".to_string(),
+        };
+
+        match cmd {
+            MasterCommand::RenameFile {
+                source_path,
+                dest_path,
+            } => {
+                assert_eq!(source_path, "/source.txt");
+                assert_eq!(dest_path, "/dest.txt");
+            }
+            _ => panic!("Expected RenameFile command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_create_transaction_record() {
+        let metadata = crate::dfs::FileMetadata {
+            path: "/dest.txt".to_string(),
+            size: 100,
+            blocks: vec![],
+        };
+
+        let tx_record = TransactionRecord::new_rename(
+            "tx-123".to_string(),
+            "/source.txt".to_string(),
+            "/dest.txt".to_string(),
+            "shard-1".to_string(),
+            "shard-2".to_string(),
+            metadata,
+        );
+
+        let cmd = MasterCommand::CreateTransactionRecord {
+            record: tx_record.clone(),
+        };
+
+        match cmd {
+            MasterCommand::CreateTransactionRecord { record } => {
+                assert_eq!(record.tx_id, "tx-123");
+                assert_eq!(record.state, TxState::Pending);
+            }
+            _ => panic!("Expected CreateTransactionRecord command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_update_transaction_state() {
+        let cmd = MasterCommand::UpdateTransactionState {
+            tx_id: "tx-123".to_string(),
+            new_state: TxState::Committed,
+        };
+
+        match cmd {
+            MasterCommand::UpdateTransactionState { tx_id, new_state } => {
+                assert_eq!(tx_id, "tx-123");
+                assert_eq!(new_state, TxState::Committed);
+            }
+            _ => panic!("Expected UpdateTransactionState command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_apply_transaction_operation() {
+        let operation = TxOperation {
+            shard_id: "shard-1".to_string(),
+            op_type: TxOpType::Delete {
+                path: "/old/file.txt".to_string(),
+            },
+        };
+
+        let cmd = MasterCommand::ApplyTransactionOperation {
+            tx_id: "tx-123".to_string(),
+            operation: operation.clone(),
+        };
+
+        match cmd {
+            MasterCommand::ApplyTransactionOperation { tx_id, operation } => {
+                assert_eq!(tx_id, "tx-123");
+                assert_eq!(operation.shard_id, "shard-1");
+            }
+            _ => panic!("Expected ApplyTransactionOperation command"),
+        }
+    }
+
+    #[test]
+    fn test_master_command_delete_transaction_record() {
+        let cmd = MasterCommand::DeleteTransactionRecord {
+            tx_id: "tx-123".to_string(),
+        };
+
+        match cmd {
+            MasterCommand::DeleteTransactionRecord { tx_id } => {
+                assert_eq!(tx_id, "tx-123");
+            }
+            _ => panic!("Expected DeleteTransactionRecord command"),
+        }
+    }
+
+    #[test]
+    fn test_command_serialization() {
+        let cmd = Command::Master(MasterCommand::RenameFile {
+            source_path: "/source.txt".to_string(),
+            dest_path: "/dest.txt".to_string(),
+        });
+
+        // Test that it can be serialized and deserialized
+        let serialized = serde_json::to_string(&cmd).expect("Failed to serialize command");
+        let deserialized: Command =
+            serde_json::from_str(&serialized).expect("Failed to deserialize command");
+
+        match deserialized {
+            Command::Master(MasterCommand::RenameFile {
+                source_path,
+                dest_path,
+            }) => {
+                assert_eq!(source_path, "/source.txt");
+                assert_eq!(dest_path, "/dest.txt");
+            }
+            _ => panic!("Deserialization produced wrong command type"),
+        }
+    }
+
+    #[test]
+    fn test_log_entry_serialization() {
+        let entry = LogEntry {
+            term: 1,
+            command: Command::Master(MasterCommand::CreateFile {
+                path: "/test.txt".to_string(),
+            }),
+        };
+
+        let serialized = serde_json::to_string(&entry).expect("Failed to serialize log entry");
+        let deserialized: LogEntry =
+            serde_json::from_str(&serialized).expect("Failed to deserialize log entry");
+
+        assert_eq!(deserialized.term, 1);
     }
 }
