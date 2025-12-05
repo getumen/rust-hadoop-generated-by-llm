@@ -276,4 +276,55 @@ mod tests {
         // moved_keys should be approx equal to keys_on_new_shard
         assert!((changed_count as i32 - new_shard_count as i32).abs() < (total_keys / 100) as i32);
     }
+
+    #[test]
+    fn test_empty_map() {
+        let map = ShardMap::new(10);
+        assert!(map.get_shard("any-key").is_none());
+        assert!(map.get_shard_peers(&"any-shard".to_string()).is_none());
+    }
+
+    #[test]
+    fn test_shard_config_parsing() {
+        let json = r#"
+        {
+            "shards": {
+                "shard-1": ["addr1", "addr2"],
+                "shard-2": ["addr3"]
+            }
+        }
+        "#;
+        let config: ShardConfig = serde_json::from_str(json).expect("Failed to parse JSON");
+        assert_eq!(config.shards.len(), 2);
+        assert_eq!(config.shards.get("shard-1").unwrap().len(), 2);
+        assert_eq!(config.shards.get("shard-2").unwrap().len(), 1);
+
+        let map = config.to_shard_map(10);
+        assert!(map.get_all_shards().contains(&"shard-1".to_string()));
+        assert!(map.get_all_shards().contains(&"shard-2".to_string()));
+        assert_eq!(
+            map.get_shard_peers(&"shard-1".to_string()).unwrap(),
+            vec!["addr1", "addr2"]
+        );
+    }
+
+    #[test]
+    fn test_consistent_hashing_stability() {
+        let mut map = ShardMap::new(100);
+        map.add_shard("shard-A".to_string(), vec![]);
+        map.add_shard("shard-B".to_string(), vec![]);
+
+        let key = "test-file.txt";
+        let shard1 = map.get_shard(key).unwrap();
+
+        // Same map, same key -> same result
+        assert_eq!(shard1, map.get_shard(key).unwrap());
+
+        // New map, same configuration -> same result
+        let mut map2 = ShardMap::new(100);
+        map2.add_shard("shard-A".to_string(), vec![]);
+        map2.add_shard("shard-B".to_string(), vec![]);
+
+        assert_eq!(shard1, map2.get_shard(key).unwrap());
+    }
 }
