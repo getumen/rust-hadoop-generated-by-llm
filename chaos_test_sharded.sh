@@ -100,4 +100,3 @@ echo -e "${GREEN}Chaos Test Passed!${NC}"
 echo "Cleaning up test files..."
 rm -f test_sharded.bin downloaded_normal.bin downloaded_degraded.bin
 echo "Cleanup complete!"
-

@@ -47,14 +47,19 @@ impl ConfigService for MyConfigServer {
     ) -> Result<Response<AddShardResponse>, Status> {
         let req = request.into_inner();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        
-        if self.raft_tx.send(Event::ClientRequest {
-            command: Command::Config(ConfigCommand::AddShard {
-                shard_id: req.shard_id,
-                peers: req.peers,
-            }),
-            reply_tx: tx,
-        }).await.is_err() {
+
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::AddShard {
+                    shard_id: req.shard_id,
+                    peers: req.peers,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
             return Err(Status::internal("Raft channel closed"));
         }
 
@@ -80,12 +85,17 @@ impl ConfigService for MyConfigServer {
         let req = request.into_inner();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        if self.raft_tx.send(Event::ClientRequest {
-            command: Command::Config(ConfigCommand::RemoveShard {
-                shard_id: req.shard_id,
-            }),
-            reply_tx: tx,
-        }).await.is_err() {
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::RemoveShard {
+                    shard_id: req.shard_id,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
             return Err(Status::internal("Raft channel closed"));
         }
 

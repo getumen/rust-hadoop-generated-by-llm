@@ -196,14 +196,14 @@ fn get_file(path: &str) -> Option<FileMetadata> {
         }
         return Some(metadata);
     }
-    
+
     // 3. このファイルを作成するCommittedトランザクションがあるか？
     for tx in transaction_records.values() {
         if tx.state == Committed && tx.creates_file(path) {
             return Some(tx.get_metadata(path));
         }
     }
-    
+
     None
 }
 ```

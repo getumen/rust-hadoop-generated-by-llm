@@ -57,12 +57,12 @@ TARGET_PATH=""
 
 for i in {1..100}; do
     TEST_PATH="/target_$i.txt"
-    
+
     # We check where this path belongs by checking stderr for REDIRECT when querying Master 1
     # Note: We use a non-existent file check (get) which triggers ownership check
-    
+
     OUTPUT=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 get $TEST_PATH /tmp/ignore 2>&1 || true)
-    
+
     if [ "$CURRENT_SHARD" == "shard-1" ]; then
         # We are on Shard 1, we want a path that redirects to Shard 2
         # The redirect hint will contain "dfs-master1-shard2"
