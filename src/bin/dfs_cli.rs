@@ -293,6 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("File renamed successfully: {} -> {}", source, dest);
             } else {
                 eprintln!("Failed to rename file: {}", rename_resp.error_message);
+                std::process::exit(1);
             }
         }
     }

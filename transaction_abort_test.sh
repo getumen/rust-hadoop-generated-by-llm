@@ -18,7 +18,7 @@ echo "========================="
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
-docker-compose -f docker-compose-sharded.yml up -d --build
+docker compose -f docker-compose-sharded.yml up -d --build
 
 # Wait for cluster
 echo "Waiting for cluster to be ready (20s)..."
@@ -37,7 +37,7 @@ docker cp file1.txt dfs-master1-shard1:/file1.txt
 docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 put /file1.txt /file1.txt
 
 # Check location
-LOC=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 ls | grep "/file1.txt")
+LOC=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 ls | grep "/file1.txt" || true)
 if [ -z "$LOC" ]; then
     # Maybe it's on shard 2?
     LOC2=$(docker exec dfs-master1-shard2 /app/dfs_cli --master http://localhost:50051 ls | grep "/file1.txt" || true)
@@ -69,9 +69,14 @@ TARGET_PATH="/target_abort.txt"
 # Actually, if we stop the dest shard, ANY cross-shard rename attempt should fail.
 # We just need to ensure it IS cross-shard.
 
-# 3. Stop the Destination Shard
-echo "🛑 Stopping Destination Shard ($DEST_CONTAINER)..."
-docker-compose -f docker-compose-sharded.yml stop $DEST_CONTAINER
+# 3. Stop the Destination Shard (use service name, not container name)
+echo "🛑 Stopping Destination Shard..."
+# Service names in docker-compose-sharded.yml are without 'dfs-' prefix
+if [ "$DEST_SHARD" = "shard-2" ]; then
+    docker compose -f docker-compose-sharded.yml stop master1-shard2
+else
+    docker compose -f docker-compose-sharded.yml stop master1-shard1
+fi
 
 # 4. Attempt Rename
 echo "Attempting rename (expecting failure)..."
@@ -95,7 +100,7 @@ fi
 
 # Cleanup
 echo "🧹 Cleanup..."
-docker-compose -f docker-compose-sharded.yml down -v
+docker compose -f docker-compose-sharded.yml down -v
 rm -f file1.txt
 
 echo ""

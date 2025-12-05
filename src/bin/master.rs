@@ -78,9 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_tx_for_server = raft_tx.clone();
     let raft_tx_for_master = raft_tx.clone();
 
+    // Filter out empty peer strings (e.g., when --peers "" is passed)
+    let peers: Vec<String> = args.peers.iter().filter(|p| !p.is_empty()).cloned().collect();
+    
     let mut raft_node = RaftNode::new(
         args.id,
-        args.peers.clone(),
+        peers.clone(),
         advertise_addr,
         args.storage_dir.clone(),
         state.clone(),

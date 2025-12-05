@@ -446,6 +446,7 @@ impl MasterService for MyMaster {
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
         let req = request.into_inner();
+        self.check_shard_ownership(&req.path)?;
 
         // Check if file exists (read optimization)
         {
