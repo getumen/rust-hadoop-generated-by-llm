@@ -1,15 +1,17 @@
 use crate::dfs::master_service_server::MasterService;
 use crate::dfs::{
-    AbortTransactionRequest, AbortTransactionResponse, AllocateBlockRequest, AllocateBlockResponse,
-    BlockInfo, ChunkServerCommand, CommitTransactionRequest, CommitTransactionResponse,
-    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
-    GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileInfoRequest, GetFileInfoResponse,
-    GetSafeModeStatusRequest, GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse,
-    ListFilesRequest, ListFilesResponse, PrepareTransactionRequest, PrepareTransactionResponse,
-    RegisterChunkServerRequest, RegisterChunkServerResponse, RenameRequest, RenameResponse,
+    AbortTransactionRequest, AbortTransactionResponse, AddRaftServerRequest, AddRaftServerResponse,
+    AllocateBlockRequest, AllocateBlockResponse, BlockInfo, ChunkServerCommand, ClusterMember,
+    CommitTransactionRequest, CommitTransactionResponse, CompleteFileRequest, CompleteFileResponse,
+    CreateFileRequest, CreateFileResponse, FileMetadata, GetBlockLocationsRequest,
+    GetBlockLocationsResponse, GetClusterInfoRequest, GetClusterInfoResponse, GetFileInfoRequest,
+    GetFileInfoResponse, GetSafeModeStatusRequest, GetSafeModeStatusResponse, HeartbeatRequest,
+    HeartbeatResponse, ListFilesRequest, ListFilesResponse, PrepareTransactionRequest,
+    PrepareTransactionResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
+    RemoveRaftServerRequest, RemoveRaftServerResponse, RenameRequest, RenameResponse,
     SetSafeModeRequest, SetSafeModeResponse,
 };
-use crate::simple_raft::{AppState, Command, Event, MasterCommand};
+use crate::simple_raft::{AppState, Command, Event, MasterCommand, MembershipCommand, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -1332,6 +1334,178 @@ impl MasterService for MyMaster {
             }
         } else {
             Err(Status::internal("Wrong state type"))
+        }
+    }
+
+    // =========================================================================
+    // Raft Cluster Membership Management RPC Handlers
+    // =========================================================================
+    async fn add_raft_server(
+        &self,
+        request: Request<AddRaftServerRequest>,
+    ) -> Result<Response<AddRaftServerResponse>, Status> {
+        let req = request.into_inner();
+
+        // Submit membership change command to Raft
+        let cmd = Command::Membership(MembershipCommand::AddServer {
+            server_id: req.server_id as usize,
+            server_address: req.server_address.clone(),
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: cmd,
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(AddRaftServerResponse {
+                success: true,
+                error_message: "".to_string(),
+                leader_hint: "".to_string(),
+            })),
+            Ok(Err(leader_opt)) => Ok(Response::new(AddRaftServerResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    async fn remove_raft_server(
+        &self,
+        request: Request<RemoveRaftServerRequest>,
+    ) -> Result<Response<RemoveRaftServerResponse>, Status> {
+        let req = request.into_inner();
+
+        // Safety check: get current cluster size
+        let (cluster_size, is_leader) = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if self
+                .raft_tx
+                .send(Event::GetClusterInfo { reply_tx: tx })
+                .await
+                .is_err()
+            {
+                return Err(Status::internal("Raft channel closed"));
+            }
+
+            match rx.await {
+                Ok(info) => (info.peers.len() + 1, info.role == Role::Leader), // +1 for self
+                Err(_) => return Err(Status::internal("Failed to get cluster info")),
+            }
+        };
+
+        if !is_leader {
+            // Not leader, return error with hint
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::GetLeaderInfo { reply_tx: tx })
+                .await;
+            let leader_hint = rx.await.ok().flatten().unwrap_or_default();
+            return Ok(Response::new(RemoveRaftServerResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint,
+            }));
+        }
+
+        // Safety check: don't remove if it would leave less than 1 node
+        if cluster_size <= 1 {
+            return Ok(Response::new(RemoveRaftServerResponse {
+                success: false,
+                error_message: "Cannot remove server: would leave cluster empty".to_string(),
+                leader_hint: "".to_string(),
+            }));
+        }
+
+        // Submit membership change command to Raft
+        let cmd = Command::Membership(MembershipCommand::RemoveServer {
+            server_id: req.server_id as usize,
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: cmd,
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(RemoveRaftServerResponse {
+                success: true,
+                error_message: "".to_string(),
+                leader_hint: "".to_string(),
+            })),
+            Ok(Err(leader_opt)) => Ok(Response::new(RemoveRaftServerResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    async fn get_cluster_info(
+        &self,
+        _request: Request<GetClusterInfoRequest>,
+    ) -> Result<Response<GetClusterInfoResponse>, Status> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::GetClusterInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(info) => {
+                let role_str = match info.role {
+                    Role::Leader => "Leader",
+                    Role::Follower => "Follower",
+                    Role::Candidate => "Candidate",
+                };
+
+                let members: Vec<ClusterMember> = info
+                    .peers
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, addr)| ClusterMember {
+                        server_id: idx as u32,
+                        address: addr.clone(),
+                        is_self: false,
+                    })
+                    .collect();
+
+                Ok(Response::new(GetClusterInfoResponse {
+                    node_id: info.node_id as u32,
+                    role: role_str.to_string(),
+                    current_term: info.current_term,
+                    leader_id: info.leader_id.map(|id| id as u32).unwrap_or(0),
+                    leader_address: info.leader_address.unwrap_or_default(),
+                    members,
+                    commit_index: info.commit_index as u64,
+                    last_applied: info.last_applied as u64,
+                }))
+            }
+            Err(_) => Err(Status::internal("Failed to get cluster info")),
         }
     }
 }
