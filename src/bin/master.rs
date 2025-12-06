@@ -69,9 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Advertise Addr: {}", advertise_addr);
     println!("Storage Dir: {}", args.storage_dir);
 
-    let state = Arc::new(Mutex::new(rust_hadoop::simple_raft::AppState::Master(
-        MasterState::default(),
-    )));
+    let state = {
+        let mut master_state = MasterState::default();
+        master_state.enter_safe_mode();
+        Arc::new(Mutex::new(rust_hadoop::simple_raft::AppState::Master(
+            master_state,
+        )))
+    };
     let (raft_tx, raft_rx) = tokio::sync::mpsc::channel(100);
 
     let raft_tx_for_node = raft_tx.clone();

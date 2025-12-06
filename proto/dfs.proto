@@ -26,6 +26,10 @@ service MasterService {
 
   // Liveness check
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Safe Mode operations
+  rpc GetSafeModeStatus (GetSafeModeStatusRequest) returns (GetSafeModeStatusResponse);
+  rpc SetSafeMode (SetSafeModeRequest) returns (SetSafeModeResponse);
 }
 
 message HeartbeatRequest {
@@ -254,4 +258,30 @@ message AbortTransactionResponse {
   bool success = 1;
   string error_message = 2;
   string leader_hint = 3;
+}
+
+// ============================================================================
+// Safe Mode Messages
+// ============================================================================
+
+message GetSafeModeStatusRequest {}
+
+message GetSafeModeStatusResponse {
+  bool is_safe_mode = 1;            // Whether cluster is in safe mode
+  bool is_manual = 2;               // Whether safe mode was manually triggered
+  uint32 chunk_server_count = 3;    // Number of registered ChunkServers
+  uint32 expected_blocks = 4;       // Expected number of blocks
+  uint32 reported_blocks = 5;       // Number of reported blocks
+  double threshold = 6;             // Safe mode exit threshold (0.0-1.0)
+  uint64 entered_at = 7;            // Timestamp when safe mode was entered
+}
+
+message SetSafeModeRequest {
+  bool enter = 1;                   // true = enter safe mode, false = leave safe mode
+}
+
+message SetSafeModeResponse {
+  bool success = 1;
+  string error_message = 2;
+  bool is_safe_mode = 3;            // Current safe mode status after operation
 }

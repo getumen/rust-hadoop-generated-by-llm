@@ -4,9 +4,10 @@ use crate::dfs::{
     BlockInfo, ChunkServerCommand, CommitTransactionRequest, CommitTransactionResponse,
     CompleteFileRequest, CompleteFileResponse, CreateFileRequest, CreateFileResponse, FileMetadata,
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileInfoRequest, GetFileInfoResponse,
-    HeartbeatRequest, HeartbeatResponse, ListFilesRequest, ListFilesResponse,
-    PrepareTransactionRequest, PrepareTransactionResponse, RegisterChunkServerRequest,
-    RegisterChunkServerResponse, RenameRequest, RenameResponse,
+    GetSafeModeStatusRequest, GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse,
+    ListFilesRequest, ListFilesResponse, PrepareTransactionRequest, PrepareTransactionResponse,
+    RegisterChunkServerRequest, RegisterChunkServerResponse, RenameRequest, RenameResponse,
+    SetSafeModeRequest, SetSafeModeResponse,
 };
 use crate::simple_raft::{AppState, Command, Event, MasterCommand};
 use serde::{Deserialize, Serialize};
@@ -193,6 +194,145 @@ pub struct MasterState {
     /// Pending commands for ChunkServers (not persisted via Raft)
     #[serde(skip)]
     pub pending_commands: HashMap<String, Vec<ChunkServerCommand>>, // address -> commands
+
+    /// Safe Mode: cluster is in safe mode until enough blocks are reported
+    #[serde(skip)]
+    pub safe_mode: bool,
+
+    /// Timestamp when safe mode was entered (millis since epoch)
+    #[serde(skip)]
+    pub safe_mode_entered_at: u64,
+
+    /// Expected minimum number of ChunkServers before exiting safe mode
+    #[serde(skip)]
+    pub safe_mode_min_chunkservers: usize,
+
+    /// Total blocks known from metadata
+    #[serde(skip)]
+    pub expected_block_count: usize,
+
+    /// Number of blocks reported by ChunkServers
+    #[serde(skip)]
+    pub reported_block_count: usize,
+
+    /// Safe mode threshold (percentage of blocks that must be reported, 0.0-1.0)
+    #[serde(skip)]
+    pub safe_mode_threshold: f64,
+
+    /// Whether safe mode was manually forced
+    #[serde(skip)]
+    pub safe_mode_manual: bool,
+}
+
+impl MasterState {
+    /// Initialize safe mode on startup
+    pub fn enter_safe_mode(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        self.safe_mode = true;
+        self.safe_mode_entered_at = now;
+        self.safe_mode_min_chunkservers = 1; // At least 1 ChunkServer required
+        self.safe_mode_threshold = 0.99; // 99% of blocks must be reported
+        self.expected_block_count = self.count_total_blocks();
+        self.reported_block_count = 0;
+        self.safe_mode_manual = false;
+
+        println!(
+            "Entering Safe Mode: expecting {} blocks, threshold {}%",
+            self.expected_block_count,
+            (self.safe_mode_threshold * 100.0) as u32
+        );
+    }
+
+    /// Count total blocks across all files
+    fn count_total_blocks(&self) -> usize {
+        self.files.values().map(|f| f.blocks.len()).sum()
+    }
+
+    /// Check if safe mode should be exited automatically
+    pub fn should_exit_safe_mode(&self) -> bool {
+        if self.safe_mode_manual {
+            return false; // Manual safe mode requires manual exit
+        }
+
+        if !self.safe_mode {
+            return false; // Already not in safe mode
+        }
+
+        // Check minimum ChunkServers
+        if self.chunk_servers.len() < self.safe_mode_min_chunkservers {
+            return false;
+        }
+
+        // Check block reporting threshold
+        if self.expected_block_count == 0 {
+            // No blocks to report, can exit immediately
+            return true;
+        }
+
+        let reported_ratio = self.reported_block_count as f64 / self.expected_block_count as f64;
+        if reported_ratio >= self.safe_mode_threshold {
+            return true;
+        }
+
+        // Check timeout (60 seconds max in safe mode)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        if now - self.safe_mode_entered_at > 60_000 {
+            println!("Safe Mode timeout reached, forcing exit");
+            return true;
+        }
+
+        false
+    }
+
+    /// Exit safe mode
+    pub fn exit_safe_mode(&mut self) {
+        if self.safe_mode {
+            println!(
+                "Exiting Safe Mode: {} ChunkServers registered, {}/{} blocks reported",
+                self.chunk_servers.len(),
+                self.reported_block_count,
+                self.expected_block_count
+            );
+            self.safe_mode = false;
+            self.safe_mode_manual = false;
+        }
+    }
+
+    /// Force enter safe mode (manual)
+    pub fn force_enter_safe_mode(&mut self) {
+        self.enter_safe_mode();
+        self.safe_mode_manual = true;
+        println!("Manually entered Safe Mode");
+    }
+
+    /// Force exit safe mode (manual)
+    pub fn force_exit_safe_mode(&mut self) {
+        self.safe_mode_manual = false;
+        self.exit_safe_mode();
+        println!("Manually exited Safe Mode");
+    }
+
+    /// Check if in safe mode
+    pub fn is_in_safe_mode(&self) -> bool {
+        self.safe_mode
+    }
+
+    /// Update reported block count from heartbeat
+    pub fn update_reported_blocks(&mut self, block_count: usize) {
+        self.reported_block_count += block_count;
+
+        // Check if we should exit safe mode
+        if self.should_exit_safe_mode() {
+            self.exit_safe_mode();
+        }
+    }
 }
 
 use crate::sharding::{ShardId, ShardMap};
@@ -410,6 +550,19 @@ impl MyMaster {
         }
         Ok(())
     }
+
+    /// Check if the cluster is in safe mode and reject write operations
+    fn check_safe_mode(&self) -> Result<(), Status> {
+        let state_lock = self.state.lock().unwrap();
+        if let AppState::Master(ref state) = *state_lock {
+            if state.is_in_safe_mode() {
+                return Err(Status::unavailable(
+                    "Cluster is in Safe Mode. Write operations are blocked.",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -447,6 +600,7 @@ impl MasterService for MyMaster {
     ) -> Result<Response<CreateFileResponse>, Status> {
         let req = request.into_inner();
         self.check_shard_ownership(&req.path)?;
+        self.check_safe_mode()?;
 
         // Check if file exists (read optimization)
         {
@@ -500,6 +654,7 @@ impl MasterService for MyMaster {
         const REPLICATION_FACTOR: usize = 3;
 
         self.check_shard_ownership(&req.path)?;
+        self.check_safe_mode()?;
 
         let (chunk_servers, block_id) = {
             let state_lock = self.state.lock().unwrap();
@@ -641,6 +796,9 @@ impl MasterService for MyMaster {
             .as_millis() as u64;
 
         if let AppState::Master(ref mut state) = *state_lock {
+            // Check if this is a new ChunkServer registration
+            let is_new_chunkserver = !state.chunk_servers.contains_key(&req.chunk_server_address);
+
             state.chunk_servers.insert(
                 req.chunk_server_address.clone(),
                 ChunkServerStatus {
@@ -650,6 +808,16 @@ impl MasterService for MyMaster {
                     chunk_count: req.chunk_count,
                 },
             );
+
+            // If in safe mode and this is a new ChunkServer, update block count
+            if state.is_in_safe_mode() && is_new_chunkserver {
+                state.update_reported_blocks(req.chunk_count as usize);
+            }
+
+            // Always check if we should exit safe mode (covers timeout and 0-block case)
+            if state.is_in_safe_mode() && state.should_exit_safe_mode() {
+                state.exit_safe_mode();
+            }
 
             // Retrieve pending commands
             let commands = state
@@ -709,6 +877,7 @@ impl MasterService for MyMaster {
 
         // Check source shard ownership
         self.check_shard_ownership(&source_path)?;
+        self.check_safe_mode()?;
 
         // Determine source and dest shard IDs
         let (source_shard, dest_shard, dest_peers) = {
@@ -1112,6 +1281,57 @@ impl MasterService for MyMaster {
                 leader_hint: leader_opt.unwrap_or_default(),
             })),
             Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    // =========================================================================
+    // Safe Mode RPC Handlers
+    // =========================================================================
+    async fn get_safe_mode_status(
+        &self,
+        _request: Request<GetSafeModeStatusRequest>,
+    ) -> Result<Response<GetSafeModeStatusResponse>, Status> {
+        let state_lock = self.state.lock().unwrap();
+        if let AppState::Master(ref state) = *state_lock {
+            Ok(Response::new(GetSafeModeStatusResponse {
+                is_safe_mode: state.safe_mode,
+                is_manual: state.safe_mode_manual,
+                chunk_server_count: state.chunk_servers.len() as u32,
+                expected_blocks: state.expected_block_count as u32,
+                reported_blocks: state.reported_block_count as u32,
+                threshold: state.safe_mode_threshold,
+                entered_at: state.safe_mode_entered_at,
+            }))
+        } else {
+            Err(Status::internal("Wrong state type"))
+        }
+    }
+
+    async fn set_safe_mode(
+        &self,
+        request: Request<SetSafeModeRequest>,
+    ) -> Result<Response<SetSafeModeResponse>, Status> {
+        let req = request.into_inner();
+
+        let mut state_lock = self.state.lock().unwrap();
+        if let AppState::Master(ref mut state) = *state_lock {
+            if req.enter {
+                state.force_enter_safe_mode();
+                Ok(Response::new(SetSafeModeResponse {
+                    success: true,
+                    error_message: "".to_string(),
+                    is_safe_mode: true,
+                }))
+            } else {
+                state.force_exit_safe_mode();
+                Ok(Response::new(SetSafeModeResponse {
+                    success: true,
+                    error_message: "".to_string(),
+                    is_safe_mode: false,
+                }))
+            }
+        } else {
+            Err(Status::internal("Wrong state type"))
         }
     }
 }
