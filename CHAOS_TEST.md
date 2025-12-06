@@ -53,7 +53,7 @@
 1. クロスシャードRenameの準備（Transaction Record作成）
 2. **Crash**: Transactionに関与するShard（SourceまたはDest）を強制停止
 3. **Restart**: Shardを再起動
-4. **Verification**: 
+4. **Verification**:
    - Crashのタイミングに応じて、Transactionが正しくAbort（ロールバック）またはCommit（完了）されるか確認
    - データの整合性が保たれているか確認
 

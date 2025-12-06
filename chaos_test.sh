@@ -134,7 +134,7 @@ main() {
     echo "-----------------------------------"
     kill_chunkserver "chunkserver1-shard1"
     cluster_status
-    
+
     # Download should work if file is on Shard 2
     echo "Attempting download (may succeed if file is on Shard 2)..."
     if download_file "download1.txt"; then
@@ -142,7 +142,7 @@ main() {
     else
         echo "⚠️  Download failed (file may be on Shard 1 which has no ChunkServer)"
     fi
-    
+
     restart_chunkserver "chunkserver1-shard1"
     cluster_status
 
@@ -152,14 +152,14 @@ main() {
     echo "-----------------------------------"
     kill_chunkserver "chunkserver1-shard2"
     cluster_status
-    
+
     echo "Attempting download..."
     if download_file "download2.txt"; then
         verify_file "download2.txt" || true
     else
         echo "⚠️  Download failed (file may be on Shard 2 which has no ChunkServer)"
     fi
-    
+
     restart_chunkserver "chunkserver1-shard2"
     cluster_status
 
@@ -188,13 +188,13 @@ main() {
     echo ""
     echo "Phase 4: Final Verification"
     echo "==========================="
-    
+
     # Verify we can still download
     echo "Final download test..."
     if download_file "final_download.txt"; then
         verify_file "final_download.txt"
     fi
-    
+
     list_files
 
     echo ""

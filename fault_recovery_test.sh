@@ -70,7 +70,7 @@ for i in {1..100}; do
     # Use max-retries 1 to avoid following the redirect (we just want to detect it)
     # If it redirects, it will fail, but print "Received SHARD REDIRECT"
     OUTPUT=$(docker exec $SOURCE_CONTAINER /app/dfs_cli --master http://localhost:50051 --max-retries 1 get $TEST_PATH /tmp/ignore 2>&1 || true)
-    
+
     IS_REDIRECT=false
     if echo "$OUTPUT" | grep -q "REDIRECT"; then
         IS_REDIRECT=true
