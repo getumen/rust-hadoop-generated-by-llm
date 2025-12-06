@@ -41,6 +41,21 @@ enum Commands {
         /// Destination file path
         dest: String,
     },
+    /// Get or set Safe Mode status
+    SafeMode {
+        #[command(subcommand)]
+        action: SafeModeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SafeModeAction {
+    /// Get current Safe Mode status
+    Get,
+    /// Enter Safe Mode (block writes)
+    Enter,
+    /// Leave Safe Mode (allow writes)
+    Leave,
 }
 
 #[tokio::main]
@@ -74,6 +89,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Rename { source, dest } => {
             client.rename_file(&source, &dest).await?;
             println!("File renamed successfully: {} -> {}", source, dest);
+        }
+        Commands::SafeMode { action } => {
+            use rust_hadoop::dfs::master_service_client::MasterServiceClient;
+            use rust_hadoop::dfs::{GetSafeModeStatusRequest, SetSafeModeRequest};
+
+            let master_addr = if cli.master.starts_with("http://") {
+                cli.master.clone()
+            } else {
+                format!("http://{}", cli.master)
+            };
+
+            let mut grpc_client = MasterServiceClient::connect(master_addr).await?;
+
+            match action {
+                SafeModeAction::Get => {
+                    let response = grpc_client
+                        .get_safe_mode_status(GetSafeModeStatusRequest {})
+                        .await?
+                        .into_inner();
+
+                    println!("Safe Mode Status:");
+                    println!("  Active: {}", response.is_safe_mode);
+                    println!("  Manual: {}", response.is_manual);
+                    println!("  ChunkServers: {}", response.chunk_server_count);
+                    println!(
+                        "  Blocks: {}/{}",
+                        response.reported_blocks, response.expected_blocks
+                    );
+                    println!("  Threshold: {}%", (response.threshold * 100.0) as u32);
+                }
+                SafeModeAction::Enter => {
+                    let response = grpc_client
+                        .set_safe_mode(SetSafeModeRequest { enter: true })
+                        .await?
+                        .into_inner();
+
+                    if response.success {
+                        println!("Entered Safe Mode");
+                    } else {
+                        println!("Failed to enter Safe Mode: {}", response.error_message);
+                    }
+                }
+                SafeModeAction::Leave => {
+                    let response = grpc_client
+                        .set_safe_mode(SetSafeModeRequest { enter: false })
+                        .await?
+                        .into_inner();
+
+                    if response.success {
+                        println!("Left Safe Mode");
+                    } else {
+                        println!("Failed to leave Safe Mode: {}", response.error_message);
+                    }
+                }
+            }
         }
     }
 

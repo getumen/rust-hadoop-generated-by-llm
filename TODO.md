@@ -79,7 +79,7 @@
 ## 🟡 Medium Priority (Important for Stability)
 
 ### 4. Safe Mode
-**Status**: Not Started
+**Status**: **Completed**
 **Priority**: Medium
 **Effort**: Medium
 
@@ -94,10 +94,10 @@
 - Exit Safe Mode only when threshold of blocks are reported
 
 **Tasks**:
-- [ ] Implement Safe Mode state machine
-- [ ] Add block reporting threshold logic (e.g., 99% of blocks reported)
-- [ ] Block modification RPCs during Safe Mode
-- [ ] Add CLI command to manually enter/leave Safe Mode
+- [x] Implement Safe Mode state machine
+- [x] Add block reporting threshold logic (e.g., 99% of blocks reported)
+- [x] Block modification RPCs during Safe Mode
+- [x] Add CLI command to manually enter/leave Safe Mode
 - [ ] Show Safe Mode status in web UI/metrics
 
 ---
