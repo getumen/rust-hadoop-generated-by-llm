@@ -53,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().to_string())
         .collect();
 
-    let client = Client::new(master_addrs);
+    let client =
+        Client::new(master_addrs).with_retry_config(cli.max_retries, cli.initial_backoff_ms);
 
     match cli.command {
         Commands::Ls => {

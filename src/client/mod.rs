@@ -21,6 +21,8 @@ pub struct Client {
     master_addrs: Vec<String>,
     shard_map: Arc<RwLock<ShardMap>>,
     host_aliases: Arc<RwLock<HashMap<String, String>>>,
+    max_retries: usize,
+    initial_backoff_ms: u64,
 }
 
 impl Client {
@@ -31,7 +33,15 @@ impl Client {
             master_addrs,
             shard_map: Arc::new(RwLock::new(ShardMap::new(100))),
             host_aliases: Arc::new(RwLock::new(HashMap::new())),
+            max_retries: MAX_RETRIES,
+            initial_backoff_ms: INITIAL_BACKOFF_MS,
         }
+    }
+
+    pub fn with_retry_config(mut self, max_retries: usize, initial_backoff_ms: u64) -> Self {
+        self.max_retries = max_retries;
+        self.initial_backoff_ms = initial_backoff_ms;
+        self
     }
 
     pub fn set_shard_map(&self, map: ShardMap) {
@@ -117,8 +127,8 @@ impl Client {
         let (alloc_resp, _) = self
             .execute_rpc_internal(
                 &alloc_masters,
-                MAX_RETRIES,
-                INITIAL_BACKOFF_MS,
+                self.max_retries,
+                self.initial_backoff_ms,
                 |mut client| {
                     let dest = dest.to_string();
                     async move {
@@ -303,8 +313,13 @@ impl Client {
             initial_targets = self.master_addrs.clone();
         }
 
-        self.execute_rpc_internal(&initial_targets, MAX_RETRIES, INITIAL_BACKOFF_MS, f)
-            .await
+        self.execute_rpc_internal(
+            &initial_targets,
+            self.max_retries,
+            self.initial_backoff_ms,
+            f,
+        )
+        .await
     }
 
     async fn execute_rpc_internal<F, Fut, T>(

@@ -2,12 +2,13 @@ use crate::client::Client;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use tokio::time::{sleep, Duration};
+
 use uuid::Uuid;
 
 const MASTER_ADDRS: &[&str] = &["http://127.0.0.1:50051", "http://127.0.0.1:50061"];
 
 #[tokio::test]
+#[ignore]
 async fn test_client_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for cluster to be ready (optional, assumes cluster is running via docker-compose)
     // In a CI env, we'd start it here. For now, assume user ran `start_sharded_cluster.sh`.

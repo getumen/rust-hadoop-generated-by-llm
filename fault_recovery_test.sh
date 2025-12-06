@@ -18,6 +18,7 @@ echo "======================"
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
+docker compose -f docker-compose-sharded.yml down -v || true
 docker compose -f docker-compose-sharded.yml up -d --build
 
 # Wait for cluster
@@ -66,7 +67,9 @@ echo "Finding target path on $DEST_SHARD..."
 TARGET_PATH=""
 for i in {1..100}; do
     TEST_PATH="/target_recovery_$i.txt"
-    OUTPUT=$(docker exec $SOURCE_CONTAINER /app/dfs_cli --master http://localhost:50051 get $TEST_PATH /tmp/ignore 2>&1 || true)
+    # Use max-retries 1 to avoid following the redirect (we just want to detect it)
+    # If it redirects, it will fail, but print "Received SHARD REDIRECT"
+    OUTPUT=$(docker exec $SOURCE_CONTAINER /app/dfs_cli --master http://localhost:50051 --max-retries 1 get $TEST_PATH /tmp/ignore 2>&1 || true)
     
     IS_REDIRECT=false
     if echo "$OUTPUT" | grep -q "REDIRECT"; then
@@ -87,6 +90,7 @@ for i in {1..100}; do
 done
 
 if [ -z "$TARGET_PATH" ]; then
+    echo "Last Output: $OUTPUT"
     fail "Could not find a path on the destination shard"
 fi
 echo "Target Path: $TARGET_PATH"

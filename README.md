@@ -80,7 +80,15 @@ cargo build --release
 ### 1. ユニットテスト
 
 ```bash
+# 全ての単体テストを実行（結合テストはスキップ）
 cargo test
+
+# 結合テスト（Client Integration Test）のみを実行
+# ※事前にDockerクラスタが起動している必要があります
+cargo test -- --ignored
+
+# 全てのテスト（単体 + 結合）を実行
+cargo test -- --include-ignored
 ```
 
 ### 2. インテグレーション & カオステスト
