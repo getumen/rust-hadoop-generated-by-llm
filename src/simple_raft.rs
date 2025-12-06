@@ -629,6 +629,21 @@ impl RaftNode {
         self.current_leader_address = Some(self.client_address.clone());
         self.next_index = vec![self.log.len() + self.last_included_index; self.peers.len()];
         self.match_index = vec![self.last_included_index; self.peers.len()];
+
+        // For single-node clusters, immediately commit everything in the log upon becoming leader.
+        // This is necessary because there are no peers to replicate to, so we can't rely on
+        // standard consensus flow to advance commit_index for restored logs.
+        if self.peers.is_empty() {
+            let last_index = self.log.len() - 1 + self.last_included_index;
+            if last_index > self.commit_index {
+                println!(
+                    "Single-node cluster: advancing commit_index to {} on leadership",
+                    last_index
+                );
+                self.commit_index = last_index;
+                self.apply_logs();
+            }
+        }
     }
 
     async fn send_heartbeats(&mut self) {

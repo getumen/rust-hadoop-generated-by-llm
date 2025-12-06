@@ -54,12 +54,12 @@
 - `dfs_cli` should become a thin wrapper around this library
 
 **Tasks**:
-- [ ] Create `Client` struct in `src/client/mod.rs`
-- [ ] Move RPC connection management (Leader discovery, retry logic) to `Client`
-- [ ] Move `ShardMap` caching and smart routing logic to `Client`
-- [ ] Expose clean async API (`create_file`, `write_file`, `read_file`, `rename`, etc.)
-- [ ] Refactor `dfs_cli.rs` to use the new `Client`
-- [ ] Add integration tests using the usage of `Client` library directly
+- [x] Create `Client` struct in `src/client/mod.rs`
+- [x] Move RPC connection management (Leader discovery, retry logic) to `Client`
+- [x] Move `ShardMap` caching and smart routing logic to `Client`
+- [x] Expose clean async API (`create_file`, `write_file`, `read_file`, `rename`, etc.)
+- [x] Refactor `dfs_cli.rs` to use the new `Client`
+- [x] Add integration tests using the usage of `Client` library directly
 
 ---
 

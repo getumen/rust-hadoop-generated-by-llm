@@ -58,11 +58,11 @@ Done (3 replicas)
 
 ### シャーディング環境でのテスト
 
-`docker-compose-sharded.yml` を使用すると、複数のShard（Master）と共有されたChunkServerプールが起動します。
+`docker-compose.yml` を使用すると、複数のShard（Master）と共有されたChunkServerプールが起動します。
 
 ```bash
 # クラスタ起動
-docker compose -f docker-compose-sharded.yml up -d --build
+docker compose -f docker-compose.yml up -d --build
 
 # ファイルアップロード（レプリケーション確認）
 docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 put /test.txt /test.txt
@@ -74,8 +74,8 @@ docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 put /test.tx
 ChunkServerのデータディレクトリを確認することで、実際に複製されているかチェックできます。
 
 ```bash
-docker compose -f docker-compose-sharded.yml exec chunkserver1 ls -l /data/
-docker compose -f docker-compose-sharded.yml exec chunkserver2 ls -l /data/
+docker compose -f docker-compose.yml exec chunkserver1 ls -l /data/
+docker compose -f docker-compose.yml exec chunkserver2 ls -l /data/
 ```
 
 ## 既存の改善状況

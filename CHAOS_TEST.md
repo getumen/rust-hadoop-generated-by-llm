@@ -13,7 +13,7 @@
 
 ## 環境構成
 
-**シャーディング構成 (`docker-compose-sharded.yml`)** を使用します。
+**シャーディング構成 (`docker-compose.yml`)** を使用します。
 
 - **Config Server** (Meta-Shard) × 1 (Raft Group)
 - **Shard 1** (Master) × 3 (Raft Group)
@@ -53,7 +53,7 @@
 1. クロスシャードRenameの準備（Transaction Record作成）
 2. **Crash**: Transactionに関与するShard（SourceまたはDest）を強制停止
 3. **Restart**: Shardを再起動
-4. **Verification**: 
+4. **Verification**:
    - Crashのタイミングに応じて、Transactionが正しくAbort（ロールバック）またはCommit（完了）されるか確認
    - データの整合性が保たれているか確認
 
@@ -85,7 +85,7 @@ ChunkServerをランダムに停止・再起動しながら、読み書きの継
 
 ```bash
 # シャーディングクラスタの起動
-docker compose -f docker-compose-sharded.yml up -d --build
+docker compose -f docker-compose.yml up -d --build
 ```
 
 ### 2. Shardリーダーの障害テスト
@@ -94,12 +94,12 @@ Raftのリーダー選出機能を確認します。
 
 ```bash
 # Shard 1の状況確認（Leaderを探す）
-docker compose -f docker-compose-sharded.yml logs -f master-0-0
-docker compose -f docker-compose-sharded.yml logs -f master-0-1
-docker compose -f docker-compose-sharded.yml logs -f master-0-2
+docker compose -f docker-compose.yml logs -f master-0-0
+docker compose -f docker-compose.yml logs -f master-0-1
+docker compose -f docker-compose.yml logs -f master-0-2
 
 # Leader（例えば master-0-0）を停止
-docker compose -f docker-compose-sharded.yml stop master-0-0
+docker compose -f docker-compose.yml stop master-0-0
 
 # 新しいLeaderが選出されたかログで確認
 # クライアント操作が継続できるか確認
@@ -113,7 +113,7 @@ docker exec master-0-1 /app/dfs_cli --master http://localhost:50051 ls /
 docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 put /file.txt /test.txt
 
 # 1つのChunkServerを停止
-docker compose -f docker-compose-sharded.yml stop chunkserver1
+docker compose -f docker-compose.yml stop chunkserver1
 
 # ファイルが読み込めるか確認（残りのレプリカから読めるはず）
 docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 get /test.txt /downloaded.txt
@@ -126,7 +126,7 @@ docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 get /test.tx
 テスト後に完全にクリーンな状態に戻すには：
 
 ```bash
-docker compose -f docker-compose-sharded.yml down -v
+docker compose -f docker-compose.yml down -v
 ```
 
 ### ログ確認
@@ -134,7 +134,7 @@ docker compose -f docker-compose-sharded.yml down -v
 特定のシャードやサーバーのログを確認：
 
 ```bash
-docker compose -f docker-compose-sharded.yml logs -f master-0-0
+docker compose -f docker-compose.yml logs -f master-0-0
 ```
 
 ## 今後のテスト計画

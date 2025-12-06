@@ -18,7 +18,7 @@ echo "========================="
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
-docker compose -f docker-compose-sharded.yml up -d --build
+docker compose -f docker-compose.yml up -d --build
 
 # Wait for cluster
 echo "Waiting for cluster to be ready (20s)..."
@@ -71,11 +71,11 @@ TARGET_PATH="/target_abort.txt"
 
 # 3. Stop the Destination Shard (use service name, not container name)
 echo "🛑 Stopping Destination Shard..."
-# Service names in docker-compose-sharded.yml are without 'dfs-' prefix
+# Service names in docker-compose.yml are without 'dfs-' prefix
 if [ "$DEST_SHARD" = "shard-2" ]; then
-    docker compose -f docker-compose-sharded.yml stop master1-shard2
+    docker compose -f docker-compose.yml stop master1-shard2
 else
-    docker compose -f docker-compose-sharded.yml stop master1-shard1
+    docker compose -f docker-compose.yml stop master1-shard1
 fi
 
 # 4. Attempt Rename
@@ -100,7 +100,7 @@ fi
 
 # Cleanup
 echo "🧹 Cleanup..."
-docker compose -f docker-compose-sharded.yml down -v
+docker compose -f docker-compose.yml down -v
 rm -f file1.txt
 
 echo ""
