@@ -1,170 +1,80 @@
 version: '3.8'
 
 services:
-  master1:
+  # ==========================================
+  # Shard 1
+  # ==========================================
+  master1-shard1:
     build: .
-    container_name: dfs-master1
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers http://dfs-master2:8080,http://dfs-master3:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1:50051
+    container_name: dfs-master1-shard1
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard1:50051 --shard-id shard-1 --shard-config /app/shard_config.json
     ports:
       - "50051:50051"
       - "8081:8080"
     networks:
-      - dfs-network
+      - dfs-sharded-network
     volumes:
-      - master1-data:/data/raft
+      - master1-shard1-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
       timeout: 3s
       retries: 3
 
-  master2:
+  chunkserver1-shard1:
     build: .
-    container_name: dfs-master2
-    command: /app/master --addr 0.0.0.0:50051 --id 2 --peers http://dfs-master1:8080,http://dfs-master3:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master2:50051
-    ports:
-      - "50057:50051"
-      - "8082:8080"
-    networks:
-      - dfs-network
-    volumes:
-      - master2-data:/data/raft
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
-  master3:
-    build: .
-    container_name: dfs-master3
-    command: /app/master --addr 0.0.0.0:50051 --id 3 --peers http://dfs-master1:8080,http://dfs-master2:8080 --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master3:50051
-    ports:
-      - "50058:50051"
-      - "8083:8080"
-    networks:
-      - dfs-network
-    volumes:
-      - master3-data:/data/raft
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
-  chunkserver1:
-    build: .
-    container_name: dfs-chunkserver1
-    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr dfs-master1:50051,dfs-master2:50051,dfs-master3:50051 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1:50052
-    environment:
-      - CHUNKSERVER_ADDR=dfs-chunkserver1:50052
+    container_name: dfs-chunkserver1-shard1
+    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr dfs-master1-shard1:50051 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
     ports:
       - "50052:50052"
     networks:
-      - dfs-network
+      - dfs-sharded-network
     depends_on:
-      - master1
-      - master2
-      - master3
+      - master1-shard1
     volumes:
-      - cs1-data:/data/cs1
+      - cs1-shard1-data:/data/cs1
+
+  # ==========================================
+  # Shard 2
+  # ==========================================
+  master1-shard2:
+    build: .
+    container_name: dfs-master1-shard2
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard2:50051 --shard-id shard-2 --shard-config /app/shard_config.json
+    ports:
+      - "50061:50051"
+      - "8091:8080"
+    networks:
+      - dfs-sharded-network
+    volumes:
+      - master1-shard2-data:/data/raft
+      - ./shard_config.json:/app/shard_config.json
     healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50052 || exit 1" ]
+      test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
       timeout: 3s
       retries: 3
 
-  chunkserver2:
+  chunkserver1-shard2:
     build: .
-    container_name: dfs-chunkserver2
-    command: /app/chunkserver --addr 0.0.0.0:50053 --master-addr dfs-master1:50051,dfs-master2:50051,dfs-master3:50051 --storage-dir /data/cs2 --advertise-addr dfs-chunkserver2:50053
+    container_name: dfs-chunkserver1-shard2
+    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr dfs-master1-shard2:50051 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
     ports:
-      - "50053:50053"
+      - "50062:50052"
     networks:
-      - dfs-network
+      - dfs-sharded-network
     depends_on:
-      - master1
-      - master2
-      - master3
+      - master1-shard2
     volumes:
-      - cs2-data:/data/cs2
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50053 || exit 1" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
-  chunkserver3:
-    build: .
-    container_name: dfs-chunkserver3
-    command: /app/chunkserver --addr 0.0.0.0:50054 --master-addr dfs-master1:50051,dfs-master2:50051,dfs-master3:50051 --storage-dir /data/cs3 --advertise-addr dfs-chunkserver3:50054
-    ports:
-      - "50054:50054"
-    networks:
-      - dfs-network
-    depends_on:
-      - master1
-      - master2
-      - master3
-    volumes:
-      - cs3-data:/data/cs3
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50054 || exit 1" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
-  chunkserver4:
-    build: .
-    container_name: dfs-chunkserver4
-    command: /app/chunkserver --addr 0.0.0.0:50055 --master-addr dfs-master1:50051,dfs-master2:50051,dfs-master3:50051 --storage-dir /data/cs4 --advertise-addr dfs-chunkserver4:50055
-    ports:
-      - "50055:50055"
-    networks:
-      - dfs-network
-    depends_on:
-      - master1
-      - master2
-      - master3
-    volumes:
-      - cs4-data:/data/cs4
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50055 || exit 1" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-
-  chunkserver5:
-    build: .
-    container_name: dfs-chunkserver5
-    command: /app/chunkserver --addr 0.0.0.0:50056 --master-addr dfs-master1:50051,dfs-master2:50051,dfs-master3:50051 --storage-dir /data/cs5 --advertise-addr dfs-chunkserver5:50056
-    ports:
-      - "50056:50056"
-    networks:
-      - dfs-network
-    depends_on:
-      - master1
-      - master2
-      - master3
-    volumes:
-      - cs5-data:/data/cs5
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "netstat -an | grep 50056 || exit 1" ]
-      interval: 5s
-      timeout: 3s
-      retries: 3
+      - cs1-shard2-data:/data/cs1
 
 networks:
-  dfs-network:
+  dfs-sharded-network:
     driver: bridge
 
 volumes:
-  cs1-data:
-  cs2-data:
-  cs3-data:
-  cs4-data:
-  cs5-data:
-  master1-data:
-  master2-data:
-  master3-data:
-  metadata-volume:
+  master1-shard1-data:
+  cs1-shard1-data:
+  master1-shard2-data:
+  cs1-shard2-data:

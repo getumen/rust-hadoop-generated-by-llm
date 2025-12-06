@@ -52,7 +52,7 @@ Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Ra
 
 ```bash
 # シャーディング環境（2シャード構成 + 複数のChunkServer）の起動
-docker compose -f docker-compose-sharded.yml up -d --build
+docker compose -f docker-compose.yml up -d --build
 
 # ファイルアップロードの例 (Shard 1への書き込み)
 docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 put /file.txt /uploaded.txt
@@ -118,7 +118,7 @@ rust-hadoop/
 │   ├── sharding.rs            # Shardingロジック (Consistent Hashing)
 │   ├── simple_raft.rs         # Raftコンセンサス実装
 │   └── chunkserver.rs         # ChunkServer実装
-├── docker-compose-sharded.yml # シャーディング構成用Docker Compose
+├── docker-compose.yml # シャーディング構成用Docker Compose
 ├── docker-compose.yml         # 従来構成用Docker Compose
 └── *.sh                       # 各種テスト・起動スクリプト
 ```

@@ -130,7 +130,7 @@ RocksDBを使用してRaftログとMaster状態を永続化しています。
 
 ## Docker Compose構成
 
-`docker-compose-sharded.yml`の例：
+`docker-compose.yml`の例：
 
 ```yaml
 services:

@@ -18,8 +18,8 @@ echo "======================"
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
-docker compose -f docker-compose-sharded.yml down -v || true
-docker compose -f docker-compose-sharded.yml up -d --build
+docker compose -f docker-compose.yml down -v || true
+docker compose -f docker-compose.yml up -d --build
 
 # Wait for cluster
 echo "Waiting for cluster to be ready (20s)..."
@@ -121,9 +121,9 @@ echo "Target Path: $TARGET_PATH"
 
 echo "🛑 Stopping Destination Shard ($DEST_SHARD) to force a pending/retry state..."
 if [ "$DEST_SHARD" == "shard-2" ]; then
-    docker compose -f docker-compose-sharded.yml stop master1-shard2
+    docker compose -f docker-compose.yml stop master1-shard2
 else
-    docker compose -f docker-compose-sharded.yml stop master1-shard1
+    docker compose -f docker-compose.yml stop master1-shard1
 fi
 
 # Start Rename (Async or background?)
@@ -138,9 +138,9 @@ sleep 2
 # Now CRASH the Source Shard!
 echo "💥 CRASHING Source Shard ($SOURCE_SHARD)..."
 if [ "$SOURCE_SHARD" == "shard-1" ]; then
-    docker compose -f docker-compose-sharded.yml kill master1-shard1
+    docker compose -f docker-compose.yml kill master1-shard1
 else
-    docker compose -f docker-compose-sharded.yml kill master1-shard2
+    docker compose -f docker-compose.yml kill master1-shard2
 fi
 
 # Wait for CLI to surely fail
@@ -148,17 +148,17 @@ wait $CLI_PID || true
 
 echo "Source Shard killed. Restarting to check recovery..."
 if [ "$SOURCE_SHARD" == "shard-1" ]; then
-    docker compose -f docker-compose-sharded.yml start master1-shard1
+    docker compose -f docker-compose.yml start master1-shard1
 else
-    docker compose -f docker-compose-sharded.yml start master1-shard2
+    docker compose -f docker-compose.yml start master1-shard2
 fi
 
 # Update: Restart the destination shard too, so we can verify system returns to health
 echo "Restarting Destination Shard..."
 if [ "$DEST_SHARD" == "shard-2" ]; then
-    docker compose -f docker-compose-sharded.yml start master1-shard2
+    docker compose -f docker-compose.yml start master1-shard2
 else
-    docker compose -f docker-compose-sharded.yml start master1-shard1
+    docker compose -f docker-compose.yml start master1-shard1
 fi
 
 echo "Waiting for cluster recovery (30s)..."
@@ -191,7 +191,7 @@ fi
 
 # Cleanup
 echo "🧹 Cleanup..."
-docker compose -f docker-compose-sharded.yml down -v
+docker compose -f docker-compose.yml down -v
 rm -f file1.txt downloaded.txt
 
 echo ""
