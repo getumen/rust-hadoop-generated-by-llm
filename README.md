@@ -1,105 +1,98 @@
 # Rust Hadoop DFS
 
 Rustで実装されたHadoop互換の分散ファイルシステム（DFS）です。
+Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Raftによる強整合性とシャーディングによるスケーラビリティを実現しています。
 
 ## 特徴
 
 - ✅ **分散ストレージ**: 複数のChunkServerにデータを分散保存
 - ✅ **レプリケーション**: デフォルトで3つのレプリカを作成（冗長性確保）
 - ✅ **高可用性 (HA)**: RaftコンセンサスアルゴリズムによるMasterの冗長化
+- ✅ **スケーラビリティ (シャーディング)**: 複数のMasterグループによるメタデータの水平分割、Consistent Hashingによる負荷分散
+- ✅ **トランザクション**: クロスシャード操作（Rename等）をAtomicに実行するTransaction Recordの実装
 - ✅ **データ整合性**: Raftログレプリケーションによるメタデータの一貫性保証
-- ✅ **永続化**: RocksDBを使用したRaftログと状態の永続化
-- ✅ **スナップショット**: ログの肥大化を防ぐスナップショット機能
 - ✅ **パイプラインレプリケーション**: 効率的なデータ複製
 - ✅ **gRPC通信**: 高性能な通信プロトコル
-- ✅ **Docker対応**: Docker Composeで簡単にクラスタ構築
+- ✅ **Docker対応**: Docker Composeで簡単にクラスタ構築（シャーディング構成対応）
 
 ## アーキテクチャ
 
+### 全体構成 (Sharding & Raft)
+
 ```
-┌─────────────────────────────────────────────────┐
-│              Raft Consensus Group               │
-│                                                 │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐   │
-│  │ Master 1 │◄──►│ Master 2 │◄──►│ Master 3 │   │
-│  │ (Leader) │    │(Follower)│    │(Follower)│   │
-│  └────┬─────┘    └──────────┘    └──────────┘   │
-│       │                                         │
-└───────┼─────────────────────────────────────────┘
-        │ Metadata Management
-        │
-   ┌────┴────┬────────┬────────┐
-   │         │        │        │
-┌──▼───┐ ┌──▼───┐ ┌──▼───┐ ┌──▼───┐
-│ CS 1 │ │ CS 2 │ │ CS 3 │ │ CS 4 │  ← Data Storage
-│(Data)│ │(Data)│ │(Data)│ │(Data)│
-└──────┘ └──────┘ └──────┘ └──────┘
+┌─────────────────────────────────────────────────────────────┐
+│             Config Server (Meta-Shard)                      │
+│      [ Config1 ] ◄──► [ Config2 ] ◄──► [Config3 ]           │
+│      (ShardMapの管理・設定情報の保持)                       │
+└─────────────────────────────────────────────────────────────┘
+          │ (ShardMap Fetch)                   │
+          ▼                                    ▼
+┌───────────────────────┐            ┌───────────────────────┐
+│     Shard-1 (A-M)     │            │     Shard-2 (N-Z)     │
+│ ┌───────────────────┐ │            │ ┌───────────────────┐ │
+│ │ Master1 (Leader)  │ │            │ │ Master1 (Leader)  │ │
+│ │ Master2 (Follower)│ │            │ │ Master2 (Follower)│ │
+│ │ Master3 (Follower)│ │            │ │ Master3 (Follower)│ │
+│ └───────────────────┘ │            │ └───────────────────┘ │
+└───────────────────────┘            └───────────────────────┘
+          │                                    │
+          └──────────────────┬─────────────────┘
+                             ▼
+              ┌─────────────────────────────┐
+              │        ChunkServers         │
+              │ [CS1] [CS2] [CS3] [CS4] ... │
+              └─────────────────────────────┘
 ```
 
 ## クイックスタート
 
-### ローカル開発
+### Docker Compose (推奨: シャーディング構成)
+
+シャーディング対応のクラスタを起動します。
+
+```bash
+# シャーディング環境（2シャード構成 + 複数のChunkServer）の起動
+docker compose -f docker-compose-sharded.yml up -d --build
+
+# ファイルアップロードの例 (Shard 1への書き込み)
+docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 put /file.txt /uploaded.txt
+
+# ファイル操作 (Renameなど)
+docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 rename /uploaded.txt /renamed.txt
+```
+
+### ローカル開発 (シングルマスター構成)
+
+従来のシングルマスター/HA構成も利用可能です。
 
 ```bash
 # ビルド
 cargo build --release
 
-# Masterサーバー起動 (3ノード構成)
-# Terminal 1
-cargo run --bin master -- --id 1 --http-port 8081 --addr 127.0.0.1:50051 --peers http://127.0.0.1:8082,http://127.0.0.1:8083 --storage-dir /tmp/raft1
-
-# Terminal 2
-cargo run --bin master -- --id 2 --http-port 8082 --addr 127.0.0.1:50052 --peers http://127.0.0.1:8081,http://127.0.0.1:8083 --storage-dir /tmp/raft2
-
-# Terminal 3
-cargo run --bin master -- --id 3 --http-port 8083 --addr 127.0.0.1:50053 --peers http://127.0.0.1:8081,http://127.0.0.1:8082 --storage-dir /tmp/raft3
-
-# ChunkServer起動（別ターミナルで）
-cargo run --bin chunkserver -- --addr 127.0.0.1:50061 --master-addr 127.0.0.1:50051,127.0.0.1:50052,127.0.0.1:50053 --storage-dir /tmp/cs1
-cargo run --bin chunkserver -- --addr 127.0.0.1:50062 --master-addr 127.0.0.1:50051,127.0.0.1:50052,127.0.0.1:50053 --storage-dir /tmp/cs2
-cargo run --bin chunkserver -- --addr 127.0.0.1:50063 --master-addr 127.0.0.1:50051,127.0.0.1:50052,127.0.0.1:50053 --storage-dir /tmp/cs3
-
-# ファイル操作
-cargo run --bin dfs_cli -- --master http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053 put test.txt /test.txt
-cargo run --bin dfs_cli -- --master http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053 ls
+# クラスタ起動スクリプト (Master × 3 + ChunkServer × 5)
+./start_cluster.sh
 ```
 
-### Docker Compose
+## テスト
+
+様々なシナリオに対応したテストスクリプトが用意されています。
+
+### 1. ユニットテスト
 
 ```bash
-# クラスタ起動（Master × 3 + ChunkServer × 5）
-./start_cluster.sh
-
-# または手動で
-docker-compose up -d
-
-# ファイルアップロード
-docker run --rm --network rust-hadoop_dfs-network \
-  -v $(pwd)/file.txt:/tmp/file.txt \
-  rust-hadoop-master1 \
-  /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 \
-  put /tmp/file.txt /file.txt
-
-# ファイル一覧
-docker run --rm --network rust-hadoop_dfs-network \
-  rust-hadoop-master1 \
-  /app/dfs_cli --master http://dfs-master1:50051,http://dfs-master2:50051,http://dfs-master3:50051 \
-  ls
+cargo test
 ```
 
-## カオスモンキーテスト
+### 2. インテグレーション & カオステスト
 
-レプリケーション機能とMasterの耐障害性をテストします:
-
-```bash
-# クラスタ起動
-./start_cluster.sh
-
-# 完全なカオステスト
-./chaos_test.sh
-```
-
-詳細は [CHAOS_TEST.md](CHAOS_TEST.md) を参照してください。
+| テストスクリプト            | 説明                                                       |
+| --------------------------- | ---------------------------------------------------------- |
+| `rename_test.sh`            | 基本的なファイルリネーム機能（同一シャード内）のテスト     |
+| `same_shard_rename_test.sh` | シャード環境下での同一シャード内リネームのテスト           |
+| `cross_shard_test.sh`       | クロスシャードリネーム（Transaction Record）の正常系テスト |
+| `transaction_abort_test.sh` | クロスシャード操作失敗時のロールバック（Abort）テスト      |
+| `fault_recovery_test.sh`    | トランザクション中のシャード障害からの復旧テスト           |
+| `chaos_test.sh`             | ChunkServerの障害などをシミュレートしたカオステスト        |
 
 ## プロジェクト構成
 
@@ -109,64 +102,40 @@ rust-hadoop/
 │   └── dfs.proto              # gRPC定義
 ├── src/
 │   ├── bin/
-│   │   ├── master.rs          # Masterサーバー (Raft統合)
+│   │   ├── master.rs          # Masterサーバー (Raft + Sharding統合)
+│   │   ├── config_server.rs   # Configサーバー (Meta-Shard)
 │   │   ├── chunkserver.rs     # ChunkServerサーバー
 │   │   └── dfs_cli.rs         # CLIクライアント
-│   ├── master.rs              # Master実装
-│   ├── chunkserver.rs         # ChunkServer実装
+│   ├── master.rs              # Master実装 (Transactionロジック含む)
+│   ├── sharding.rs            # Shardingロジック (Consistent Hashing)
 │   ├── simple_raft.rs         # Raftコンセンサス実装
-│   └── lib.rs
-├── Dockerfile                 # Dockerイメージ定義
-├── docker-compose.yml         # クラスタ構成
-├── start_cluster.sh           # クラスタ起動スクリプト
-└── chaos_test.sh              # カオステスト
-```
-
-## レプリケーション機能
-
-### 仕組み
-
-1. **ブロック割り当て**: Masterが3つのChunkServerを選択
-2. **パイプライン転送**: クライアント → CS1 → CS2 → CS3
-3. **冗長性**: 2つまでのサーバー障害に耐える
-
-詳細は [REPLICATION.md](REPLICATION.md) を参照してください。
-
-### レプリケーションフロー
-
-```
-Client
-  │
-  │ WriteBlock(data, next=[CS2, CS3])
-  ▼
-ChunkServer1
-  │ 1. Save locally
-  │ 2. ReplicateBlock(data, next=[CS3])
-  ▼
-ChunkServer2
-  │ 3. Save locally
-  │ 4. ReplicateBlock(data, next=[])
-  ▼
-ChunkServer3
-  │ 5. Save locally
-  ▼
-Done (3 replicas)
+│   └── chunkserver.rs         # ChunkServer実装
+├── docker-compose-sharded.yml # シャーディング構成用Docker Compose
+├── docker-compose.yml         # 従来構成用Docker Compose
+└── *.sh                       # 各種テスト・起動スクリプト
 ```
 
 ## API
 
-### Master Service
+### Master Core RPC
 
 - `CreateFile`: ファイル作成
 - `GetFileInfo`: ファイル情報取得
 - `AllocateBlock`: ブロック割り当て
 - `CompleteFile`: ファイル書き込み完了
 - `ListFiles`: ファイル一覧
-- `RegisterChunkServer`: ChunkServer登録
+- `Rename`: ファイル移動・名前変更（クロスシャード対応）
 
-### ChunkServer Service
+### Master Internal RPC (Transaction & Raft)
 
-- `WriteBlock`: ブロック書き込み（レプリケーション付き）
+- `PrepareTransaction`: トランザクション準備（2PC）
+- `CommitTransaction`: トランザクションコミット
+- `AbortTransaction`: トランザクションロールバック
+- `Heartbeat`: ChunkServer生存確認
+
+### ChunkServer RPC
+
+- `WriteBlock`: ブロック書き込み（パイプラインレプリケーション）
 - `ReadBlock`: ブロック読み込み
 - `ReplicateBlock`: レプリケーション受信
 
@@ -174,60 +143,10 @@ Done (3 replicas)
 
 - **言語**: Rust
 - **通信**: gRPC (tonic)
-- **シリアライゼーション**: Protocol Buffers
 - **非同期**: Tokio
-- **CLI**: Clap
+- **合意形成**: 自作Raft実装 + Transaction Record (2PC)
+- **シャーディング**: Consistent Hashing (Virtual Nodes)
 - **コンテナ**: Docker
-
-## 開発
-
-### ビルド
-
-```bash
-cargo build
-```
-
-### テスト
-
-```bash
-cargo test
-```
-
-### Protoファイル更新時
-
-```bash
-# build.rsが自動的に再生成
-cargo build
-```
-
-## トラブルシューティング
-
-### ChunkServerが登録されない
-
-```bash
-# Masterのログ確認
-docker-compose logs master
-
-# ChunkServerのログ確認
-docker-compose logs chunkserver1
-```
-
-### ファイルアップロード失敗
-
-- ChunkServerが3つ以上起動しているか確認
-- ネットワーク接続を確認
-- ストレージ容量を確認
-
-### Docker関連
-
-```bash
-# コンテナ再作成
-docker-compose down
-docker-compose up -d --force-recreate
-
-# ボリューム削除（全データ削除）
-docker-compose down -v
-```
 
 ## ライセンス
 
@@ -235,6 +154,8 @@ MIT
 
 ## 参考資料
 
+- [MASTER_HA.md](MASTER_HA.md) - Master HAとシャーディングの詳細
 - [REPLICATION.md](REPLICATION.md) - レプリケーション機能の詳細
 - [CHAOS_TEST.md](CHAOS_TEST.md) - カオステストガイド
-- [Hadoop HDFS Architecture](https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html)
+- [Google File System](https://research.google.com/archive/gfs.html)
+- [Spanner: Google's Globally-Distributed Database](https://research.google.com/archive/spanner.html)

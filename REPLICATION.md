@@ -1,6 +1,6 @@
 # レプリケーション機能
 
-このドキュメントでは、Rust Hadoop DFSに追加されたレプリケーション機能について説明します。
+このドキュメントでは、Rust Hadoop DFSのレプリケーション機能について説明します。
 
 ## 概要
 
@@ -11,108 +11,80 @@
 ### 1. レプリケーション係数
 - デフォルトのレプリケーション係数: **3**
 - Masterサーバーが各ブロックに対して最大3つのChunkServerを選択します
+- ChunkServerは全シャードで共有されているため、シャードの設定に関わらずグローバルなプールから選択されます
 - 利用可能なChunkServerが3つ未満の場合は、利用可能な数だけ選択されます
 
 ### 2. レプリケーションパイプライン
 - クライアントは最初のChunkServerにのみデータを送信します
 - 最初のChunkServerがデータをローカルに保存した後、次のChunkServerに転送します
-- このプロセスがパイプライン方式で続き、すべてのレプリカが作成されます
+- このプロセスがパイプライン方式（Chain Replication）で続き、すべてのレプリカが作成されます
 
-### 3. 実装の詳細
+### 3. 自動再レプリケーションとバランサー
+- **Balancer**: ディスク容量の使用率に基づいて、使用量の多いChunkServerから少ないChunkServerへバックグラウンドでブロックを移動します（実装済み）。
+- ChunkServerの障害検知: ハートビートの途絶を検知し、デッドサーバーとしてマークします。
 
-#### protoファイルの変更
-- `WriteBlockRequest`に`next_servers`フィールドを追加
-- `ReplicateBlock` RPCを`ChunkServerService`に追加
-- `ReplicateBlockRequest`と`ReplicateBlockResponse`メッセージを追加
+## 実装の詳細
 
-#### Masterサーバーの変更
-- `allocate_block`メソッドで複数のChunkServerを選択
-- レプリケーション係数に基づいてサーバーを選択
+### Master側
+- `allocate_block`: 容量の多いChunkServerを優先的に選択してリストを返します。
+- `register_chunk_server`: 共通のストレージプールとしてChunkServerを管理します。
 
-#### ChunkServerの変更
-- `write_block`メソッドでレプリケーションパイプラインをサポート
-- `replicate_block`メソッドを実装して、他のChunkServerからのレプリケーションリクエストを処理
+### ChunkServer側
+- `write_block`: クライアントからのデータを受け取り、自身のディスクに書き込んだ後、次のChunkServerへ転送します。
+- `replicate_block`: 前のChunkServerからの転送データを受け取ります。
 
-#### CLIの変更
-- `put`コマンドで`next_servers`を最初のChunkServerに渡す
-- レプリケーション状況をユーザーに表示
-
-## テスト方法
-
-### 1. Masterサーバーを起動
-```bash
-cargo run --bin master
-```
-
-### 2. 複数のChunkServerを起動（異なるターミナルで）
-```bash
-# ChunkServer 1
-cargo run --bin chunkserver -- --addr 127.0.0.1:50052 --storage-dir /tmp/cs1
-
-# ChunkServer 2
-cargo run --bin chunkserver -- --addr 127.0.0.1:50053 --storage-dir /tmp/cs2 --master-addr 127.0.0.1:50051
-
-# ChunkServer 3
-cargo run --bin chunkserver -- --addr 127.0.0.1:50054 --storage-dir /tmp/cs3 --master-addr 127.0.0.1:50051
-```
-
-### 3. ファイルをアップロード
-```bash
-cargo run --bin dfs_cli -- put test.txt /test.txt
-```
-
-出力例:
-```
-Replicating to 3 servers: ["127.0.0.1:50052", "127.0.0.1:50053", "127.0.0.1:50054"]
-File uploaded successfully with replication
-```
-
-### 4. レプリケーションを確認
-各ChunkServerのストレージディレクトリを確認して、ブロックが複製されていることを確認します:
-
-```bash
-ls -la /tmp/cs1/
-ls -la /tmp/cs2/
-ls -la /tmp/cs3/
-```
-
-すべてのディレクトリに同じblock_idのファイルが存在するはずです。
-
-### 5. ファイルをダウンロード
-```bash
-cargo run --bin dfs_cli -- get /test.txt downloaded.txt
-```
-
-いずれかのChunkServerがダウンしていても、他のレプリカからデータを取得できます。
-
-## アーキテクチャ
+### レプリケーションフロー
 
 ```
 Client
-  |
-  | 1. WriteBlock(data, next_servers=[CS2, CS3])
-  v
+  │
+  │ WriteBlock(data, next=[CS2, CS3])
+  ▼
 ChunkServer1
-  |
-  | 2. Save locally
-  | 3. ReplicateBlock(data, next_servers=[CS3])
-  v
+  │ 1. Save locally
+  │ 2. ReplicateBlock(data, next=[CS3])
+  ▼
 ChunkServer2
-  |
-  | 4. Save locally
-  | 5. ReplicateBlock(data, next_servers=[])
-  v
+  │ 3. Save locally
+  │ 4. ReplicateBlock(data, next=[])
+  ▼
 ChunkServer3
-  |
-  | 6. Save locally
-  v
-Done
+  │ 5. Save locally
+  ▼
+Done (3 replicas)
 ```
+
+## テスト方法
+
+### シャーディング環境でのテスト
+
+`docker-compose-sharded.yml` を使用すると、複数のShard（Master）と共有されたChunkServerプールが起動します。
+
+```bash
+# クラスタ起動
+docker compose -f docker-compose-sharded.yml up -d --build
+
+# ファイルアップロード（レプリケーション確認）
+docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 put /test.txt /test.txt
+# Output: Replicating to 3 servers: ...
+```
+
+### データの確認
+
+ChunkServerのデータディレクトリを確認することで、実際に複製されているかチェックできます。
+
+```bash
+docker compose -f docker-compose-sharded.yml exec chunkserver1 ls -l /data/
+docker compose -f docker-compose-sharded.yml exec chunkserver2 ls -l /data/
+```
+
+## 既存の改善状況
+
+- ✅ **負荷分散 (Balancer)**: 実装済み。容量に基づいてブロック移動を行います。
+- ✅ **シャーディング対応**: 複数のMasterが共通のChunkServerプールを利用できるようになりました。
 
 ## 今後の改善点
 
 1. **動的レプリケーション係数**: ファイルごとにレプリケーション係数を設定可能にする
 2. **ラック認識**: 異なるラックにレプリカを配置してフォールトトレランスを向上
-3. **レプリケーション検証**: Masterがレプリケーションの完了を検証
-4. **自動再レプリケーション**: ChunkServerがダウンした場合に自動的に再レプリケーション
-5. **負荷分散**: ChunkServerの負荷を考慮してレプリカの配置を最適化
+3. **自動修復 (Self-Healing)**: レプリカ数が不足した場合に、即座に新しいChunkServerへコピーを作成する（現在はScaler/Balancerによる移動がメイン）
