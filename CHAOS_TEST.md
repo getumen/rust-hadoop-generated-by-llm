@@ -1,278 +1,144 @@
 # カオスモンキーテスト ガイド
 
-このドキュメントでは、Rust Hadoop DFSのレプリケーション機能をカオスモンキーテストで検証する方法を説明します。
+このドキュメントでは、Rust Hadoop DFSのシャーディング環境下での耐障害性を検証するカオスモンキーテストの手法について説明します。
 
 ## 概要
 
-カオスモンキーテストは、システムの耐障害性を検証するために、ランダムにサーバーを停止・再起動するテスト手法です。このテストにより、以下を確認できます:
+現在、システムは**Raftコンセンサス**と**シャーディング**（Transaction Recordによるクロスシャード操作を含む）を実装しています。カオステストでは、これらの機能が障害発生時にも正しく動作することを確認します。
 
-- ✅ レプリケーションが正しく機能しているか
-- ✅ サーバー障害時にデータが失われないか
-- ✅ システムが障害から自動的に回復できるか
-- ✅ 部分的な障害時でも読み書きが可能か
+主な検証項目:
+- ✅ **Master HA**: Masterノード（Leader/Follower）の障害
+- ✅ **Cross-Shard Atomic**: クロスシャードトランザクション中の障害とロールバック/コミット
+- ✅ **Replication**: ChunkServer障害時のデータ可用性
 
 ## 環境構成
 
-Docker Composeで以下のサービスを起動します:
+**シャーディング構成 (`docker-compose-sharded.yml`)** を使用します。
 
-- **Master Server** × 1: メタデータ管理
-- **Chunk Servers** × 5: データストレージ（レプリケーション係数3に対して十分な冗長性）
+- **Config Server** (Meta-Shard) × 1 (Raft Group)
+- **Shard 1** (Master) × 3 (Raft Group)
+- **Shard 2** (Master) × 3 (Raft Group)
+- **Chunk Servers** × 5 (Shared)
 
 ```
-┌─────────────┐
-│   Master    │
-│  :50051     │
-└──────┬──────┘
-       │
-   ┌───┴───┬───────┬───────┬───────┐
-   │       │       │       │       │
-┌──▼──┐ ┌──▼──┐ ┌──▼──┐ ┌──▼──┐ ┌──▼──┐
-│ CS1 │ │ CS2 │ │ CS3 │ │ CS4 │ │ CS5 │
-│:5005│ │:5005│ │:5005│ │:5005│ │:5005│
-│  2  │ │  3  │ │  4  │ │  5  │ │  6  │
-└─────┘ └─────┘ └─────┘ └─────┘ └─────┘
+┌────────────────────────────────────────┐
+│             Config Server              │
+└───────────────────┬────────────────────┘
+          ┌─────────┴─────────┐
+    ┌─────▼─────┐       ┌─────▼─────┐
+    │  Shard 1  │       │  Shard 2  │    Metadata
+    │ (3 Nodes) │       │ (3 Nodes) │
+    └─────┬─────┘       └─────┬─────┘
+          │                   │
+    ┌─────┴─┬───────┬───────┬─┴─────┐    Data
+    │       │       │       │       │
+ ┌──▼──┐ ┌──▼──┐ ┌──▼──┐ ┌──▼──┐ ┌──▼──┐
+ │ CS1 │ │ CS2 │ │ CS3 │ │ CS4 │ │ CS5 │
+ └─────┘ └─────┘ └─────┘ └─────┘ └─────┘
 ```
 
-## クイックスタート
+## 自動テストスクリプト
 
-### 1. クラスタの起動
+以下のスクリプトを実行することで、主要な障害シナリオを自動テストできます。
+
+### 1. 障害復旧テスト (Transaction Recovery)
+
+トランザクション処理中（Prepare/Commitフェーズ）にShardがクラッシュした際の復旧能力を検証します。
 
 ```bash
-./start_cluster.sh
+./fault_recovery_test.sh
 ```
 
-このスクリプトは以下を実行します:
-- Dockerイメージのビルド
-- 全サービスの起動
-- サービスの準備完了を待機
+**シナリオ:**
+1. クロスシャードRenameの準備（Transaction Record作成）
+2. **Crash**: Transactionに関与するShard（SourceまたはDest）を強制停止
+3. **Restart**: Shardを再起動
+4. **Verification**: 
+   - Crashのタイミングに応じて、Transactionが正しくAbort（ロールバック）またはCommit（完了）されるか確認
+   - データの整合性が保たれているか確認
 
-### 2. カオスモンキーテストの実行
+### 2. トランザクションアボートテスト
+
+クロスシャード操作中に相手先のShardが応答しない場合のタイムアウトとロールバックを検証します。
 
 ```bash
+./transaction_abort_test.sh
+```
+
+**シナリオ:**
+1. Destination Shardを停止
+2. Source ShardからRename要求を送信
+3. **Expectation**: タイムアウトにより操作が失敗し、Source側のファイルは消えずに残る（Atomic性が保たれる）
+
+### 3. レプリケーションカオステスト
+
+ChunkServerをランダムに停止・再起動しながら、読み書きの継続性を検証します。
+
+```bash
+# 従来のレプリケーションテスト（シャーディング環境向けに要調整）
 ./chaos_test.sh
 ```
 
-## テストシナリオ
+## 手動テスト手順
 
-### Phase 1: 初期セットアップ
-1. 10MBのランダムデータファイルを生成
-2. DFSにアップロード（3つのChunkServerにレプリケート）
-3. MD5チェックサムを保存
+### 1. 環境セットアップ
 
-### Phase 2: カオステスト
-
-#### Test 1: 単一サーバー障害
 ```bash
-# 1つのChunkServerをランダムに停止
-# データのダウンロードと整合性確認
-# サーバーを再起動
+# シャーディングクラスタの起動
+docker compose -f docker-compose-sharded.yml up -d --build
 ```
 
-**期待結果**: 残り2つのレプリカからデータを取得可能
+### 2. Shardリーダーの障害テスト
 
-#### Test 2: 2サーバー同時障害
+Raftのリーダー選出機能を確認します。
+
 ```bash
-# 2つのChunkServerを同時に停止
-# データのダウンロードと整合性確認
-# サーバーを再起動
+# Shard 1の状況確認（Leaderを探す）
+docker compose -f docker-compose-sharded.yml logs -f master-0-0
+docker compose -f docker-compose-sharded.yml logs -f master-0-1
+docker compose -f docker-compose-sharded.yml logs -f master-0-2
+
+# Leader（例えば master-0-0）を停止
+docker compose -f docker-compose-sharded.yml stop master-0-0
+
+# 新しいLeaderが選出されたかログで確認
+# クライアント操作が継続できるか確認
+docker exec master-0-1 /app/dfs_cli --master http://localhost:50051 ls /
 ```
 
-**期待結果**: 残り1つのレプリカからデータを取得可能
+### 3. ChunkServer障害テスト
 
-#### Test 3: ローリング障害
 ```bash
-# 5回繰り返し:
-#   - ランダムにサーバーを停止
-#   - データをダウンロード
-#   - 整合性確認
-#   - サーバーを再起動
-```
+# ファイルアップロード
+docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 put /file.txt /test.txt
 
-**期待結果**: 各ラウンドでデータの整合性が保たれる
-
-#### Test 4: 障害中のアップロード
-```bash
 # 1つのChunkServerを停止
-# 新しいファイルをアップロード
-# サーバーを再起動
-```
+docker compose -f docker-compose-sharded.yml stop chunkserver1
 
-**期待結果**: 利用可能なサーバーが十分あればアップロード成功
-
-### Phase 3: 最終検証
-1. 元のファイルを再度ダウンロード
-2. MD5チェックサムで整合性を確認
-3. 全ファイルのリスト表示
-
-## 手動テスト
-
-### ファイルのアップロード
-
-```bash
-# テストファイルを作成
-echo "Hello, DFS!" > test.txt
-
-# アップロード
-docker run --rm --network rust-hadoop_dfs-network \
-  -v $(pwd)/test.txt:/tmp/test.txt \
-  rust-hadoop-master \
-  /app/dfs_cli --master http://dfs-master:50051 put /tmp/test.txt /test.txt
-```
-
-### ファイルのリスト表示
-
-```bash
-docker run --rm --network rust-hadoop_dfs-network \
-  rust-hadoop-master \
-  /app/dfs_cli --master http://dfs-master:50051 ls
-```
-
-### ファイルのダウンロード
-
-```bash
-docker run --rm --network rust-hadoop_dfs-network \
-  -v $(pwd):/output \
-  rust-hadoop-master \
-  /app/dfs_cli --master http://dfs-master:50051 get /test.txt /output/downloaded.txt
-```
-
-### ChunkServerの手動停止・再起動
-
-```bash
-# 停止
-docker-compose stop dfs-chunkserver1
-
-# 再起動
-docker-compose start dfs-chunkserver1
-
-# ステータス確認
-docker-compose ps
-```
-
-## ログの確認
-
-### 全サービスのログ
-
-```bash
-docker-compose logs -f
-```
-
-### 特定のサービスのログ
-
-```bash
-# Masterのログ
-docker-compose logs -f master
-
-# ChunkServer1のログ
-docker-compose logs -f chunkserver1
+# ファイルが読み込めるか確認（残りのレプリカから読めるはず）
+docker exec master-0-0 /app/dfs_cli --master http://localhost:50051 get /test.txt /downloaded.txt
 ```
 
 ## トラブルシューティング
 
-### サービスが起動しない
+### クラスタの状態リセット
+
+テスト後に完全にクリーンな状態に戻すには：
 
 ```bash
-# ログを確認
-docker-compose logs
-
-# コンテナを再作成
-docker-compose down
-docker-compose up -d --force-recreate
+docker compose -f docker-compose-sharded.yml down -v
 ```
 
-### ビルドエラー
+### ログ確認
+
+特定のシャードやサーバーのログを確認：
 
 ```bash
-# キャッシュをクリアして再ビルド
-docker-compose build --no-cache
+docker compose -f docker-compose-sharded.yml logs -f master-0-0
 ```
 
-### ネットワークエラー
+## 今後のテスト計画
 
-```bash
-# ネットワークを再作成
-docker-compose down
-docker network prune
-docker-compose up -d
-```
-
-### ストレージのクリーンアップ
-
-```bash
-# 全データを削除
-docker-compose down -v
-
-# 再起動
-docker-compose up -d
-```
-
-## パフォーマンステスト
-
-### 大きなファイルのテスト
-
-```bash
-# 100MBのファイルを作成
-dd if=/dev/urandom of=large_file.bin bs=1M count=100
-
-# アップロード時間を測定
-time docker run --rm --network rust-hadoop_dfs-network \
-  -v $(pwd)/large_file.bin:/tmp/large_file.bin \
-  rust-hadoop-master \
-  /app/dfs_cli --master http://dfs-master:50051 put /tmp/large_file.bin /large.bin
-
-# ダウンロード時間を測定
-time docker run --rm --network rust-hadoop_dfs-network \
-  -v $(pwd):/output \
-  rust-hadoop-master \
-  /app/dfs_cli --master http://dfs-master:50051 get /large.bin /output/large_downloaded.bin
-```
-
-### 並列アップロード
-
-```bash
-# 複数のファイルを並列でアップロード
-for i in {1..10}; do
-  echo "File $i" > file_$i.txt
-  docker run --rm --network rust-hadoop_dfs-network \
-    -v $(pwd)/file_$i.txt:/tmp/file_$i.txt \
-    rust-hadoop-master \
-    /app/dfs_cli --master http://dfs-master:50051 put /tmp/file_$i.txt /file_$i.txt &
-done
-wait
-```
-
-## 期待される結果
-
-### 成功ケース
-- ✅ レプリケーション係数3で全ファイルが複製される
-- ✅ 2つまでのサーバー障害でもデータアクセス可能
-- ✅ ファイルの整合性が常に保たれる
-- ✅ サーバー再起動後、自動的にMasterに再登録される
-
-### 失敗ケース（想定内）
-- ⚠️ 3つ以上のサーバーが同時に停止するとデータアクセス不可
-- ⚠️ 利用可能なサーバーが3つ未満の場合、レプリケーション係数を満たせない
-
-## クリーンアップ
-
-```bash
-# クラスタの停止
-docker-compose down
-
-# データボリュームも削除
-docker-compose down -v
-
-# Dockerイメージも削除
-docker rmi rust-hadoop-master
-```
-
-## まとめ
-
-このカオスモンキーテストにより、Rust Hadoop DFSのレプリケーション機能が以下を満たすことを確認できます:
-
-1. **耐障害性**: 複数のサーバー障害に耐えられる
-2. **データ整合性**: 障害時でもデータが破損しない
-3. **自動回復**: サーバー再起動時に自動的に復旧
-4. **可用性**: 部分的な障害時でも読み書き可能
-
-これらの特性により、本番環境でも信頼性の高い分散ファイルシステムとして機能することが期待できます。
+- [ ] **Split Brain**: ネットワーク分断時の挙動検証
+- [ ] **Config Server Crash**: Meta-Shardの障害とRecovery検証
+- [ ] **Rolling Upgrade**: 稼働中のローリングアップデート検証
