@@ -103,7 +103,7 @@
 ---
 
 ### 5. Raft Configuration Management
-**Status**: Not Started
+**Status**: **Partially Completed**
 **Priority**: Medium
 **Effort**: Medium
 
@@ -118,12 +118,12 @@
 - Implement configuration log entries
 
 **Tasks**:
-- [ ] Design configuration change protocol
-- [ ] Implement AddServer/RemoveServer RPC
-- [ ] Add configuration log entries to Raft log
-- [ ] Implement joint consensus phase
-- [ ] Add CLI commands for cluster management
-- [ ] Add safety checks (prevent removing majority)
+- [x] Design configuration change protocol
+- [x] Implement AddServer/RemoveServer RPC
+- [x] Add configuration log entries to Raft log
+- [ ] Implement joint consensus phase (using single-server changes for safety)
+- [x] Add CLI commands for cluster management
+- [x] Add safety checks (prevent removing majority)
 
 ---
 

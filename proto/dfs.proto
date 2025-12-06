@@ -30,6 +30,11 @@ service MasterService {
   // Safe Mode operations
   rpc GetSafeModeStatus (GetSafeModeStatusRequest) returns (GetSafeModeStatusResponse);
   rpc SetSafeMode (SetSafeModeRequest) returns (SetSafeModeResponse);
+
+  // Raft cluster membership management
+  rpc AddRaftServer (AddRaftServerRequest) returns (AddRaftServerResponse);
+  rpc RemoveRaftServer (RemoveRaftServerRequest) returns (RemoveRaftServerResponse);
+  rpc GetClusterInfo (GetClusterInfoRequest) returns (GetClusterInfoResponse);
 }
 
 message HeartbeatRequest {
@@ -284,4 +289,48 @@ message SetSafeModeResponse {
   bool success = 1;
   string error_message = 2;
   bool is_safe_mode = 3;            // Current safe mode status after operation
+}
+
+// ============================================================================
+// Raft Cluster Membership Management Messages
+// ============================================================================
+
+message AddRaftServerRequest {
+  uint32 server_id = 1;             // Server ID to add
+  string server_address = 2;        // Server's HTTP address for Raft RPC
+}
+
+message AddRaftServerResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;           // Hint if not the leader
+}
+
+message RemoveRaftServerRequest {
+  uint32 server_id = 1;             // Server ID to remove
+}
+
+message RemoveRaftServerResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;           // Hint if not the leader
+}
+
+message GetClusterInfoRequest {}
+
+message GetClusterInfoResponse {
+  uint32 node_id = 1;               // This node's ID
+  string role = 2;                  // Current role (Leader, Follower, Candidate)
+  uint64 current_term = 3;          // Current Raft term
+  uint32 leader_id = 4;             // Current leader's ID (0 if unknown)
+  string leader_address = 5;        // Current leader's address
+  repeated ClusterMember members = 6;  // All cluster members
+  uint64 commit_index = 7;          // Current commit index
+  uint64 last_applied = 8;          // Last applied index
+}
+
+message ClusterMember {
+  uint32 server_id = 1;             // Server ID (index in peers list)
+  string address = 2;               // Server's HTTP address
+  bool is_self = 3;                 // True if this is the current node
 }
