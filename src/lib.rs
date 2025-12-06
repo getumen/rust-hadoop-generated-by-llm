@@ -3,7 +3,11 @@ pub mod dfs {
 }
 
 pub mod chunkserver;
+pub mod client;
 pub mod config_server;
 pub mod master;
 pub mod sharding;
 pub mod simple_raft;
+
+#[cfg(test)]
+pub mod tests;
