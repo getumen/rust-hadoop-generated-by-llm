@@ -46,6 +46,11 @@ enum Commands {
         #[command(subcommand)]
         action: SafeModeAction,
     },
+    /// Raft cluster management
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,6 +61,24 @@ enum SafeModeAction {
     Enter,
     /// Leave Safe Mode (allow writes)
     Leave,
+}
+
+#[derive(Subcommand)]
+enum ClusterAction {
+    /// Get cluster information
+    Info,
+    /// Add a server to the Raft cluster
+    AddServer {
+        /// Server ID
+        server_id: u32,
+        /// Server HTTP address for Raft RPC
+        server_address: String,
+    },
+    /// Remove a server from the Raft cluster
+    RemoveServer {
+        /// Server ID to remove
+        server_id: u32,
+    },
 }
 
 #[tokio::main]
@@ -141,6 +164,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Left Safe Mode");
                     } else {
                         println!("Failed to leave Safe Mode: {}", response.error_message);
+                    }
+                }
+            }
+        }
+        Commands::Cluster { action } => {
+            use rust_hadoop::dfs::master_service_client::MasterServiceClient;
+            use rust_hadoop::dfs::{
+                AddRaftServerRequest, GetClusterInfoRequest, RemoveRaftServerRequest,
+            };
+
+            let master_addr = if cli.master.starts_with("http://") {
+                cli.master.clone()
+            } else {
+                format!("http://{}", cli.master)
+            };
+
+            let mut grpc_client = MasterServiceClient::connect(master_addr).await?;
+
+            match action {
+                ClusterAction::Info => {
+                    let response = grpc_client
+                        .get_cluster_info(GetClusterInfoRequest {})
+                        .await?
+                        .into_inner();
+
+                    println!("Raft Cluster Info:");
+                    println!("  Node ID: {}", response.node_id);
+                    println!("  Role: {}", response.role);
+                    println!("  Term: {}", response.current_term);
+                    println!("  Leader ID: {}", response.leader_id);
+                    println!("  Leader Address: {}", response.leader_address);
+                    println!("  Commit Index: {}", response.commit_index);
+                    println!("  Last Applied: {}", response.last_applied);
+                    println!("  Members ({}):", response.members.len());
+                    for member in response.members {
+                        println!(
+                            "    - [{}] {} {}",
+                            member.server_id,
+                            member.address,
+                            if member.is_self { "(self)" } else { "" }
+                        );
+                    }
+                }
+                ClusterAction::AddServer {
+                    server_id,
+                    server_address,
+                } => {
+                    let response = grpc_client
+                        .add_raft_server(AddRaftServerRequest {
+                            server_id,
+                            server_address: server_address.clone(),
+                        })
+                        .await?
+                        .into_inner();
+
+                    if response.success {
+                        println!("Added server {} ({}) to cluster", server_id, server_address);
+                    } else {
+                        println!("Failed to add server: {}", response.error_message);
+                        if !response.leader_hint.is_empty() {
+                            println!("Leader hint: {}", response.leader_hint);
+                        }
+                    }
+                }
+                ClusterAction::RemoveServer { server_id } => {
+                    let response = grpc_client
+                        .remove_raft_server(RemoveRaftServerRequest { server_id })
+                        .await?
+                        .into_inner();
+
+                    if response.success {
+                        println!("Removed server {} from cluster", server_id);
+                    } else {
+                        println!("Failed to remove server: {}", response.error_message);
+                        if !response.leader_hint.is_empty() {
+                            println!("Leader hint: {}", response.leader_hint);
+                        }
                     }
                 }
             }

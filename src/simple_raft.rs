@@ -24,7 +24,25 @@ pub struct LogEntry {
 pub enum Command {
     Master(MasterCommand),
     Config(ConfigCommand),
+    Membership(MembershipCommand),
     NoOp,
+}
+
+/// Commands for Raft cluster membership changes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MembershipCommand {
+    /// Add a new server to the Raft cluster
+    AddServer {
+        /// Server ID (typically the node index)
+        server_id: usize,
+        /// Server address (HTTP endpoint for Raft RPC)
+        server_address: String,
+    },
+    /// Remove a server from the Raft cluster
+    RemoveServer {
+        /// Server ID to remove
+        server_id: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +181,22 @@ pub enum Event {
     GetLeaderInfo {
         reply_tx: tokio::sync::oneshot::Sender<Option<String>>,
     },
+    GetClusterInfo {
+        reply_tx: tokio::sync::oneshot::Sender<ClusterInfo>,
+    },
+}
+
+/// Information about the Raft cluster state
+#[derive(Debug, Clone)]
+pub struct ClusterInfo {
+    pub node_id: usize,
+    pub role: Role,
+    pub current_term: u64,
+    pub leader_id: Option<usize>,
+    pub leader_address: Option<String>,
+    pub peers: Vec<String>,
+    pub commit_index: usize,
+    pub last_applied: usize,
 }
 
 pub struct RaftNode {
@@ -818,6 +852,19 @@ impl RaftNode {
             Event::GetLeaderInfo { reply_tx } => {
                 let _ = reply_tx.send(self.current_leader_address.clone());
             }
+            Event::GetClusterInfo { reply_tx } => {
+                let info = ClusterInfo {
+                    node_id: self.id,
+                    role: self.role,
+                    current_term: self.current_term,
+                    leader_id: self.current_leader,
+                    leader_address: self.current_leader_address.clone(),
+                    peers: self.peers.clone(),
+                    commit_index: self.commit_index,
+                    last_applied: self.last_applied,
+                };
+                let _ = reply_tx.send(info);
+            }
         }
     }
 
@@ -1052,11 +1099,67 @@ impl RaftNode {
             self.last_applied += 1;
             let log_index = self.last_applied - self.last_included_index;
             if log_index < self.log.len() {
-                let command = &self.log[log_index].command;
-                self.apply_command(command);
+                let command = self.log[log_index].command.clone();
+
+                // Handle membership commands specially - they modify RaftNode itself
+                if let Command::Membership(ref cmd) = command {
+                    self.apply_membership_command(cmd.clone());
+                } else {
+                    self.apply_command(&command);
+                }
             } else {
                 eprintln!("Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}",
                     log_index, self.log.len(), self.last_applied, self.last_included_index);
+            }
+        }
+    }
+
+    fn apply_membership_command(&mut self, cmd: MembershipCommand) {
+        match cmd {
+            MembershipCommand::AddServer {
+                server_id,
+                server_address,
+            } => {
+                // Check if server already exists
+                if self.peers.iter().any(|p| p == &server_address) {
+                    println!("Server {} already in cluster, skipping", server_address);
+                    return;
+                }
+
+                println!(
+                    "Adding server {} ({}) to cluster",
+                    server_id, server_address
+                );
+                self.peers.push(server_address);
+
+                // Reinitialize next_index and match_index for the new peer
+                self.next_index
+                    .push(self.log.len() + self.last_included_index + 1);
+                self.match_index.push(0);
+
+                println!(
+                    "Cluster now has {} peers: {:?}",
+                    self.peers.len(),
+                    self.peers
+                );
+            }
+            MembershipCommand::RemoveServer { server_id } => {
+                // Find and remove the server
+                if server_id < self.peers.len() {
+                    let removed = self.peers.remove(server_id);
+                    self.next_index.remove(server_id);
+                    self.match_index.remove(server_id);
+                    println!(
+                        "Removed server {} from cluster. Remaining peers: {:?}",
+                        removed, self.peers
+                    );
+                } else {
+                    eprintln!(
+                        "Cannot remove server {}: index out of bounds (have {} peers)",
+                        server_id,
+                        self.peers.len()
+                    );
+                }
             }
         }
     }
@@ -1183,6 +1286,11 @@ impl RaftNode {
                 } else {
                     eprintln!("Error: Received ConfigCommand but state is not ConfigState");
                 }
+            }
+            Command::Membership(cmd) => {
+                // Membership commands are handled separately in apply_membership_command
+                // They modify the RaftNode's peer list, not the application state
+                println!("Membership command applied via log: {:?}", cmd);
             }
             Command::NoOp => {}
         }
