@@ -18,6 +18,7 @@ echo "=========================="
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
+docker-compose -f docker-compose.yml build --no-cache
 docker-compose -f docker-compose.yml up -d --build
 
 # Wait for cluster
@@ -29,16 +30,21 @@ echo "Content of file1" > file1.txt
 # Copy test file to container
 docker cp file1.txt dfs-master1-shard1:/file1.txt
 
+# Generate unique filename to avoid conflicts
+UNIQUE_ID=$(date +%s%N)
+SOURCE_FILE="/file1_${UNIQUE_ID}.txt"
+TARGET_FILE="/target_${UNIQUE_ID}.txt"
+
 # 1. Upload file
-echo "Uploading /file1.txt..."
+echo "Uploading $SOURCE_FILE..."
 # We upload to port 50051 (Shard 1).
-docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 put /file1.txt /file1.txt
+docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 put /file1.txt $SOURCE_FILE
 
 # 2. Determine where the file landed
 echo "Checking file location..."
-LOC_SHARD1=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 ls | grep "/file1.txt" || true)
+LOC_SHARD1=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 ls | grep "$SOURCE_FILE" || true)
 # For Shard 2, we exec into shard2 container
-LOC_SHARD2=$(docker exec dfs-master1-shard2 /app/dfs_cli --master http://localhost:50051 ls | grep "/file1.txt" || true)
+LOC_SHARD2=$(docker exec dfs-master1-shard2 /app/dfs_cli --master http://localhost:50051 ls | grep "$SOURCE_FILE" || true)
 
 CURRENT_SHARD=""
 if [ ! -z "$LOC_SHARD1" ]; then
@@ -63,6 +69,7 @@ for i in {1..100}; do
     # If Master 2 owns it, Master 1 returns "REDIRECT".
 
     OUTPUT=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 get $TEST_PATH /tmp/ignore 2>&1 || true)
+    if [ $i -le 10 ]; then echo "Checking $TEST_PATH: $OUTPUT"; fi
 
     PATH_SHARD=""
     if echo "$OUTPUT" | grep -q "REDIRECT"; then
@@ -81,12 +88,13 @@ for i in {1..100}; do
 done
 
 if [ -z "$TARGET_PATH" ]; then
+    echo "CURRENT_SHARD: $CURRENT_SHARD"
     fail "Could not find a path on the other shard"
 fi
 
 # Execute rename from inside container
-echo "Executing rename: /file1.txt -> $TARGET_PATH"
-docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 rename /file1.txt $TARGET_PATH
+echo "Executing rename: $SOURCE_FILE -> $TARGET_PATH"
+docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 rename $SOURCE_FILE $TARGET_PATH
 
 pass "Rename command executed"
 
@@ -106,7 +114,7 @@ else
 fi
 
 # Check if old file is gone
-if docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 get /file1.txt /tmp/gone.txt 2>&1 | grep -q "not found"; then
+if docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 get $SOURCE_FILE /tmp/gone.txt 2>&1 | grep -q "not found"; then
     pass "Old file is gone"
 else
     # It might fail with "Error" or similar
