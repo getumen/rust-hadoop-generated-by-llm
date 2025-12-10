@@ -456,11 +456,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "fs2",
- "futures",
  "prost",
- "rand 0.9.2",
- "reqwest",
- "rocksdb",
  "serde",
  "serde_json",
  "tempfile",
@@ -469,8 +465,6 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
- "tower-http",
- "uuid",
 ]
 
 [[package]]
@@ -480,13 +474,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
- "crc32fast",
- "fs2",
- "futures",
  "prost",
- "rand 0.9.2",
- "reqwest",
- "rocksdb",
  "serde",
  "serde_json",
  "tempfile",
@@ -495,8 +483,6 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
- "tower-http",
- "uuid",
 ]
 
 [[package]]
@@ -507,8 +493,6 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
- "crc32fast",
- "fs2",
  "futures",
  "openraft",
  "prost",
