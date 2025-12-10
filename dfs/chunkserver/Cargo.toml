@@ -3,6 +3,10 @@ name = "dfs-chunkserver"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dfs_chunkserver"
+path = "src/lib.rs"
+
 [[bin]]
 name = "chunkserver"
 path = "src/bin/chunkserver.rs"

@@ -1,3 +1,9 @@
+pub mod dfs {
+    include!(concat!(env!("OUT_DIR"), "/dfs.rs"));
+}
+
+pub mod sharding;
+
 use crate::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use crate::dfs::master_service_client::MasterServiceClient;
 use crate::dfs::{

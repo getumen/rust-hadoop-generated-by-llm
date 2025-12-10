@@ -6,10 +6,10 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use rust_hadoop::config_server::MyConfigServer;
-use rust_hadoop::dfs::config_service_server::ConfigServiceServer;
-use rust_hadoop::sharding::ShardMap;
-use rust_hadoop::simple_raft::{
+use dfs_metaserver::config_server::MyConfigServer;
+use dfs_metaserver::dfs::config_service_server::ConfigServiceServer;
+use dfs_metaserver::sharding::ShardMap;
+use dfs_metaserver::simple_raft::{
     AppState, AppendEntriesArgs, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs, RpcMessage,
 };
 use std::sync::{Arc, Mutex};

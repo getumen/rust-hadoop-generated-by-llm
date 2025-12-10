@@ -3,6 +3,10 @@ name = "dfs-metaserver"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dfs_metaserver"
+path = "src/lib.rs"
+
 [[bin]]
 name = "master"
 path = "src/bin/master.rs"
@@ -31,6 +35,9 @@ rand = "0.9"
 rocksdb = "0.24"
 crc32fast = "1.5"
 tonic-prost = "0.14"
+
+openraft = { git = "https://github.com/datafuselabs/openraft", branch = "main" }
+async-trait = "0.1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
