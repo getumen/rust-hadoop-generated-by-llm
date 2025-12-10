@@ -6,9 +6,9 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use rust_hadoop::dfs::master_service_server::MasterServiceServer;
-use rust_hadoop::master::{MasterState, MyMaster};
-use rust_hadoop::simple_raft::{
+use dfs_metaserver::dfs::master_service_server::MasterServiceServer;
+use dfs_metaserver::master::{MasterState, MyMaster};
+use dfs_metaserver::simple_raft::{
     AppendEntriesArgs, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs, RpcMessage,
 };
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = {
         let mut master_state = MasterState::default();
         master_state.enter_safe_mode();
-        Arc::new(Mutex::new(rust_hadoop::simple_raft::AppState::Master(
+        Arc::new(Mutex::new(dfs_metaserver::simple_raft::AppState::Master(
             master_state,
         )))
     };
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load Shard Map
     let shard_map =
-        rust_hadoop::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100);
+        dfs_metaserver::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100);
     let shard_map = Arc::new(Mutex::new(shard_map));
 
     let master = MyMaster::new(state, raft_tx_for_master, shard_map, args.shard_id.clone());

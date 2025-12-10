@@ -3,6 +3,10 @@ name = "dfs-client"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dfs_client"
+path = "src/mod.rs"
+
 [[bin]]
 name = "dfs_cli"
 path = "src/bin/dfs_cli.rs"

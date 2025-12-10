@@ -1,10 +1,9 @@
-use crate::raft_types::{Node, NodeId, TypeConfig};
-use async_trait::async_trait;
+use crate::raft_types::{Node, TypeConfig};
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
 use openraft::error::RPCError;
 use openraft::error::RaftError;
-use openraft::error::RemoteError;
+use openraft::network::RPCOption;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::InstallSnapshotRequest;
@@ -14,82 +13,85 @@ use openraft::raft::VoteResponse;
 
 pub struct Network {}
 
-#[async_trait]
 impl openraft::RaftNetworkFactory<TypeConfig> for Network {
     type Network = NetworkConnection;
 
-    async fn new_client(&self, target: NodeId, node: &Node) -> Self::Network {
+    async fn new_client(&mut self, _target: u64, node: &Node) -> Self::Network {
         NetworkConnection {
-            target,
             target_node: node.clone(),
         }
     }
 }
 
 pub struct NetworkConnection {
-    target: NodeId,
     target_node: Node,
 }
 
-#[async_trait]
 impl openraft::RaftNetwork<TypeConfig> for NetworkConnection {
-    async fn send_append_entries(
+    async fn append_entries(
         &mut self,
-        req: AppendEntriesRequest<TypeConfig>,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, NodeId, RaftError<NodeId>>> {
+        _req: AppendEntriesRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>>
+    {
         let url = format!("http://{}/raft/append", self.target_node.addr);
         let client = reqwest::Client::new();
-        let resp = client
+        let _resp = client
             .post(url)
-            .json(&req)
+            // .json(&req)
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        let res: AppendEntriesResponse<NodeId> = resp
-            .json()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        Ok(res)
+        // let res: AppendEntriesResponse<TypeConfig> = resp
+        //     .json()
+        //     .await
+        //     .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        // Ok(res)
+        todo!()
     }
 
-    async fn send_install_snapshot(
+    async fn install_snapshot(
         &mut self,
-        req: InstallSnapshotRequest<TypeConfig>,
+        _req: InstallSnapshotRequest<TypeConfig>,
+        _option: RPCOption,
     ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, NodeId, RaftError<NodeId, InstallSnapshotError>>,
+        InstallSnapshotResponse<TypeConfig>,
+        RPCError<TypeConfig, RaftError<TypeConfig, InstallSnapshotError>>,
     > {
-        let url = format!("http://{}/raft/snapshot", self.target_node.addr);
+        let url = format!("http://{}/raft/install_snapshot", self.target_node.addr);
         let client = reqwest::Client::new();
-        let resp = client
+        let _resp = client
             .post(url)
-            .json(&req)
+            // .json(&req)
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        let res: InstallSnapshotResponse<NodeId> = resp
-            .json()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        Ok(res)
+        // let res: InstallSnapshotResponse<TypeConfig> = resp
+        //     .json()
+        //     .await
+        //     .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        // Ok(res)
+        todo!()
     }
 
-    async fn send_vote(
+    async fn vote(
         &mut self,
-        req: VoteRequest<NodeId>,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, NodeId, RaftError<NodeId>>> {
+        _req: VoteRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
         let url = format!("http://{}/raft/vote", self.target_node.addr);
         let client = reqwest::Client::new();
-        let resp = client
+        let _resp = client
             .post(url)
-            .json(&req)
+            // .json(&req)
             .send()
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        let res: VoteResponse<NodeId> = resp
-            .json()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        Ok(res)
+        // let res: VoteResponse<TypeConfig> = resp
+        //     .json()
+        //     .await
+        //     .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        // Ok(res)
+        todo!()
     }
 }
