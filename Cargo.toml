@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["dfs"]
+members = ["dfs/metaserver", "dfs/chunkserver", "dfs/client"]
