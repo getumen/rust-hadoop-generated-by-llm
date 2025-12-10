@@ -298,6 +298,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfs-chunkserver"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "crc32fast",
+ "fs2",
+ "futures",
+ "prost",
+ "rand",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
+name = "dfs-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "crc32fast",
+ "fs2",
+ "futures",
+ "prost",
+ "rand",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
+name = "dfs-metaserver"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "crc32fast",
+ "fs2",
+ "futures",
+ "prost",
+ "rand",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tower-http",
+ "uuid",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,32 +1435,6 @@ checksum = "ddb7af00d2b17dbd07d82c0063e25411959748ff03e8d4f96134c2ff41fce34f"
 dependencies = [
  "libc",
  "librocksdb-sys",
-]
-
-[[package]]
-name = "rust-hadoop"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "clap",
- "crc32fast",
- "fs2",
- "futures",
- "prost",
- "rand",
- "reqwest",
- "rocksdb",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tower",
- "tower-http",
- "uuid",
 ]
 
 [[package]]

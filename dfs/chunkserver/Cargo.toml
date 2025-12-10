@@ -1,23 +1,11 @@
 [package]
-name = "rust-hadoop"
+name = "dfs-chunkserver"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "master"
-path = "src/bin/master.rs"
-
-[[bin]]
 name = "chunkserver"
 path = "src/bin/chunkserver.rs"
-
-[[bin]]
-name = "config_server"
-path = "src/bin/config_server.rs"
-
-[[bin]]
-name = "dfs_cli"
-path = "src/bin/dfs_cli.rs"
 
 [dependencies]
 tonic = "0.14"
