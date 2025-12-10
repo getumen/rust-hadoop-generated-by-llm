@@ -30,6 +30,11 @@ service MasterService {
   // Safe Mode operations
   rpc GetSafeModeStatus (GetSafeModeStatusRequest) returns (GetSafeModeStatusResponse);
   rpc SetSafeMode (SetSafeModeRequest) returns (SetSafeModeResponse);
+
+  // Raft cluster management
+  rpc AddRaftServer (AddRaftServerRequest) returns (AddRaftServerResponse);
+  rpc RemoveRaftServer (RemoveRaftServerRequest) returns (RemoveRaftServerResponse);
+  rpc GetClusterInfo (GetClusterInfoRequest) returns (GetClusterInfoResponse);
 }
 
 message HeartbeatRequest {
@@ -284,4 +289,47 @@ message SetSafeModeResponse {
   bool success = 1;
   string error_message = 2;
   bool is_safe_mode = 3;            // Current safe mode status after operation
+}
+
+// ============================================================================
+// Raft Cluster Management Messages
+// ============================================================================
+
+message AddRaftServerRequest {
+  string server_address = 1;        // Address of the server to add
+}
+
+message AddRaftServerResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message RemoveRaftServerRequest {
+  string server_address = 1;        // Address of the server to remove
+}
+
+message RemoveRaftServerResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message GetClusterInfoRequest {}
+
+message ClusterMember {
+  uint32 server_id = 1;
+  string address = 2;
+  bool is_self = 3;
+}
+
+message GetClusterInfoResponse {
+  uint32 node_id = 1;
+  string role = 2;
+  uint64 current_term = 3;
+  uint32 leader_id = 4;
+  string leader_address = 5;
+  repeated ClusterMember members = 6;
+  uint64 commit_index = 7;
+  uint64 last_applied = 8;
 }
