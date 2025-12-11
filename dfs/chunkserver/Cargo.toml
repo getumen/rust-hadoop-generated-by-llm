@@ -1,0 +1,32 @@
+[package]
+name = "dfs-chunkserver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dfs_chunkserver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chunkserver"
+path = "src/bin/chunkserver.rs"
+
+[dependencies]
+tonic = "0.14"
+prost = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+bytes = "1.0"
+fs2 = "0.4"
+axum = "0.8"
+tower = "0.5"
+crc32fast = "1.5"
+tonic-prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = "3.23"

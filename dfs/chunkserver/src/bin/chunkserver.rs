@@ -1,8 +1,8 @@
 use clap::Parser;
-use rust_hadoop::chunkserver::MyChunkServer;
-use rust_hadoop::dfs::chunk_server_service_server::ChunkServerServiceServer;
-use rust_hadoop::dfs::master_service_client::MasterServiceClient;
-use rust_hadoop::dfs::RegisterChunkServerRequest;
+use dfs_chunkserver::chunkserver::MyChunkServer;
+use dfs_chunkserver::dfs::chunk_server_service_server::ChunkServerServiceServer;
+use dfs_chunkserver::dfs::master_service_client::MasterServiceClient;
+use dfs_chunkserver::dfs::RegisterChunkServerRequest;
 use std::path::PathBuf;
 use tonic::transport::Server;
 
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for master_addr in &master_addrs {
                 match MasterServiceClient::connect(master_addr.clone()).await {
                     Ok(mut client) => {
-                        let request = tonic::Request::new(rust_hadoop::dfs::HeartbeatRequest {
+                        let request = tonic::Request::new(dfs_chunkserver::dfs::HeartbeatRequest {
                             chunk_server_address: my_addr.clone(),
                             used_space,
                             available_space,

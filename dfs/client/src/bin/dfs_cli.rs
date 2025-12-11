@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rust_hadoop::client::Client;
+use dfs_client::Client;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -69,7 +69,7 @@ enum ClusterAction {
     Info,
     /// Add a server to the Raft cluster
     AddServer {
-        /// Server ID
+        /// Server ID to add
         server_id: u32,
         /// Server HTTP address for Raft RPC
         server_address: String,
@@ -114,8 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("File renamed successfully: {} -> {}", source, dest);
         }
         Commands::SafeMode { action } => {
-            use rust_hadoop::dfs::master_service_client::MasterServiceClient;
-            use rust_hadoop::dfs::{GetSafeModeStatusRequest, SetSafeModeRequest};
+            use dfs_client::dfs::master_service_client::MasterServiceClient;
+            use dfs_client::dfs::{GetSafeModeStatusRequest, SetSafeModeRequest};
 
             let master_addr = if cli.master.starts_with("http://") {
                 cli.master.clone()
@@ -169,8 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Cluster { action } => {
-            use rust_hadoop::dfs::master_service_client::MasterServiceClient;
-            use rust_hadoop::dfs::{
+            use dfs_client::dfs::master_service_client::MasterServiceClient;
+            use dfs_client::dfs::{
                 AddRaftServerRequest, GetClusterInfoRequest, RemoveRaftServerRequest,
             };
 

@@ -1,10 +1,1 @@
-{
-  "shards": {
-    "shard-1": [
-      "http://dfs-master1-shard1:50051"
-    ],
-    "shard-2": [
-      "http://dfs-master1-shard2:50051"
-    ]
-  }
-}
+{"shards": {"shard-1": ["http://dfs-master1-shard1:50051"], "shard-2": ["http://dfs-master1-shard2:50051"]}}

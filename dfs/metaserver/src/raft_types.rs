@@ -1,7 +1,6 @@
 use crate::dfs::FileMetadata;
-use openraft::Config;
-use openraft::NodeId;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::io::Cursor;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -38,4 +37,16 @@ pub enum Response {
     FileAlreadyExists,
     FileNotFound,
     State(Option<FileMetadata>), // For read requests if needed, though usually read from state directly
+}
+
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl fmt::Display for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }

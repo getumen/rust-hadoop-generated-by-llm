@@ -1,0 +1,30 @@
+[package]
+name = "dfs-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dfs_client"
+path = "src/mod.rs"
+
+[[bin]]
+name = "dfs_cli"
+path = "src/bin/dfs_cli.rs"
+
+[dependencies]
+tonic = "0.14"
+prost = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+bytes = "1.0"
+axum = "0.8"
+tower = "0.5"
+tonic-prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tempfile = "3.23"

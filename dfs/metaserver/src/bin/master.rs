@@ -6,11 +6,10 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use rust_hadoop::config_server::MyConfigServer;
-use rust_hadoop::dfs::config_service_server::ConfigServiceServer;
-use rust_hadoop::sharding::ShardMap;
-use rust_hadoop::simple_raft::{
-    AppState, AppendEntriesArgs, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs, RpcMessage,
+use dfs_metaserver::dfs::master_service_server::MasterServiceServer;
+use dfs_metaserver::master::{MasterState, MyMaster};
+use dfs_metaserver::simple_raft::{
+    AppendEntriesArgs, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs, RpcMessage,
 };
 use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
@@ -18,7 +17,7 @@ use tonic::transport::Server;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value = "127.0.0.1:50052")] // Default port different from Master
+    #[arg(short, long, default_value = "127.0.0.1:50051")]
     addr: String,
 
     #[arg(long, default_value = "1")]
@@ -27,19 +26,25 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     peers: Vec<String>, // http://host:port
 
-    #[arg(long, default_value = "8081")] // Default HTTP port different from Master
+    #[arg(long, default_value = "8080")]
     http_port: u16,
 
     #[arg(long)]
     advertise_addr: Option<String>,
 
-    #[arg(long, default_value = "/tmp/config-raft-logs")]
+    #[arg(long, default_value = "/tmp/raft-logs")]
     storage_dir: String,
+
+    #[arg(long, default_value = "shard-0")]
+    shard_id: String,
+
+    #[arg(long)]
+    shard_config: Option<String>,
 }
 
 // Axum state for sharing the Raft channel
 #[derive(Clone)]
-struct AxumState {
+struct AppState {
     raft_tx: tokio::sync::mpsc::Sender<Event>,
 }
 
@@ -58,23 +63,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = args.addr.parse()?;
     let advertise_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
 
-    println!("Config Server node {} starting...", args.id);
+    println!("Master node {} starting...", args.id);
     println!("Peers: {:?}", args.peers);
     println!("HTTP Port: {}", args.http_port);
     println!("Advertise Addr: {}", advertise_addr);
     println!("Storage Dir: {}", args.storage_dir);
 
-    // Initialize with empty ShardMap (100 virtual nodes)
-    let state = Arc::new(Mutex::new(AppState::Config(ShardMap::new(100))));
+    let state = {
+        let mut master_state = MasterState::default();
+        master_state.enter_safe_mode();
+        Arc::new(Mutex::new(dfs_metaserver::simple_raft::AppState::Master(
+            master_state,
+        )))
+    };
     let (raft_tx, raft_rx) = tokio::sync::mpsc::channel(100);
 
     let raft_tx_for_node = raft_tx.clone();
     let raft_tx_for_server = raft_tx.clone();
-    let raft_tx_for_service = raft_tx.clone();
+    let raft_tx_for_master = raft_tx.clone();
+
+    // Filter out empty peer strings (e.g., when --peers "" is passed)
+    let peers: Vec<String> = args
+        .peers
+        .iter()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .collect();
 
     let mut raft_node = RaftNode::new(
         args.id,
-        args.peers.clone(),
+        peers.clone(),
         advertise_addr,
         args.storage_dir.clone(),
         state.clone(),
@@ -88,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Build Axum router for Raft RPC
-    let app_state = AxumState {
+    let app_state = AppState {
         raft_tx: raft_tx_for_server,
     };
 
@@ -105,12 +123,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let config_server = MyConfigServer::new(state, raft_tx_for_service);
+    // Load Shard Map
+    let shard_map =
+        dfs_metaserver::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100);
+    let shard_map = Arc::new(Mutex::new(shard_map));
 
-    println!("Config Server listening on {}", addr);
+    let master = MyMaster::new(state, raft_tx_for_master, shard_map, args.shard_id.clone());
+
+    println!("Master listening on {}", addr);
 
     Server::builder()
-        .add_service(ConfigServiceServer::new(config_server))
+        .add_service(MasterServiceServer::new(master).max_decoding_message_size(100 * 1024 * 1024))
         .serve(addr)
         .await?;
 
@@ -118,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle_vote(
-    State(app_state): State<AxumState>,
+    State(app_state): State<AppState>,
     Json(args): Json<RequestVoteArgs>,
 ) -> Result<Json<serde_json::Value>, InternalError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -143,7 +166,7 @@ async fn handle_vote(
 }
 
 async fn handle_append(
-    State(app_state): State<AxumState>,
+    State(app_state): State<AppState>,
     Json(args): Json<AppendEntriesArgs>,
 ) -> Result<Json<serde_json::Value>, InternalError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -168,7 +191,7 @@ async fn handle_append(
 }
 
 async fn handle_snapshot(
-    State(app_state): State<AxumState>,
+    State(app_state): State<AppState>,
     Json(args): Json<InstallSnapshotArgs>,
 ) -> Result<Json<serde_json::Value>, InternalError> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
