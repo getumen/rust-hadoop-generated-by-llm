@@ -69,13 +69,15 @@ enum ClusterAction {
     Info,
     /// Add a server to the Raft cluster
     AddServer {
+        /// Server ID to add
+        server_id: u32,
         /// Server HTTP address for Raft RPC
         server_address: String,
     },
     /// Remove a server from the Raft cluster
     RemoveServer {
-        /// Server address to remove
-        server_address: String,
+        /// Server ID to remove
+        server_id: u32,
     },
 }
 
@@ -205,16 +207,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-                ClusterAction::AddServer { server_address } => {
+                ClusterAction::AddServer {
+                    server_id,
+                    server_address,
+                } => {
                     let response = grpc_client
                         .add_raft_server(AddRaftServerRequest {
+                            server_id,
                             server_address: server_address.clone(),
                         })
                         .await?
                         .into_inner();
 
                     if response.success {
-                        println!("Added server {} to cluster", server_address);
+                        println!("Added server {} ({}) to cluster", server_id, server_address);
                     } else {
                         println!("Failed to add server: {}", response.error_message);
                         if !response.leader_hint.is_empty() {
@@ -222,16 +228,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                ClusterAction::RemoveServer { server_address } => {
+                ClusterAction::RemoveServer { server_id } => {
                     let response = grpc_client
-                        .remove_raft_server(RemoveRaftServerRequest {
-                            server_address: server_address.clone(),
-                        })
+                        .remove_raft_server(RemoveRaftServerRequest { server_id })
                         .await?
                         .into_inner();
 
                     if response.success {
-                        println!("Removed server {} from cluster", server_address);
+                        println!("Removed server {} from cluster", server_id);
                     } else {
                         println!("Failed to remove server: {}", response.error_message);
                         if !response.leader_hint.is_empty() {

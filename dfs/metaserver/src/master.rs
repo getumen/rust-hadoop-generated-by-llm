@@ -1346,25 +1346,9 @@ impl MasterService for MyMaster {
     ) -> Result<Response<AddRaftServerResponse>, Status> {
         let req = request.into_inner();
 
-        // Get current cluster info to determine next server_id
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .raft_tx
-            .send(Event::GetClusterInfo { reply_tx: tx })
-            .await
-            .is_err()
-        {
-            return Err(Status::internal("Raft channel closed"));
-        }
-
-        let next_server_id = match rx.await {
-            Ok(info) => info.peers.len() + 1, // peers + self + new server
-            Err(_) => return Err(Status::internal("Failed to get cluster info")),
-        };
-
         // Submit membership change command to Raft
         let cmd = Command::Membership(MembershipCommand::AddServer {
-            server_id: next_server_id,
+            server_id: req.server_id as usize,
             server_address: req.server_address.clone(),
         });
 
@@ -1444,32 +1428,10 @@ impl MasterService for MyMaster {
             }));
         }
 
-        // Find server_id from address
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        if self
-            .raft_tx
-            .send(Event::GetClusterInfo { reply_tx: tx2 })
-            .await
-            .is_err()
-        {
-            return Err(Status::internal("Raft channel closed"));
-        }
-
-        let server_id = match rx2.await {
-            Ok(info) => {
-                // Find the server_id by address
-                info.peers
-                    .iter()
-                    .position(|addr| addr == &req.server_address)
-                    .ok_or_else(|| {
-                        Status::not_found(format!("Server not found: {}", req.server_address))
-                    })?
-            }
-            Err(_) => return Err(Status::internal("Failed to get cluster info")),
-        };
-
         // Submit membership change command to Raft
-        let cmd = Command::Membership(MembershipCommand::RemoveServer { server_id });
+        let cmd = Command::Membership(MembershipCommand::RemoveServer {
+            server_id: req.server_id as usize,
+        });
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
