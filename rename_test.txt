@@ -1,1 +1,0 @@
-Hello from Rust Hadoop DFS! Testing rename operation.
