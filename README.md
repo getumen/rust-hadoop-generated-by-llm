@@ -102,30 +102,36 @@ cargo test -- --include-ignored
 | `fault_recovery_test.sh`    | トランザクション中のシャード障害からの復旧テスト           |
 | `chaos_test.sh`             | ChunkServerの障害などをシミュレートしたカオステスト        |
 
+
 ## プロジェクト構成
+
+このプロジェクトはCargo Workspace機能を使用して複数のクレートを管理しています。
 
 ```
 rust-hadoop/
+├── dfs/                       # DFS主要コンポーネント
+│   ├── metaserver/            # メタデータ管理サーバー
+│   │   ├── src/bin/
+│   │   │   ├── master.rs      # Masterサーバー (Raft + Sharding統合)
+│   │   │   └── config_server.rs # Configサーバー (Meta-Shard)
+│   │   └── src/               # Raft, Shardingロジックの実装
+│   ├── chunkserver/           # データ格納サーバー
+│   │   ├── src/bin/
+│   │   │   └── chunkserver.rs # ChunkServerバイナリ
+│   │   └── src/               # データ保存・レプリケーションロジック
+│   └── client/                # クライアントライブラリ & CLI
+│       ├── src/bin/
+│       │   └── dfs_cli.rs     # CLIツール
+│       └── src/               # Clientライブラリ実装 (接続管理, ShardMapキャッシュ)
 ├── proto/
 │   └── dfs.proto              # gRPC定義
-├── src/
-│   ├── bin/
-│   │   ├── master.rs          # Masterサーバー (Raft + Sharding統合)
-│   │   ├── config_server.rs   # Configサーバー (Meta-Shard)
-│   │   ├── chunkserver.rs     # ChunkServerサーバー
-│   │   └── dfs_cli.rs         # CLIクライアント
-│   ├── master.rs              # Master実装 (Transactionロジック含む)
-│   ├── sharding.rs            # Shardingロジック (Consistent Hashing)
-│   ├── simple_raft.rs         # Raftコンセンサス実装
-│   └── chunkserver.rs         # ChunkServer実装
-├── docker-compose.yml # シャーディング構成用Docker Compose
-├── docker-compose.yml         # 従来構成用Docker Compose
+├── docker-compose.yml         # シャーディング構成用Docker Compose
 └── *.sh                       # 各種テスト・起動スクリプト
 ```
 
 ## API
 
-### Master Core RPC
+### Master Core RPC (gRPC)
 
 - `CreateFile`: ファイル作成
 - `GetFileInfo`: ファイル情報取得
@@ -133,6 +139,12 @@ rust-hadoop/
 - `CompleteFile`: ファイル書き込み完了
 - `ListFiles`: ファイル一覧
 - `Rename`: ファイル移動・名前変更（クロスシャード対応）
+
+### Master Mgmt & Monitoring (HTTP)
+
+- **GET** `/health`: Liveness Probe
+- **GET** `/metrics`: Prometheus メトリクス (Raft状態など)
+- **GET** `/raft/state`: Raftの内部状態（JSON）
 
 ### Master Internal RPC (Transaction & Raft)
 
