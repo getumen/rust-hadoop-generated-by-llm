@@ -4,7 +4,5 @@ pub mod dfs {
 
 pub mod config_server;
 pub mod master;
-pub mod raft_network;
-pub mod raft_types;
 pub mod sharding;
 pub mod simple_raft;

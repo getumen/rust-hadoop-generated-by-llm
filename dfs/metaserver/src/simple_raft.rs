@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Follower,
     Candidate,
@@ -187,7 +187,7 @@ pub enum Event {
 }
 
 /// Information about the Raft cluster state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClusterInfo {
     pub node_id: usize,
     pub role: Role,
@@ -197,6 +197,8 @@ pub struct ClusterInfo {
     pub peers: Vec<String>,
     pub commit_index: usize,
     pub last_applied: usize,
+    pub log_len: usize,
+    pub votes_received: usize,
 }
 
 pub struct RaftNode {
@@ -862,6 +864,8 @@ impl RaftNode {
                     peers: self.peers.clone(),
                     commit_index: self.commit_index,
                     last_applied: self.last_applied,
+                    log_len: self.log.len() + self.last_included_index,
+                    votes_received: self.votes_received,
                 };
                 let _ = reply_tx.send(info);
             }

@@ -34,8 +34,8 @@ rand = "0.9"
 rocksdb = "0.24"
 tonic-prost = "0.14"
 
-openraft = { git = "https://github.com/datafuselabs/openraft", branch = "main" }
 async-trait = "0.1"
+prometheus = "0.13"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

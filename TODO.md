@@ -128,7 +128,7 @@
 ---
 
 ### 6. Health Checks and Monitoring
-**Status**: Basic
+**Status**: **Mostly Completed**
 **Priority**: Medium
 **Effort**: Small
 
@@ -137,18 +137,18 @@
 - No Raft-specific health metrics
 
 **Tasks**:
-- [ ] Add `/health` endpoint
-- [ ] Expose Raft state (role, term, commit_index) via HTTP
-- [ ] Add Prometheus metrics endpoint
-- [ ] Implement metrics (Role, Term, Log size, Latency)
-  - [ ] Current role (Leader/Follower/Candidate)
-  - [ ] Term number
-  - [ ] Log size
-  - [ ] Commit index
-  - [ ] Last applied index
-  - [ ] Number of votes received
+- [x] Add `/health` endpoint
+- [x] Expose Raft state (role, term, commit_index) via HTTP
+- [x] Add Prometheus metrics endpoint
+- [x] Implement metrics (Role, Term, Log size, Latency)
+  - [x] Current role (Leader/Follower/Candidate)
+  - [x] Term number
+  - [x] Log size
+  - [x] Commit index
+  - [x] Last applied index
+  - [x] Number of votes received
   - [ ] Heartbeat latency
-- [ ] Add Grafana dashboard template
+- [x] Add Grafana dashboard template
 
 ---
 
