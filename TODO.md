@@ -40,7 +40,7 @@
 ---
 
 ### 2. Client Library Refactoring
-**Status**: Not Started
+**Status**: **Completed**
 **Priority**: High
 **Effort**: Medium
 
@@ -103,7 +103,7 @@
 ---
 
 ### 5. Raft Configuration Management
-**Status**: **Partially Completed**
+**Status**: **Mostly Completed**
 **Priority**: Medium
 **Effort**: Medium
 
@@ -149,6 +149,46 @@
   - [x] Number of votes received
   - [ ] Heartbeat latency
 - [x] Add Grafana dashboard template
+
+---
+
+### 19. S3 REST API Compatibility
+**Status**: **Not Started**
+**Priority**: Medium
+**Effort**: Very Large
+
+**Problem**:
+- Clients currently must use custom gRPC/TCP client or CLI
+- No support for standard tools (AWS CLI, SDKs, Cyberduck, etc.)
+- Difficult to integrate with existing ecosystem
+
+**Solution**:
+- Implement an S3-compatible API Gateway
+- Translate S3 REST calls to internal DFS gRPC calls
+
+**Milestones**:
+
+#### Milestone 1: Basic Operations & Spark Prerequisites
+- [ ] Implement `s3_server` binary (using Axum)
+- [ ] Implement Bucket operations (CreateBucket, DeleteBucket, ListBuckets, HeadBucket)
+  - *Note: Map Buckets to top-level directories*
+- [ ] Implement Object operations (PutObject, GetObject, DeleteObject, HeadObject)
+  - [ ] Simple single-part upload/download
+- [ ] Support for Directory Simulation (ListObjects with `prefix` and `delimiter`)
+- [ ] Basic authentication (V4 Signature or dummy auth for dev)
+
+#### Milestone 2: Multipart Upload & Rename Support (Crucial for Spark)
+- [ ] Implement InitiateMultipartUpload
+- [ ] Implement UploadPart (map to DFS blocks)
+- [ ] Implement CompleteMultipartUpload
+- [ ] Implement AbortMultipartUpload
+- [ ] Implement CopyObject (required for `rename()` simulation)
+
+#### Milestone 3: Advanced Features
+- [ ] Support for Object Metadata (User-defined tags)
+- [ ] Support for Range Requests (Partial content)
+- [ ] Support for ListObjectsV2 (Pagination)
+- [ ] Presigned URLs
 
 ---
 
@@ -379,12 +419,13 @@
 
 ### Phase 3: Scalability (Current)
 - ✅ **Master Server Sharding (Completed)**
-- Next: Client Library Refactoring (#2)
+- ✅ Client Library Refactoring (#2)
 - Safe Mode (#4)
 - Dynamic cluster membership (#5)
 - Read optimizations (#7)
 
 ### Phase 4: Enterprise Features (Future)
+- S3 Compatibility (#19)
 - Security enhancements (#11)
 - Observability (#12)
 - Rack Awareness (#14)
@@ -398,5 +439,5 @@
 - Some tasks can be parallelized
 - Security features are marked low priority for prototype but would be critical for production
 
-**Last Updated**: 2025-12-06
+**Last Updated**: 2025-12-15
 **Maintainer**: Development Team
