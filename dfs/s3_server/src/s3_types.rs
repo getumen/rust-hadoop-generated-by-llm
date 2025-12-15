@@ -84,3 +84,52 @@ pub struct S3Error {
     #[serde(rename = "RequestId")]
     pub request_id: String,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
+pub struct InitiateMultipartUploadResult {
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "CompleteMultipartUpload")]
+pub struct CompleteMultipartUpload {
+    #[serde(rename = "Part")]
+    #[allow(dead_code)]
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Part {
+    #[serde(rename = "PartNumber")]
+    pub part_number: i32,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult")]
+pub struct CompleteMultipartUploadResult {
+    #[serde(rename = "Location")]
+    pub location: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CopyObjectResult")]
+pub struct CopyObjectResult {
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}

@@ -178,11 +178,11 @@
 - [x] Basic authentication (V4 Signature or dummy auth for dev)
 
 #### Milestone 2: Multipart Upload & Rename Support (Crucial for Spark)
-- [ ] Implement InitiateMultipartUpload
-- [ ] Implement UploadPart (map to DFS blocks)
-- [ ] Implement CompleteMultipartUpload
-- [ ] Implement AbortMultipartUpload
-- [ ] Implement CopyObject (required for `rename()` simulation)
+- [x] Implement InitiateMultipartUpload
+- [x] Implement UploadPart (map to DFS blocks)
+- [x] Implement CompleteMultipartUpload
+- [x] Implement AbortMultipartUpload
+- [x] Implement CopyObject (required for `rename()` simulation)
 
 #### Milestone 3: Advanced Features
 - [ ] Support for Object Metadata (User-defined tags)
