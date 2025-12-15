@@ -153,7 +153,7 @@
 ---
 
 ### 19. S3 REST API Compatibility
-**Status**: **Not Started**
+**Status**: **In Progress**
 **Priority**: Medium
 **Effort**: Very Large
 
@@ -169,13 +169,13 @@
 **Milestones**:
 
 #### Milestone 1: Basic Operations & Spark Prerequisites
-- [ ] Implement `s3_server` binary (using Axum)
-- [ ] Implement Bucket operations (CreateBucket, DeleteBucket, ListBuckets, HeadBucket)
+- [x] Implement `s3_server` binary (using Axum)
+- [x] Implement Bucket operations (CreateBucket, DeleteBucket, ListBuckets, HeadBucket)
   - *Note: Map Buckets to top-level directories*
-- [ ] Implement Object operations (PutObject, GetObject, DeleteObject, HeadObject)
-  - [ ] Simple single-part upload/download
-- [ ] Support for Directory Simulation (ListObjects with `prefix` and `delimiter`)
-- [ ] Basic authentication (V4 Signature or dummy auth for dev)
+- [x] Implement Object operations (PutObject, GetObject, DeleteObject, HeadObject)
+  - [x] Simple single-part upload/download
+- [x] Support for Directory Simulation (ListObjects with `prefix` and `delimiter`)
+- [x] Basic authentication (V4 Signature or dummy auth for dev)
 
 #### Milestone 2: Multipart Upload & Rename Support (Crucial for Spark)
 - [ ] Implement InitiateMultipartUpload

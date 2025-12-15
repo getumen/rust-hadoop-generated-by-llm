@@ -7,8 +7,8 @@ pub mod sharding;
 use crate::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use crate::dfs::master_service_client::MasterServiceClient;
 use crate::dfs::{
-    AllocateBlockRequest, CreateFileRequest, GetFileInfoRequest, ListFilesRequest,
-    ReadBlockRequest, RenameRequest, WriteBlockRequest,
+    AllocateBlockRequest, CreateFileRequest, DeleteFileRequest, GetFileInfoRequest,
+    ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
 use crate::sharding::ShardMap;
 use std::collections::HashMap;
@@ -70,7 +70,10 @@ impl Client {
         url.to_string()
     }
 
-    pub async fn list_files(&self, path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub async fn list_files(
+        &self,
+        path: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let (response, _) = self
             .execute_rpc(Some(path), |mut client| {
                 let path = path.to_string();
@@ -88,7 +91,7 @@ impl Client {
         &self,
         source: &Path,
         dest: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Create file on Master
         let (create_resp, success_addr) = self
             .execute_rpc(Some(dest), |mut client| {
@@ -194,7 +197,7 @@ impl Client {
         &self,
         source: &str,
         dest: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Get file info from Master
         let (info_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -253,11 +256,41 @@ impl Client {
         Ok(())
     }
 
+    pub async fn delete_file(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (delete_resp, _) = self
+            .execute_rpc(Some(path), |mut client| {
+                let path = path.to_string();
+                async move {
+                    let delete_req = tonic::Request::new(DeleteFileRequest { path });
+                    let response = client.delete_file(delete_req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!(
+                            "Not Leader|{}",
+                            inner.leader_hint
+                        )));
+                    }
+                    Ok(response)
+                }
+            })
+            .await?;
+        let delete_resp = delete_resp.into_inner();
+
+        if !delete_resp.success {
+            return Err(format!("Failed to delete file: {}", delete_resp.error_message).into());
+        }
+
+        Ok(())
+    }
+
     pub async fn rename_file(
         &self,
         source: &str,
         dest: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Use source path for routing
         let (rename_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -300,7 +333,7 @@ impl Client {
         &self,
         key: Option<&str>,
         f: F,
-    ) -> Result<(T, String), Box<dyn std::error::Error>>
+    ) -> Result<(T, String), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(MasterServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<T, tonic::Status>>,
@@ -334,7 +367,7 @@ impl Client {
         max_retries: usize,
         initial_backoff_ms: u64,
         f: F,
-    ) -> Result<(T, String), Box<dyn std::error::Error>>
+    ) -> Result<(T, String), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(MasterServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<T, tonic::Status>>,

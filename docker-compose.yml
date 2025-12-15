@@ -69,6 +69,19 @@ services:
     volumes:
       - cs1-shard2-data:/data/cs1
 
+  s3-server:
+    build: .
+    container_name: dfs-s3-server
+    command: /app/s3-server
+    environment:
+      - MASTER_ADDR=http://dfs-master1-shard1:50051
+    ports:
+      - "9000:9000"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - master1-shard1
+
 networks:
   dfs-sharded-network:
     driver: bridge

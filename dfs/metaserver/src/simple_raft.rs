@@ -50,6 +50,10 @@ pub enum MasterCommand {
     CreateFile {
         path: String,
     },
+    DeleteFile {
+        path: String,
+    },
+
     AllocateBlock {
         path: String,
         block_id: String,
@@ -1183,6 +1187,11 @@ impl RaftNode {
                                     blocks: vec![],
                                 },
                             );
+                        }
+                        MasterCommand::DeleteFile { path } => {
+                            if master_state.files.remove(path).is_some() {
+                                println!("Deleted file {}", path);
+                            }
                         }
                         MasterCommand::AllocateBlock {
                             path,

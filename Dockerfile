@@ -32,6 +32,8 @@ COPY --from=builder /app/target/release/master /app/master
 COPY --from=builder /app/target/release/chunkserver /app/chunkserver
 COPY --from=builder /app/target/release/dfs_cli /app/dfs_cli
 COPY --from=builder /app/target/release/config_server /app/config_server
+COPY --from=builder /app/target/release/s3-server /app/s3-server
+
 
 # Create storage directory
 RUN mkdir -p /data

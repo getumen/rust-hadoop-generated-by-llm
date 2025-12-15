@@ -3,13 +3,14 @@ use crate::dfs::{
     AbortTransactionRequest, AbortTransactionResponse, AddRaftServerRequest, AddRaftServerResponse,
     AllocateBlockRequest, AllocateBlockResponse, BlockInfo, ChunkServerCommand, ClusterMember,
     CommitTransactionRequest, CommitTransactionResponse, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, CreateFileResponse, FileMetadata, GetBlockLocationsRequest,
-    GetBlockLocationsResponse, GetClusterInfoRequest, GetClusterInfoResponse, GetFileInfoRequest,
-    GetFileInfoResponse, GetSafeModeStatusRequest, GetSafeModeStatusResponse, HeartbeatRequest,
-    HeartbeatResponse, ListFilesRequest, ListFilesResponse, PrepareTransactionRequest,
-    PrepareTransactionResponse, RegisterChunkServerRequest, RegisterChunkServerResponse,
-    RemoveRaftServerRequest, RemoveRaftServerResponse, RenameRequest, RenameResponse,
-    SetSafeModeRequest, SetSafeModeResponse,
+    CreateFileRequest, CreateFileResponse, DeleteFileRequest, DeleteFileResponse, FileMetadata,
+    GetBlockLocationsRequest, GetBlockLocationsResponse, GetClusterInfoRequest,
+    GetClusterInfoResponse, GetFileInfoRequest, GetFileInfoResponse, GetSafeModeStatusRequest,
+    GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse, ListFilesRequest,
+    ListFilesResponse, PrepareTransactionRequest, PrepareTransactionResponse,
+    RegisterChunkServerRequest, RegisterChunkServerResponse, RemoveRaftServerRequest,
+    RemoveRaftServerResponse, RenameRequest, RenameResponse, SetSafeModeRequest,
+    SetSafeModeResponse,
 };
 use crate::simple_raft::{AppState, Command, Event, MasterCommand, MembershipCommand, Role};
 use serde::{Deserialize, Serialize};
@@ -638,6 +639,56 @@ impl MasterService for MyMaster {
                 leader_hint: "".to_string(),
             })),
             Ok(Err(leader_opt)) => Ok(Response::new(CreateFileResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    async fn delete_file(
+        &self,
+        request: Request<DeleteFileRequest>,
+    ) -> Result<Response<DeleteFileResponse>, Status> {
+        let req = request.into_inner();
+        self.check_shard_ownership(&req.path)?;
+        self.check_safe_mode()?;
+
+        // Check if file exists
+        {
+            let state_lock = self.state.lock().unwrap();
+            if let AppState::Master(ref state) = *state_lock {
+                if !state.files.contains_key(&req.path) {
+                    return Ok(Response::new(DeleteFileResponse {
+                        success: false,
+                        error_message: "File not found".to_string(),
+                        leader_hint: "".to_string(),
+                    }));
+                }
+            }
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Master(MasterCommand::DeleteFile { path: req.path }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(DeleteFileResponse {
+                success: true,
+                error_message: "".to_string(),
+                leader_hint: "".to_string(),
+            })),
+            Ok(Err(leader_opt)) => Ok(Response::new(DeleteFileResponse {
                 success: false,
                 error_message: "Not Leader".to_string(),
                 leader_hint: leader_opt.unwrap_or_default(),

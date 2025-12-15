@@ -1,0 +1,86 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "ListAllMyBucketsResult")]
+pub struct ListAllMyBucketsResult {
+    #[serde(rename = "Owner")]
+    pub owner: Owner,
+    #[serde(rename = "Buckets")]
+    pub buckets: Buckets,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Owner {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "DisplayName")]
+    pub display_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Buckets {
+    #[serde(rename = "Bucket")]
+    pub bucket: Vec<Bucket>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Bucket {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "CreationDate")]
+    pub creation_date: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "ListBucketResult")]
+pub struct ListBucketResult {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "Marker")]
+    pub marker: String,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: i32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Contents", default)]
+    pub contents: Vec<Object>,
+    #[serde(rename = "CommonPrefixes", default)]
+    pub common_prefixes: Vec<CommonPrefix>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Object {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+    #[serde(rename = "StorageClass")]
+    pub storage_class: String,
+    #[serde(rename = "Owner")]
+    pub owner: Owner,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommonPrefix {
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "Error")]
+pub struct S3Error {
+    #[serde(rename = "Code")]
+    pub code: String,
+    #[serde(rename = "Message")]
+    pub message: String,
+    #[serde(rename = "Resource")]
+    pub resource: String,
+    #[serde(rename = "RequestId")]
+    pub request_id: String,
+}
