@@ -2,15 +2,17 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
 use dfs_metaserver::dfs::master_service_server::MasterServiceServer;
 use dfs_metaserver::master::{MasterState, MyMaster};
 use dfs_metaserver::simple_raft::{
-    AppendEntriesArgs, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs, RpcMessage,
+    AppendEntriesArgs, ClusterInfo, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs,
+    RpcMessage,
 };
+use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
 
@@ -111,6 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
+        .route("/raft/state", get(handle_raft_state))
         .route("/raft/vote", post(handle_vote))
         .route("/raft/append", post(handle_append))
         .route("/raft/snapshot", post(handle_snapshot))
@@ -138,6 +143,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+async fn handle_health() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+async fn handle_raft_state(
+    State(app_state): State<AppState>,
+) -> Result<Json<ClusterInfo>, InternalError> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if app_state
+        .raft_tx
+        .send(Event::GetClusterInfo { reply_tx })
+        .await
+        .is_err()
+    {
+        return Err(InternalError);
+    }
+
+    match reply_rx.await {
+        Ok(info) => Ok(Json(info)),
+        _ => Err(InternalError),
+    }
+}
+
+async fn handle_metrics(State(app_state): State<AppState>) -> Result<String, InternalError> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if app_state
+        .raft_tx
+        .send(Event::GetClusterInfo { reply_tx })
+        .await
+        .is_err()
+    {
+        return Err(InternalError);
+    }
+
+    let info = match reply_rx.await {
+        Ok(info) => info,
+        _ => return Err(InternalError),
+    };
+
+    let registry = Registry::new();
+
+    let role_gauge = Gauge::new(
+        "raft_role",
+        "Current Raft role (0=Follower, 1=Candidate, 2=Leader)",
+    )
+    .unwrap();
+    let term_gauge = Gauge::new("raft_current_term", "Current Raft term").unwrap();
+    let commit_index_gauge = Gauge::new("raft_commit_index", "Current commit index").unwrap();
+    let last_applied_gauge = Gauge::new("raft_last_applied", "Last applied index").unwrap();
+    let log_len_gauge = Gauge::new("raft_log_len", "Current log length").unwrap();
+    let votes_gauge = Gauge::new(
+        "raft_votes_received",
+        "Number of votes received in current term",
+    )
+    .unwrap();
+
+    registry.register(Box::new(role_gauge.clone())).unwrap();
+    registry.register(Box::new(term_gauge.clone())).unwrap();
+    registry
+        .register(Box::new(commit_index_gauge.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(last_applied_gauge.clone()))
+        .unwrap();
+    registry.register(Box::new(log_len_gauge.clone())).unwrap();
+    registry.register(Box::new(votes_gauge.clone())).unwrap();
+
+    let role_val = match info.role {
+        dfs_metaserver::simple_raft::Role::Follower => 0.0,
+        dfs_metaserver::simple_raft::Role::Candidate => 1.0,
+        dfs_metaserver::simple_raft::Role::Leader => 2.0,
+    };
+    role_gauge.set(role_val);
+    term_gauge.set(info.current_term as f64);
+    commit_index_gauge.set(info.commit_index as f64);
+    last_applied_gauge.set(info.last_applied as f64);
+    log_len_gauge.set(info.log_len as f64);
+    votes_gauge.set(info.votes_received as f64);
+
+    let mut buffer = vec![];
+    let encoder = TextEncoder::new();
+    encoder.encode(&registry.gather(), &mut buffer).unwrap();
+
+    Ok(String::from_utf8(buffer).unwrap())
 }
 
 async fn handle_vote(
