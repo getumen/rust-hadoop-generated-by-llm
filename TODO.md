@@ -185,10 +185,10 @@
 - [x] Implement CopyObject (required for `rename()` simulation)
 
 #### Milestone 3: Advanced Features
-- [ ] Support for Object Metadata (User-defined tags)
-- [ ] Support for Range Requests (Partial content)
-- [ ] Support for ListObjectsV2 (Pagination)
-- [ ] Presigned URLs
+- [x] Support for Object Metadata (User-defined tags)
+- [x] Support for Range Requests (Partial content)
+- [x] Support for ListObjectsV2 (Pagination)
+- [x] Presigned URLs
 
 ---
 

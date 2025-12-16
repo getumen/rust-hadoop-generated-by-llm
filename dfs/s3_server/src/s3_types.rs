@@ -133,3 +133,36 @@ pub struct CopyObjectResult {
     #[serde(rename = "ETag")]
     pub etag: String,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "ListBucketResult")]
+pub struct ListBucketResultV2 {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: i32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Contents")]
+    pub contents: Vec<Object>,
+    #[serde(rename = "CommonPrefixes", default)]
+    pub common_prefixes: Vec<CommonPrefix>,
+    #[serde(rename = "KeyCount")]
+    pub key_count: i32,
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(
+        rename = "NextContinuationToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_continuation_token: Option<String>,
+    #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
+    pub start_after: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Metadata {
+    pub headers: std::collections::HashMap<String, String>,
+}
