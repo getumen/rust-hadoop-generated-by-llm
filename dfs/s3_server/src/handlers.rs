@@ -55,18 +55,28 @@ pub async fn handle_root(State(state): State<S3AppState>, method: Method) -> imp
 }
 
 async fn list_buckets(state: S3AppState) -> Response {
-    match state.client.list_files("/").await {
+    match state.client.list_all_files().await {
         Ok(files) => {
             // Primitive dedup/filtering if needed.
-            let buckets_vec: Vec<Bucket> = files
+            let mut unique_buckets = std::collections::HashSet::new();
+            for name in files {
+                let clean_name = name.trim_matches('/').to_string();
+                // Extract the first component as the bucket name
+                let bucket_name = if let Some((root, _)) = clean_name.split_once('/') {
+                    root.to_string()
+                } else {
+                    clean_name
+                };
+                if !bucket_name.is_empty() {
+                    unique_buckets.insert(bucket_name);
+                }
+            }
+
+            let buckets_vec: Vec<Bucket> = unique_buckets
                 .into_iter()
-                .map(|name| {
-                    // Remove trailing slash and leading slash if present (though client usually handles paths)
-                    let clean_name = name.trim_matches('/').to_string();
-                    Bucket {
-                        name: clean_name,
-                        creation_date: "2025-01-01T00:00:00.000Z".to_string(),
-                    }
+                .map(|name| Bucket {
+                    name,
+                    creation_date: "2025-01-01T00:00:00.000Z".to_string(),
                 })
                 .collect();
 
@@ -405,7 +415,10 @@ async fn list_objects(state: S3AppState, bucket: &str, params: S3Query) -> Respo
 
             for f in files {
                 // Filter out .s3keep
-                if f.ends_with(".s3keep") || f.ends_with(".s3_mpu_completed") {
+                if f.ends_with(".s3keep")
+                    || f.ends_with(".s3_mpu_completed")
+                    || f.ends_with(".meta")
+                {
                     continue;
                 }
 

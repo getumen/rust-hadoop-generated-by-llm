@@ -249,6 +249,8 @@
   - [ ] Log replication
   - [ ] Vote counting
   - [ ] Term updates
+- [x] Develop integration test script (`test_scripts/s3_integration_test.py`) using AWS SDK
+- [x] Verify full S3 compatibility with DataFrame APIs
 - [ ] Add integration tests for network partitions
   - [ ] Multi-node scenarios
   - [ ] Network partition simulation

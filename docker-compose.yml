@@ -75,6 +75,9 @@ services:
     command: /app/s3-server
     environment:
       - MASTER_ADDR=http://dfs-master1-shard1:50051
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - ./shard_config.json:/app/shard_config.json
     ports:
       - "9000:9000"
     networks:

@@ -87,6 +87,80 @@ impl Client {
         Ok(response.into_inner().files)
     }
 
+    pub async fn list_all_files(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let (shards, default_masters) = {
+            let map = self.shard_map.read().unwrap();
+            (map.get_all_shards(), self.master_addrs.clone())
+        };
+
+        let mut all_files = std::collections::HashSet::new();
+
+        if shards.is_empty() {
+            // No shards configured, use default masters as single shard
+            let (response, _) = self
+                .execute_rpc_internal(
+                    &default_masters,
+                    self.max_retries,
+                    self.initial_backoff_ms,
+                    |mut client| async move {
+                        let request = tonic::Request::new(ListFilesRequest {
+                            path: "/".to_string(),
+                        });
+                        client.list_files(request).await
+                    },
+                )
+                .await?;
+            for f in response.into_inner().files {
+                all_files.insert(f);
+            }
+        } else {
+            // Query each shard
+            for shard_id in shards {
+                let peers = {
+                    let map = self.shard_map.read().unwrap();
+                    map.get_shard_peers(&shard_id).unwrap_or_default()
+                };
+
+                if peers.is_empty() {
+                    continue;
+                }
+
+                // We try to query the shard. If it fails, we log and continue (partial results better than crash?)
+                // Ideally we should fail if any shard is unreachable to be consistent.
+                // Let's fail if we can't get data from a shard.
+                let result = self
+                    .execute_rpc_internal(
+                        &peers,
+                        self.max_retries,
+                        self.initial_backoff_ms,
+                        |mut client| async move {
+                            let request = tonic::Request::new(ListFilesRequest {
+                                path: "/".to_string(),
+                            });
+                            client.list_files(request).await
+                        },
+                    )
+                    .await;
+
+                match result {
+                    Ok((response, _)) => {
+                        for f in response.into_inner().files {
+                            all_files.insert(f);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to list files from shard {}: {}", shard_id, e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(all_files.into_iter().collect())
+    }
+
     pub async fn create_file(
         &self,
         source: &Path,
