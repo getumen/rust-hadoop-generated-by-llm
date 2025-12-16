@@ -705,7 +705,6 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
 
     // Normal Object
     let source_path = format!("/{}/{}", bucket, key);
-
     let temp_dir = std::env::temp_dir();
     let dest_path = temp_dir.join(format!("s3_get_{}_{}", bucket, key.replace('/', "_")));
 
