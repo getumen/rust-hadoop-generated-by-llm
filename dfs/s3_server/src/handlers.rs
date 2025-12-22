@@ -29,6 +29,8 @@ pub struct S3Query {
     pub continuation_token: Option<String>,
     #[serde(rename = "start-after")]
     pub start_after: Option<String>,
+    #[serde(rename = "max-keys")]
+    pub max_keys: Option<i32>,
 }
 
 // Helper to return XML response
@@ -813,10 +815,15 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
 
 async fn list_objects_v2(state: S3AppState, bucket: &str, params: S3Query) -> Response {
     // Re-use list_objects logic but return V2 structure and handle pagination
-    // Ideally we factor out common logic but for now strict copy-mod
-    let list_path = format!("/{}", bucket);
-    match state.client.list_files(&list_path).await {
-        Ok(mut files) => {
+    // Use list_all_files to aggregate across all shards
+    let bucket_prefix = format!("/{}/", bucket);
+    match state.client.list_all_files().await {
+        Ok(all_files) => {
+            // Filter files to only those in this bucket
+            let mut files: Vec<String> = all_files
+                .into_iter()
+                .filter(|f| f.starts_with(&bucket_prefix))
+                .collect();
             files.sort(); // Pagination requires order
 
             // Apply start_after / continuation_token
@@ -840,7 +847,7 @@ async fn list_objects_v2(state: S3AppState, bucket: &str, params: S3Query) -> Re
             let mut common_prefixes = Vec::new();
             let mut seen_prefixes = std::collections::HashSet::new();
             let mut key_count = 0;
-            let max_keys = 1000; // Hardcoded default for now
+            let max_keys = params.max_keys.unwrap_or(1000);
             let mut next_token = None;
             let mut is_truncated = false;
 
