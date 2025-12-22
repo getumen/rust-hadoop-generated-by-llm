@@ -7,8 +7,8 @@ pub mod sharding;
 use crate::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use crate::dfs::master_service_client::MasterServiceClient;
 use crate::dfs::{
-    AllocateBlockRequest, CreateFileRequest, GetFileInfoRequest, ListFilesRequest,
-    ReadBlockRequest, RenameRequest, WriteBlockRequest,
+    AllocateBlockRequest, CreateFileRequest, DeleteFileRequest, GetFileInfoRequest,
+    ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
 use crate::sharding::ShardMap;
 use std::collections::HashMap;
@@ -70,7 +70,10 @@ impl Client {
         url.to_string()
     }
 
-    pub async fn list_files(&self, path: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub async fn list_files(
+        &self,
+        path: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let (response, _) = self
             .execute_rpc(Some(path), |mut client| {
                 let path = path.to_string();
@@ -84,11 +87,85 @@ impl Client {
         Ok(response.into_inner().files)
     }
 
+    pub async fn list_all_files(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let (shards, default_masters) = {
+            let map = self.shard_map.read().unwrap();
+            (map.get_all_shards(), self.master_addrs.clone())
+        };
+
+        let mut all_files = std::collections::HashSet::new();
+
+        if shards.is_empty() {
+            // No shards configured, use default masters as single shard
+            let (response, _) = self
+                .execute_rpc_internal(
+                    &default_masters,
+                    self.max_retries,
+                    self.initial_backoff_ms,
+                    |mut client| async move {
+                        let request = tonic::Request::new(ListFilesRequest {
+                            path: "/".to_string(),
+                        });
+                        client.list_files(request).await
+                    },
+                )
+                .await?;
+            for f in response.into_inner().files {
+                all_files.insert(f);
+            }
+        } else {
+            // Query each shard
+            for shard_id in shards {
+                let peers = {
+                    let map = self.shard_map.read().unwrap();
+                    map.get_shard_peers(&shard_id).unwrap_or_default()
+                };
+
+                if peers.is_empty() {
+                    continue;
+                }
+
+                // We try to query the shard. If it fails, we log and continue (partial results better than crash?)
+                // Ideally we should fail if any shard is unreachable to be consistent.
+                // Let's fail if we can't get data from a shard.
+                let result = self
+                    .execute_rpc_internal(
+                        &peers,
+                        self.max_retries,
+                        self.initial_backoff_ms,
+                        |mut client| async move {
+                            let request = tonic::Request::new(ListFilesRequest {
+                                path: "/".to_string(),
+                            });
+                            client.list_files(request).await
+                        },
+                    )
+                    .await;
+
+                match result {
+                    Ok((response, _)) => {
+                        for f in response.into_inner().files {
+                            all_files.insert(f);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to list files from shard {}: {}", shard_id, e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(all_files.into_iter().collect())
+    }
+
     pub async fn create_file(
         &self,
         source: &Path,
         dest: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Create file on Master
         let (create_resp, success_addr) = self
             .execute_rpc(Some(dest), |mut client| {
@@ -194,7 +271,7 @@ impl Client {
         &self,
         source: &str,
         dest: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Get file info from Master
         let (info_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -253,11 +330,41 @@ impl Client {
         Ok(())
     }
 
+    pub async fn delete_file(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (delete_resp, _) = self
+            .execute_rpc(Some(path), |mut client| {
+                let path = path.to_string();
+                async move {
+                    let delete_req = tonic::Request::new(DeleteFileRequest { path });
+                    let response = client.delete_file(delete_req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!(
+                            "Not Leader|{}",
+                            inner.leader_hint
+                        )));
+                    }
+                    Ok(response)
+                }
+            })
+            .await?;
+        let delete_resp = delete_resp.into_inner();
+
+        if !delete_resp.success {
+            return Err(format!("Failed to delete file: {}", delete_resp.error_message).into());
+        }
+
+        Ok(())
+    }
+
     pub async fn rename_file(
         &self,
         source: &str,
         dest: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Use source path for routing
         let (rename_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -300,7 +407,7 @@ impl Client {
         &self,
         key: Option<&str>,
         f: F,
-    ) -> Result<(T, String), Box<dyn std::error::Error>>
+    ) -> Result<(T, String), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(MasterServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<T, tonic::Status>>,
@@ -334,7 +441,7 @@ impl Client {
         max_retries: usize,
         initial_backoff_ms: u64,
         f: F,
-    ) -> Result<(T, String), Box<dyn std::error::Error>>
+    ) -> Result<(T, String), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(MasterServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<T, tonic::Status>>,

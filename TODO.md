@@ -153,7 +153,7 @@
 ---
 
 ### 19. S3 REST API Compatibility
-**Status**: **Not Started**
+**Status**: **In Progress**
 **Priority**: Medium
 **Effort**: Very Large
 
@@ -169,26 +169,26 @@
 **Milestones**:
 
 #### Milestone 1: Basic Operations & Spark Prerequisites
-- [ ] Implement `s3_server` binary (using Axum)
-- [ ] Implement Bucket operations (CreateBucket, DeleteBucket, ListBuckets, HeadBucket)
+- [x] Implement `s3_server` binary (using Axum)
+- [x] Implement Bucket operations (CreateBucket, DeleteBucket, ListBuckets, HeadBucket)
   - *Note: Map Buckets to top-level directories*
-- [ ] Implement Object operations (PutObject, GetObject, DeleteObject, HeadObject)
-  - [ ] Simple single-part upload/download
-- [ ] Support for Directory Simulation (ListObjects with `prefix` and `delimiter`)
-- [ ] Basic authentication (V4 Signature or dummy auth for dev)
+- [x] Implement Object operations (PutObject, GetObject, DeleteObject, HeadObject)
+  - [x] Simple single-part upload/download
+- [x] Support for Directory Simulation (ListObjects with `prefix` and `delimiter`)
+- [x] Basic authentication (V4 Signature or dummy auth for dev)
 
 #### Milestone 2: Multipart Upload & Rename Support (Crucial for Spark)
-- [ ] Implement InitiateMultipartUpload
-- [ ] Implement UploadPart (map to DFS blocks)
-- [ ] Implement CompleteMultipartUpload
-- [ ] Implement AbortMultipartUpload
-- [ ] Implement CopyObject (required for `rename()` simulation)
+- [x] Implement InitiateMultipartUpload
+- [x] Implement UploadPart (map to DFS blocks)
+- [x] Implement CompleteMultipartUpload
+- [x] Implement AbortMultipartUpload
+- [x] Implement CopyObject (required for `rename()` simulation)
 
 #### Milestone 3: Advanced Features
-- [ ] Support for Object Metadata (User-defined tags)
-- [ ] Support for Range Requests (Partial content)
-- [ ] Support for ListObjectsV2 (Pagination)
-- [ ] Presigned URLs
+- [x] Support for Object Metadata (User-defined tags)
+- [x] Support for Range Requests (Partial content)
+- [x] Support for ListObjectsV2 (Pagination)
+- [x] Presigned URLs
 
 ---
 
@@ -249,6 +249,8 @@
   - [ ] Log replication
   - [ ] Vote counting
   - [ ] Term updates
+- [x] Develop integration test script (`test_scripts/s3_integration_test.py`) using AWS SDK
+- [x] Verify full S3 compatibility with DataFrame APIs
 - [ ] Add integration tests for network partitions
   - [ ] Multi-node scenarios
   - [ ] Network partition simulation

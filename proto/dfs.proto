@@ -9,6 +9,8 @@ service MasterService {
   rpc AllocateBlock (AllocateBlockRequest) returns (AllocateBlockResponse);
   rpc CompleteFile (CompleteFileRequest) returns (CompleteFileResponse);
   rpc ListFiles (ListFilesRequest) returns (ListFilesResponse);
+  rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+
 
   // Rename operation (supports cross-shard rename via Transaction Record)
   rpc Rename (RenameRequest) returns (RenameResponse);
@@ -112,6 +114,17 @@ message ListFilesRequest {
 message ListFilesResponse {
   repeated string files = 1;
 }
+
+message DeleteFileRequest {
+  string path = 1;
+}
+
+message DeleteFileResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
 
 message RegisterChunkServerRequest {
   string address = 1;
