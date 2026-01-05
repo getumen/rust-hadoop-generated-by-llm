@@ -13,7 +13,8 @@ Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Ra
 - ✅ **データ整合性**: Raftログレプリケーションによるメタデータの一貫性保証
 - ✅ **パイプラインレプリケーション**: 効率的なデータ複製
 - ✅ **gRPC通信**: 高性能な通信プロトコル
-- ✅ **Docker対応**: Docker Composeで簡単にクラスタ構築（シャーディング構成対応）
+- ✅ **S3互換API**: AWS CLI や Apache Spark からのアクセス、マルチパートアップロード対応
+- ✅ **Docker対応**: Docker Composeで簡単にクラスタ構築（シャーディング・S3構成対応）
 
 ## アーキテクチャ
 
@@ -59,6 +60,9 @@ docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 put 
 
 # ファイル操作 (Renameなど)
 docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 rename /uploaded.txt /renamed.txt
+
+# AWS CLIからの操作 (S3互換API経由)
+aws --endpoint-url http://localhost:9000 s3 ls s3://spark-test-bucket/
 ```
 
 ### ローカル開発 (シングルマスター構成)
@@ -101,6 +105,7 @@ cargo test -- --include-ignored
 | `transaction_abort_test.sh` | クロスシャード操作失敗時のロールバック（Abort）テスト      |
 | `fault_recovery_test.sh`    | トランザクション中のシャード障害からの復旧テスト           |
 | `chaos_test.sh`             | ChunkServerの障害などをシミュレートしたカオステスト        |
+| `run_spark_test.sh`         | S3互換API経由でのSpark (CSV/Parquet) 統合テスト            |
 
 
 ## プロジェクト構成
@@ -123,6 +128,7 @@ rust-hadoop/
 │       ├── src/bin/
 │       │   └── dfs_cli.rs     # CLIツール
 │       └── src/               # Clientライブラリ実装 (接続管理, ShardMapキャッシュ)
+├── s3_server/                 # S3互換APIゲートウェイ (Axumベース)
 ├── proto/
 │   └── dfs.proto              # gRPC定義
 ├── docker-compose.yml         # シャーディング構成用Docker Compose
@@ -155,9 +161,14 @@ rust-hadoop/
 
 ### ChunkServer RPC
 
-- `WriteBlock`: ブロック書き込み（パイプラインレプリケーション）
-- `ReadBlock`: ブロック読み込み
 - `ReplicateBlock`: レプリケーション受信
+
+### S3 API (REST)
+
+- `PutObject`, `GetObject`, `DeleteObject`, `HeadObject`, `CopyObject`
+- `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`
+- `CreateBucket`, `DeleteBucket`, `ListBuckets`
+- `DeleteObjects` (Multi-Object Delete)
 
 ## 技術スタック
 
@@ -176,6 +187,7 @@ MIT
 
 - [MASTER_HA.md](MASTER_HA.md) - Master HAとシャーディングの詳細
 - [REPLICATION.md](REPLICATION.md) - レプリケーション機能の詳細
+- [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) - S3互換APIとSpark統合の詳細
 - [CHAOS_TEST.md](CHAOS_TEST.md) - カオステストガイド
 - [Google File System](https://research.google.com/archive/gfs.html)
 - [Spanner: Google's Globally-Distributed Database](https://research.google.com/archive/spanner.html)
