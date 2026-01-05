@@ -330,6 +330,22 @@ impl Client {
         Ok(())
     }
 
+    pub async fn exists(
+        &self,
+        path: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let (info_resp, _) = self
+            .execute_rpc(Some(path), |mut client| {
+                let path = path.to_string();
+                async move {
+                    let info_req = tonic::Request::new(GetFileInfoRequest { path });
+                    client.get_file_info(info_req).await
+                }
+            })
+            .await?;
+        Ok(info_resp.into_inner().found)
+    }
+
     pub async fn delete_file(
         &self,
         path: &str,

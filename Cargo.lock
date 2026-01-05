@@ -1756,6 +1756,7 @@ dependencies = [
  "headers",
  "hex",
  "md-5",
+ "percent-encoding",
  "quick-xml",
  "serde",
  "serde_json",

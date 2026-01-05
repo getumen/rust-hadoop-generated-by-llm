@@ -206,7 +206,7 @@ mod tests {
 
         println!("Distribution with 5 shards and 100 vnodes:");
         for s in &shards {
-            let count = counts.get(&s.to_string()).unwrap_or(&0);
+            let count = counts.get(*s).unwrap_or(&0);
             let percentage = (*count as f64 / total_keys as f64) * 100.0;
             println!("{}: {} ({:.2}%)", s, count, percentage);
         }
@@ -214,7 +214,7 @@ mod tests {
         // Check if distribution is roughly uniform (e.g., within 20% deviation from ideal 20%)
         // Ideal is 20%. Allow 15% - 25%.
         for s in &shards {
-            let count = *counts.get(&s.to_string()).unwrap_or(&0);
+            let count = *counts.get(*s).unwrap_or(&0);
             let percentage = (count as f64 / total_keys as f64) * 100.0;
             assert!(
                 percentage > 15.0 && percentage < 25.0,
@@ -245,8 +245,8 @@ mod tests {
         // Add a new shard
         map.add_shard("shard-D".to_string(), vec![]);
 
-        let mut changed_count = 0;
-        let mut new_shard_count = 0;
+        let mut changed_count: i32 = 0;
+        let mut new_shard_count: i32 = 0;
 
         for (key, old_shard) in &key_mapping {
             let new_shard = map.get_shard(key).unwrap();
@@ -274,7 +274,7 @@ mod tests {
         // In pure consistent hashing, keys only move TO the new node.
         // However, due to hash collisions or vnode placement, slight variations might occur, but generally:
         // moved_keys should be approx equal to keys_on_new_shard
-        assert!((changed_count as i32 - new_shard_count as i32).abs() < (total_keys / 100) as i32);
+        assert!((changed_count - new_shard_count).abs() < total_keys / 100);
     }
 
     #[test]

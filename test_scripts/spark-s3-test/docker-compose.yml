@@ -15,7 +15,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: [ "/app/master", "--id", "1", "--addr", "0.0.0.0:50051", "--http-port", "8080", "--peers", "", "--storage-dir", "/data/raft", "--shard-config", "/app/shard_config.json", "--advertise-addr", "http://dfs-master1-shard1:50051" ]
+    command: [ "/app/master", "--id", "1", "--addr", "0.0.0.0:50051", "--http-port", "8080", "--peers", "", "--storage-dir", "/data/raft", "--shard-config", "/app/shard_config.json", "--advertise-addr", "http://dfs-master1-shard1:50051", "--shard-id", "shard-1" ]
     volumes:
       - master1-shard1-data:/data/raft
       - ../../shard_config.json:/app/shard_config.json:ro
@@ -29,7 +29,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: [ "/app/master", "--id", "1", "--addr", "0.0.0.0:50051", "--http-port", "8080", "--peers", "", "--storage-dir", "/data/raft", "--shard-config", "/app/shard_config.json", "--advertise-addr", "http://dfs-master1-shard2:50051" ]
+    command: [ "/app/master", "--id", "1", "--addr", "0.0.0.0:50051", "--http-port", "8080", "--peers", "", "--storage-dir", "/data/raft", "--shard-config", "/app/shard_config.json", "--advertise-addr", "http://dfs-master1-shard2:50051", "--shard-id", "shard-2" ]
     volumes:
       - master1-shard2-data:/data/raft
       - ../../shard_config.json:/app/shard_config.json:ro
@@ -43,7 +43,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--master-addr", "http://dfs-master1-shard1:50051", "--storage-dir", "/data/chunks" ]
+    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--master-addr", "dfs-master1-shard1:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "dfs-chunkserver1-shard1:50052" ]
     volumes:
       - cs1-shard1-data:/data/chunks
     depends_on:
@@ -58,7 +58,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--master-addr", "http://dfs-master1-shard2:50051", "--storage-dir", "/data/chunks" ]
+    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--master-addr", "dfs-master1-shard2:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "dfs-chunkserver1-shard2:50052" ]
     volumes:
       - cs1-shard2-data:/data/chunks
     depends_on:
@@ -121,6 +121,7 @@ services:
   # Spark Submit Job Runner
   spark-submit:
     image: apache/spark:3.5.3
+    user: root
     volumes:
       - ./spark_s3_test.py:/app/spark_s3_test.py:ro
     depends_on:
