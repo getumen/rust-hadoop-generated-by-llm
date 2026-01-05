@@ -152,8 +152,8 @@
 
 ---
 
-### 19. S3 REST API Compatibility
-**Status**: **In Progress**
+### 19. `S3 REST API Compatibility`
+**Status**: **Mostly Completed**
 **Priority**: Medium
 **Effort**: Very Large
 
@@ -182,13 +182,15 @@
 - [x] Implement UploadPart (map to DFS blocks)
 - [x] Implement CompleteMultipartUpload
 - [x] Implement AbortMultipartUpload
-- [x] Implement CopyObject (required for `rename()` simulation)
+- [x] Implement `CopyObject`
+- [x] Implement Multi-Object Delete (`POST /?delete`)
 
-#### Milestone 3: Advanced Features
+#### Milestone 3: Advanced Features & Compatibility Fixes
 - [x] Support for Object Metadata (User-defined tags)
 - [x] Support for Range Requests (Partial content)
 - [x] Support for ListObjectsV2 (Pagination)
-- [x] Presigned URLs
+- [x] Support for Directory Semantics (HeadObject on prefixes)
+- [ ] Presigned URLs
 
 ---
 

@@ -12,9 +12,9 @@ pip install -r test_scripts/requirements.txt
 
 # 2. Build and Start Cluster
 echo "Cleaning up old data..."
-docker-compose down -v
+docker-compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
 echo "Starting Cluster..."
-docker-compose up -d --build
+docker-compose -f test_scripts/spark-s3-test/docker-compose.yml up -d --build
 
 # 3. Wait for S3 Server
 echo "Waiting for S3 Server (port 9000)..."
@@ -32,7 +32,7 @@ done
 if [ $RETRIES -eq 0 ]; then
     echo "Error: S3 Server failed to start."
     docker-compose logs s3-server
-    docker-compose down -v
+    docker-compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
     exit 1
 fi
 
@@ -56,7 +56,7 @@ fi
 
 # 5. Cleanup
 echo "Stopping Cluster..."
-docker-compose down -v
+docker-compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
 
 # 6. Report/Exit
 if [ $EXIT_CODE -ne 0 ]; then

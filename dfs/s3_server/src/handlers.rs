@@ -1,5 +1,5 @@
 use crate::{s3_types::*, state::AppState as S3AppState};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -7,6 +7,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
+use md5::{Digest, Md5};
+use percent_encoding::percent_decode_str;
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
 use serde::Deserialize;
@@ -17,6 +19,7 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 pub struct S3Query {
     pub uploads: Option<String>,
+    pub delete: Option<String>,
     #[serde(rename = "uploadId")]
     pub upload_id: Option<String>,
     #[serde(rename = "partNumber")]
@@ -140,6 +143,9 @@ pub async fn handle_request(
         if params.uploads.is_some() && method == Method::POST {
             return initiate_multipart_upload(state, bucket, key).await;
         }
+        if params.delete.is_some() && method == Method::POST {
+            return delete_multiple_objects(state, bucket, body_bytes).await;
+        }
         if let Some(upload_id) = params.upload_id {
             if let Some(part_number) = params.part_number {
                 if method == Method::PUT {
@@ -209,7 +215,7 @@ async fn upload_part(
     match state.client.create_file(temp_file.path(), &part_path).await {
         Ok(_) => Response::builder()
             .status(StatusCode::OK)
-            .header("ETag", "\"000\"")
+            .header("ETag", "\"d41d8cd98f00b204e9800998ecf8427e\"")
             .body(Body::empty())
             .unwrap(),
         Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
@@ -308,32 +314,101 @@ async fn abort_multipart_upload(
     empty_response(StatusCode::NO_CONTENT)
 }
 
-async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -> Response {
-    // source format: "/bucket/key" or "bucket/key"
-    let source = if source.starts_with('/') {
-        source.to_string()
-    } else {
-        format!("/{}", source)
+async fn delete_multiple_objects(state: S3AppState, bucket: &str, body: Bytes) -> Response {
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return empty_response(StatusCode::BAD_REQUEST),
     };
+
+    let req: DeleteObjectsRequest = match from_str(body_str) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to parse DeleteObjects request: {}", e);
+            return empty_response(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    for obj in req.objects {
+        let path = format!("/{}/{}", bucket, obj.key);
+        match state.client.delete_file(&path).await {
+            Ok(_) => {
+                deleted.push(DeletedObject { key: obj.key });
+            }
+            Err(e) => {
+                if e.to_string().contains("not found") || e.to_string().contains("File not found") {
+                    // S3: deleting non-existent object is a success
+                    deleted.push(DeletedObject { key: obj.key });
+                } else {
+                    errors.push(DeleteError {
+                        key: obj.key,
+                        code: "InternalError".into(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let result = DeleteObjectsResult { deleted, errors };
+
+    match to_string(&result) {
+        Ok(xml) => xml_response(StatusCode::OK, xml),
+        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -> Response {
     let dest = format!("/{}/{}", bucket, key);
+    // source can be URL encoded.
+    let decoded_source = percent_decode_str(source).decode_utf8_lossy().to_string();
+    let source_path = if decoded_source.starts_with('/') {
+        decoded_source
+    } else {
+        format!("/{}", decoded_source)
+    };
+
+    tracing::info!("CopyObject: source={} -> dest={}", source_path, dest);
 
     // Naive copy: Download to temp, upload to dest
     let temp_dir = std::env::temp_dir();
     let temp_path = temp_dir.join(Uuid::new_v4().to_string());
 
-    if state.client.get_file(&source, &temp_path).await.is_err() {
+    if let Err(e) = state.client.get_file(&source_path, &temp_path).await {
+        tracing::error!(
+            "CopyObject: Failed to download source {}: {}",
+            source_path,
+            e
+        );
         return empty_response(StatusCode::NOT_FOUND);
     }
 
-    if state.client.create_file(&temp_path, &dest).await.is_err() {
+    if let Err(e) = state.client.create_file(&temp_path, &dest).await {
+        tracing::error!("CopyObject: Failed to upload to {}: {}", dest, e);
         let _ = std::fs::remove_file(temp_path);
         return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
     let _ = std::fs::remove_file(temp_path);
 
+    // Copy metadata if exists
+    let meta_source = format!("{}.meta", source_path);
+    let meta_dest = format!("{}.meta", dest);
+    let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
+    if state
+        .client
+        .get_file(&meta_source, &meta_temp)
+        .await
+        .is_ok()
+    {
+        let _ = state.client.create_file(&meta_temp, &meta_dest).await;
+        let _ = std::fs::remove_file(meta_temp);
+    }
+
     let result = CopyObjectResult {
         last_modified: "2025-01-01T00:00:00.000Z".into(),
-        etag: "\"000\"".into(),
+        etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
     };
 
     match to_string(&result) {
@@ -500,7 +575,7 @@ async fn list_objects(state: S3AppState, bucket: &str, params: S3Query) -> Respo
                 objects.push(Object {
                     key,
                     last_modified: "2025-01-01T00:00:00.000Z".into(),
-                    etag: "\"000\"".into(),
+                    etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
                     size: 0,
                     storage_class: "STANDARD".into(),
                     owner: Owner {
@@ -575,10 +650,14 @@ async fn put_object(
         return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
     let temp_path = temp_file.path();
+    let etag = format!("\"{:x}\"", Md5::digest(&body));
+    tracing::info!("PutObject: key={}, size={}, etag={}", key, body.len(), etag);
+
     match state.client.create_file(temp_path, &dest_path).await {
         Ok(_) => {
             // Metadata handling
             let mut meta_map = std::collections::HashMap::new();
+            meta_map.insert("ETag".to_string(), etag.clone());
             for (k, v) in headers.iter() {
                 let k_str = k.as_str();
                 if k_str.starts_with("x-amz-meta-") {
@@ -596,11 +675,45 @@ async fn put_object(
                     let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
                 }
             }
-            empty_response(StatusCode::OK)
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, etag)
+                .body(Body::empty())
+                .unwrap()
         }
         Err(e) => {
-            tracing::error!("PutObject failed: {}", e);
-            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            if e.to_string().contains("already exists") {
+                // S3 semantics: overwrite. Delete and retry.
+                tracing::info!("File {} exists, deleting for overwrite", dest_path);
+                let _ = state.client.delete_file(&dest_path).await;
+                match state.client.create_file(temp_path, &dest_path).await {
+                    Ok(_) => {
+                        // Re-save metadata on retry
+                        let mut meta_map = std::collections::HashMap::new();
+                        meta_map.insert("ETag".to_string(), etag.clone());
+                        let metadata = Metadata { headers: meta_map };
+                        if let Ok(json) = serde_json::to_string(&metadata) {
+                            let meta_path = format!("{}.meta", dest_path);
+                            let mut meta_temp = NamedTempFile::new().unwrap();
+                            let _ = meta_temp.write_all(json.as_bytes());
+                            let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
+                        }
+
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(ETAG, etag)
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                    Err(e2) => {
+                        tracing::error!("PutObject retry failed: {}", e2);
+                        empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+                    }
+                }
+            } else {
+                tracing::error!("PutObject failed: {}", e);
+                empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
     }
 }
@@ -622,11 +735,16 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
     let meta_path = format!("{}.meta", full_path);
     let temp_dir = std::env::temp_dir();
     let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
+    let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(); // Default ETag
+
     // Try download meta
     if state.client.get_file(&meta_path, &meta_temp).await.is_ok() {
         if let Ok(content) = std::fs::read_to_string(&meta_temp) {
             if let Ok(metadata) = serde_json::from_str::<Metadata>(&content) {
                 for (k, v) in metadata.headers {
+                    if k == "ETag" {
+                        etag = v.clone();
+                    }
                     if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
                         if let Ok(name) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
                             response_headers.insert(name, val);
@@ -699,7 +817,11 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
         }
 
         let mut resp_builder = Response::builder().status(status);
-        *resp_builder.headers_mut().unwrap() = response_headers;
+        {
+            let headers_map = resp_builder.headers_mut().unwrap();
+            *headers_map = response_headers;
+            headers_map.insert(ETAG, etag.parse().unwrap());
+        }
         return resp_builder.body(Body::from(body_bytes)).unwrap();
     }
 
@@ -752,7 +874,11 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
             let _ = std::fs::remove_file(dest_path);
 
             let mut resp_builder = Response::builder().status(status);
-            *resp_builder.headers_mut().unwrap() = response_headers;
+            {
+                let headers_map = resp_builder.headers_mut().unwrap();
+                *headers_map = response_headers;
+                headers_map.insert(ETAG, etag.parse().unwrap());
+            }
             resp_builder.body(Body::from(data)).unwrap()
         }
         Err(e) => {
@@ -775,41 +901,69 @@ async fn delete_object(state: S3AppState, bucket: &str, key: &str) -> Response {
 
 async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
     let path = format!("/{}/{}", bucket, key);
-    match state.client.list_files("/").await {
-        Ok(files) => {
-            if files.contains(&path) {
-                // Try to get metadata
-                let meta_path = format!("{}.meta", path);
-                let temp_dir = std::env::temp_dir();
-                let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
-                let mut response = Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Body::empty())
-                    .unwrap();
+    match state.client.exists(&path).await {
+        Ok(true) => {
+            // Try to get metadata
+            let meta_path = format!("{}.meta", path);
+            let temp_dir = std::env::temp_dir();
+            let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
+            let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(); // Default ETag
 
-                if state.client.get_file(&meta_path, &meta_temp).await.is_ok() {
-                    if let Ok(content) = std::fs::read_to_string(&meta_temp) {
-                        if let Ok(metadata) = serde_json::from_str::<Metadata>(&content) {
-                            let headers_map = response.headers_mut();
-                            for (k, v) in metadata.headers {
-                                if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
-                                    if let Ok(name) =
-                                        axum::http::HeaderName::from_bytes(k.as_bytes())
-                                    {
-                                        headers_map.insert(name, val);
-                                    }
+            if state.client.get_file(&meta_path, &meta_temp).await.is_ok() {
+                if let Ok(content) = std::fs::read_to_string(&meta_temp) {
+                    if let Ok(metadata) = serde_json::from_str::<Metadata>(&content) {
+                        for (k, v) in metadata.headers.clone() {
+                            if k == "ETag" {
+                                etag = v.clone();
+                            }
+                        }
+                        let mut response = Response::builder()
+                            .status(StatusCode::OK)
+                            .header(ETAG, etag)
+                            .body(Body::empty())
+                            .unwrap();
+                        let headers_map = response.headers_mut();
+                        for (k, v) in metadata.headers {
+                            if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
+                                if let Ok(name) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
+                                    headers_map.insert(name, val);
                                 }
                             }
                         }
+                        let _ = std::fs::remove_file(meta_temp);
+                        return response;
                     }
-                    let _ = std::fs::remove_file(meta_temp);
                 }
-                response
+                let _ = std::fs::remove_file(meta_temp);
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, etag)
+                .body(Body::empty())
+                .unwrap()
+        }
+        Ok(false) => {
+            // Only return 200 for "directory" if the path ends with /
+            if path.ends_with('/') {
+                match state.client.list_files(&path).await {
+                    Ok(files) if !files.is_empty() => {
+                        tracing::info!("HeadObject: Directory marker (implicit) for {}", path);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_LENGTH, "0")
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                    _ => empty_response(StatusCode::NOT_FOUND),
+                }
             } else {
                 empty_response(StatusCode::NOT_FOUND)
             }
         }
-        Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(e) => {
+            tracing::error!("HeadObject failed: {}", e);
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -924,7 +1078,7 @@ async fn list_objects_v2(state: S3AppState, bucket: &str, params: S3Query) -> Re
                 objects.push(Object {
                     key: key.clone(),
                     last_modified: "2025-01-01T00:00:00.000Z".into(),
-                    etag: "\"000\"".into(),
+                    etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
                     size: 0,
                     storage_class: "STANDARD".into(),
                     owner: Owner {

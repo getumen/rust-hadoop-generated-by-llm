@@ -166,3 +166,47 @@ pub struct ListBucketResultV2 {
 pub struct Metadata {
     pub headers: std::collections::HashMap<String, String>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Delete")]
+pub struct DeleteObjectsRequest {
+    #[serde(rename = "Object")]
+    pub objects: Vec<ObjectToDelete>,
+    #[serde(rename = "Quiet", default)]
+    #[allow(dead_code)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ObjectToDelete {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "VersionId")]
+    #[allow(dead_code)]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "DeleteResult")]
+pub struct DeleteObjectsResult {
+    #[serde(rename = "Deleted")]
+    pub deleted: Vec<DeletedObject>,
+    #[serde(rename = "Error")]
+    pub errors: Vec<DeleteError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeletedObject {
+    #[serde(rename = "Key")]
+    pub key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteError {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "Code")]
+    pub code: String,
+    #[serde(rename = "Message")]
+    pub message: String,
+}

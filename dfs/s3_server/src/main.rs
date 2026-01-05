@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod handler_tests;
 mod handlers;
 mod s3_types;
 mod state;
