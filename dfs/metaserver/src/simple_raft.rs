@@ -839,8 +839,6 @@ impl RaftNode {
         if let Err(e) = self.save_log_entry(absolute_index, &entry) {
             tracing::error!("Failed to save log entry in become_leader: {:?}", e);
         }
-        self.match_index[self.id] = absolute_index;
-
         // For single-node clusters, immediately commit everything in the log upon becoming leader.
         if self.peers.is_empty() && absolute_index > self.commit_index {
             tracing::info!(
@@ -1034,8 +1032,14 @@ impl RaftNode {
 
                 // Leader appends entry, but does not immediately commit it.
                 // It will be committed once replicated to a majority.
-                // For now, just update match_index for self.
-                self.match_index[self.id] = absolute_index;
+                // The commit index advancement is handled after sending heartbeats
+                // or in the AppendEntriesResponse handler.
+
+                // For single-node clusters, we advance commit_index immediately.
+                if self.peers.is_empty() && absolute_index > self.commit_index {
+                    self.commit_index = absolute_index;
+                    self.apply_logs();
+                }
 
                 // The original code had `self.commit_index = absolute_index; self.apply_logs();` here.
                 // This is incorrect for a multi-node cluster as it commits before replication.
@@ -1076,16 +1080,25 @@ impl RaftNode {
                 let mut acks = HashSet::new();
                 acks.insert(self.id); // Acknowledge self
 
+                let total_nodes = self.peers.len() + 1;
+                let majority_confirmed = acks.len() > total_nodes / 2;
+
                 self.pending_read_indices.push(ReadIndexRequest {
                     read_index: self.commit_index,
                     term: self.current_term,
                     acks,
-                    majority_confirmed: false,
+                    majority_confirmed,
                     reply_tx,
                 });
 
-                // Trigger heartbeats immediately to speed up ReadIndex
-                self.send_heartbeats().await?;
+                if majority_confirmed {
+                    self.check_read_indices();
+                }
+
+                // Trigger heartbeats immediately to speed up ReadIndex (for multi-node clusters)
+                if !self.peers.is_empty() {
+                    self.send_heartbeats().await?;
+                }
             }
         }
         Ok(())
@@ -1402,9 +1415,14 @@ impl RaftNode {
                     }
 
                     // Check for commit_index advancement
-                    let mut sorted_match_indices = self.match_index.clone();
-                    sorted_match_indices.sort_unstable();
-                    let majority_match_index = sorted_match_indices[self.peers.len() / 2];
+                    // Include leader's own match index (which is absolute_index)
+                    let mut all_match_indices = self.match_index.clone();
+                    let absolute_index = self.log.len() - 1 + self.last_included_index;
+                    all_match_indices.push(absolute_index);
+                    all_match_indices.sort_unstable();
+
+                    let total_nodes = self.peers.len() + 1;
+                    let majority_match_index = all_match_indices[total_nodes / 2];
 
                     if majority_match_index > self.commit_index {
                         // Only commit if the entry is from the current term
