@@ -14,6 +14,9 @@ struct Cli {
     #[arg(short, long, default_value = "http://127.0.0.1:50051")]
     master: String,
 
+    #[arg(long, value_delimiter = ',')]
+    config_servers: Vec<String>,
+
     #[arg(long, default_value_t = 5)]
     max_retries: usize,
 
@@ -100,8 +103,8 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| s.trim().to_string())
         .collect();
 
-    let client =
-        Client::new(master_addrs).with_retry_config(cli.max_retries, cli.initial_backoff_ms);
+    let client = Client::new(master_addrs, cli.config_servers)
+        .with_retry_config(cli.max_retries, cli.initial_backoff_ms);
 
     match cli.command {
         Commands::Ls => {

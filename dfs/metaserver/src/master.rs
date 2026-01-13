@@ -341,12 +341,75 @@ impl MasterState {
 
 use crate::sharding::{ShardId, ShardMap};
 
+// ============================================================================
+// Throughput Monitoring for Dynamic Sharding
+// ============================================================================
+
+#[derive(Debug, Default, Clone)]
+pub struct PrefixMetrics {
+    pub rps: f64,
+    pub bps: f64,
+    pub last_count: u64,
+    pub last_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct ThroughputMonitor {
+    pub metrics: Mutex<HashMap<String, PrefixMetrics>>,
+}
+
+impl ThroughputMonitor {
+    pub fn new() -> Self {
+        Self {
+            metrics: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn record_request(&self, path: &str, bytes: u64) {
+        let prefix = self.get_path_prefix(path);
+        let mut metrics = self.metrics.lock().expect("Mutex poisoned");
+        let entry = metrics.entry(prefix).or_default();
+        entry.last_count += 1;
+        entry.last_bytes += bytes;
+    }
+
+    fn get_path_prefix(&self, path: &str) -> String {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() > 2 {
+            // e.g., /bucket/folder/file -> /bucket/folder/
+            format!("/{}/{}/", parts[1], parts[2])
+        } else if parts.len() > 1 {
+            // e.g., /bucket/file -> /bucket/
+            format!("/{}/", parts[1])
+        } else {
+            "/".to_string()
+        }
+    }
+
+    pub fn decay_metrics(&self) {
+        let mut metrics = self.metrics.lock().expect("Mutex poisoned");
+        for m in metrics.values_mut() {
+            // Simple exponential moving average (EMA)
+            // rps = last_count / interval (we assume 5s interval for now)
+            let current_rps = m.last_count as f64 / 5.0;
+            let current_bps = m.last_bytes as f64 / 5.0;
+
+            m.rps = m.rps * 0.7 + current_rps * 0.3;
+            m.bps = m.bps * 0.7 + current_bps * 0.3;
+
+            m.last_count = 0;
+            m.last_bytes = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct MyMaster {
     state: Arc<Mutex<AppState>>,
     raft_tx: mpsc::Sender<Event>,
     shard_map: Arc<Mutex<ShardMap>>,
     shard_id: ShardId,
+    monitor: Arc<ThroughputMonitor>,
 }
 
 impl MyMaster {
@@ -355,6 +418,7 @@ impl MyMaster {
         raft_tx: mpsc::Sender<Event>,
         shard_map: Arc<Mutex<ShardMap>>,
         shard_id: ShardId,
+        config_server_addrs: Vec<String>,
     ) -> Self {
         // Spawn liveness check loop
         let state_clone = state.clone();
@@ -530,11 +594,122 @@ impl MyMaster {
             }
         });
 
+        let monitor = Arc::new(ThroughputMonitor::new());
+
+        // Spawn metrics decay task
+        let monitor_clone = monitor.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                monitor_clone.decay_metrics();
+            }
+        });
+
+        // Spawn split detection task
+        let monitor_clone_split = monitor.clone();
+        let raft_tx_split = raft_tx.clone();
+        let shard_id_split = shard_id.clone();
+        let config_server_addrs_task = config_server_addrs.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let hot_prefix = {
+                    let metrics = monitor_clone_split.metrics.lock().expect("Mutex poisoned");
+                    metrics
+                        .iter()
+                        .find(|(_, m)| m.rps > 100.0)
+                        .map(|(p, m)| (p.clone(), m.rps))
+                };
+
+                if let Some((prefix, rps)) = hot_prefix {
+                    tracing::warn!(
+                        "Hot prefix detected: {} (RPS={:.2}). Triggering shard split...",
+                        prefix,
+                        rps
+                    );
+
+                    // Propose SplitShard command
+                    let new_shard_id = format!(
+                        "{}-split-{}",
+                        shard_id_split,
+                        Uuid::new_v4().to_string().split('-').next().unwrap()
+                    );
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let split_cmd = MasterCommand::SplitShard {
+                        split_key: prefix.clone(),
+                        new_shard_id: new_shard_id.clone(),
+                        new_shard_peers: vec![], // In real world, we'd need to allocate peers
+                    };
+
+                    if let Err(e) = raft_tx_split
+                        .send(Event::ClientRequest {
+                            command: Command::Master(split_cmd),
+                            reply_tx: tx,
+                        })
+                        .await
+                    {
+                        tracing::error!("Failed to send split command to Raft: {}", e);
+                        continue;
+                    }
+
+                    match rx.await {
+                        Ok(Ok(_)) => {
+                            tracing::info!(
+                                "Successfully split shard {} at prefix {}",
+                                shard_id_split,
+                                prefix
+                            );
+
+                            // Notify Config Server
+                            let config_addrs = config_server_addrs_task.clone();
+                            let prefix_report = prefix.clone();
+                            let shard_id_report = shard_id_split.clone();
+                            let new_shard_report = new_shard_id.clone();
+                            tokio::spawn(async move {
+                                for config_addr in config_addrs {
+                                    use crate::dfs::config_service_client::ConfigServiceClient;
+                                    if let Ok(mut client) = ConfigServiceClient::connect(format!(
+                                        "http://{}",
+                                        config_addr
+                                    ))
+                                    .await
+                                    {
+                                        let split_req = crate::dfs::SplitShardRequest {
+                                            shard_id: shard_id_report.clone(),
+                                            split_key: prefix_report.clone(),
+                                            new_shard_id: new_shard_report.clone(),
+                                            new_shard_peers: vec![],
+                                        };
+                                        if let Ok(resp) = client.split_shard(split_req).await {
+                                            if resp.into_inner().success {
+                                                tracing::info!(
+                                                    "Config server {} updated with new shard split",
+                                                    config_addr
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Err(hint)) => {
+                            tracing::warn!("Failed to split shard (not leader). Hint: {:?}", hint)
+                        }
+                        Err(_) => tracing::error!("Raft response error during split"),
+                    }
+                }
+            }
+        });
+
         MyMaster {
             state,
             raft_tx,
             shard_map,
             shard_id,
+            monitor,
         }
     }
 
@@ -604,6 +779,7 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
 
+            self.monitor.record_request(&req.path, 0); // Read request, 0 bytes for metadata
             self.check_shard_ownership(&req.path)?;
             self.ensure_linearizable_read().await?;
 
@@ -635,6 +811,7 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "create_file");
         async move {
             let req = request.into_inner();
+            self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
@@ -690,6 +867,7 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "delete_file");
         async move {
             let req = request.into_inner();
+            self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
@@ -749,6 +927,7 @@ impl MasterService for MyMaster {
             // Replication factor (default: 3)
             const REPLICATION_FACTOR: usize = 3;
 
+            self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
@@ -1004,6 +1183,7 @@ impl MasterService for MyMaster {
             let source_path = req.source_path;
             let dest_path = req.dest_path;
 
+            self.monitor.record_request(&source_path, 0);
             // Check source shard ownership
             self.check_shard_ownership(&source_path)?;
             self.check_safe_mode()?;

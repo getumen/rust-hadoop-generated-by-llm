@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -5,38 +6,68 @@ use std::hash::{Hash, Hasher};
 /// ShardId is a unique identifier for a Raft Group (Shard).
 pub type ShardId = String;
 
-use serde::{Deserialize, Serialize};
+/// Helper to compute hash of a string key.
+fn hash_key(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
 
-/// ShardMap manages the mapping between keys and Shards using Consistent Hashing.
-/// It uses Virtual Nodes to ensure even distribution of load.
+/// ShardingStrategy defines how keys are mapped to Shards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShardingStrategy {
+    /// Consistent Hashing (current static implementation)
+    ConsistentHash {
+        /// The hash ring mapping hash values to ShardIds.
+        ring: BTreeMap<u64, ShardId>,
+        /// Number of virtual nodes per physical shard.
+        virtual_nodes: usize,
+    },
+    /// Range-based Partitioning (S3/Colossus style)
+    Range {
+        /// Map of range-end (exclusive) to ShardId.
+        /// The last entry typically has an empty string or a very high value as the key.
+        /// We use lexicographical order for prefix locality.
+        ranges: BTreeMap<String, ShardId>,
+    },
+}
+
+/// ShardMap manages the mapping between keys and Shards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardMap {
-    /// The hash ring mapping hash values to ShardIds.
-    /// We use BTreeMap to keep keys sorted for efficient lookup.
-    ring: BTreeMap<u64, ShardId>,
+    /// The sharding strategy being used.
+    pub strategy: ShardingStrategy,
     /// Set of active ShardIds.
     shards: HashSet<ShardId>,
     /// Map of ShardId to list of peer addresses.
     shard_peers: HashMap<ShardId, Vec<String>>,
-    /// Number of virtual nodes per physical shard.
-    virtual_nodes: usize,
 }
 
 impl ShardMap {
-    /// Create a new empty ShardMap with a specified number of virtual nodes.
-    /// A higher number of virtual nodes provides better load balancing but uses more memory.
-    /// Recommended value: 100-200.
-    pub fn new(virtual_nodes: usize) -> Self {
+    /// Create a new ShardMap using Consistent Hashing.
+    pub fn new_consistent_hash(virtual_nodes: usize) -> Self {
         Self {
-            ring: BTreeMap::new(),
+            strategy: ShardingStrategy::ConsistentHash {
+                ring: BTreeMap::new(),
+                virtual_nodes,
+            },
             shards: HashSet::new(),
             shard_peers: HashMap::new(),
-            virtual_nodes,
         }
     }
 
-    /// Add a new Shard to the ring with its peers.
-    /// This creates `virtual_nodes` entries in the ring for the shard.
+    /// Create a new ShardMap using Range-based Partitioning.
+    pub fn new_range() -> Self {
+        Self {
+            strategy: ShardingStrategy::Range {
+                ranges: BTreeMap::new(),
+            },
+            shards: HashSet::new(),
+            shard_peers: HashMap::new(),
+        }
+    }
+
+    /// Add a new Shard to the map with its peers.
     pub fn add_shard(&mut self, shard_id: ShardId, peers: Vec<String>) {
         if self.shards.contains(&shard_id) {
             return;
@@ -44,13 +75,31 @@ impl ShardMap {
         self.shards.insert(shard_id.clone());
         self.shard_peers.insert(shard_id.clone(), peers);
 
-        for i in 0..self.virtual_nodes {
-            let hash = self.hash_key(&format!("{}:{}", shard_id, i));
-            self.ring.insert(hash, shard_id.clone());
+        match &mut self.strategy {
+            ShardingStrategy::ConsistentHash {
+                ring,
+                virtual_nodes,
+            } => {
+                for i in 0..*virtual_nodes {
+                    let hash = hash_key(&format!("{}:{}", shard_id, i));
+                    ring.insert(hash, shard_id.clone());
+                }
+            }
+            ShardingStrategy::Range { ranges } => {
+                // For a new range shard, we need a split point.
+                // If it's the first shard, it covers everything.
+                if ranges.is_empty() {
+                    ranges.insert("\u{10FFFF}".to_string(), shard_id);
+                } else {
+                    // In dynamic sharding, add_shard for Range usually happens via a split operation.
+                    // For static config, we'll just append it for now (this needs refinement).
+                    ranges.insert(format!("z-{}", shard_id), shard_id);
+                }
+            }
         }
     }
 
-    /// Remove a Shard from the ring.
+    /// Remove a Shard from the map.
     pub fn remove_shard(&mut self, shard_id: &ShardId) {
         if !self.shards.contains(shard_id) {
             return;
@@ -58,37 +107,91 @@ impl ShardMap {
         self.shards.remove(shard_id);
         self.shard_peers.remove(shard_id);
 
-        // Remove all virtual nodes associated with this shard
-        // Note: This is O(N) where N is ring size. Could be optimized if we tracked keys per shard.
-        let keys_to_remove: Vec<u64> = self
-            .ring
-            .iter()
-            .filter(|(_, sid)| *sid == shard_id)
-            .map(|(k, _)| *k)
-            .collect();
+        match &mut self.strategy {
+            ShardingStrategy::ConsistentHash { ring, .. } => {
+                let keys_to_remove: Vec<u64> = ring
+                    .iter()
+                    .filter(|(_, sid)| *sid == shard_id)
+                    .map(|(k, _)| *k)
+                    .collect();
 
-        for k in keys_to_remove {
-            self.ring.remove(&k);
+                for k in keys_to_remove {
+                    ring.remove(&k);
+                }
+            }
+            ShardingStrategy::Range { ranges } => {
+                let keys_to_remove: Vec<String> = ranges
+                    .iter()
+                    .filter(|(_, sid)| *sid == shard_id)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+
+                for k in keys_to_remove {
+                    ranges.remove(&k);
+                }
+            }
         }
     }
 
     /// Get the Shard responsible for the given key (e.g., file path).
     pub fn get_shard(&self, key: &str) -> Option<ShardId> {
-        if self.ring.is_empty() {
-            return None;
+        match &self.strategy {
+            ShardingStrategy::ConsistentHash { ring, .. } => {
+                if ring.is_empty() {
+                    return None;
+                }
+                let hash = hash_key(key);
+                let entry = ring.range(hash..).next().or_else(|| ring.iter().next());
+                entry.map(|(_, shard_id)| shard_id.clone())
+            }
+            ShardingStrategy::Range { ranges } => {
+                if ranges.is_empty() {
+                    return None;
+                }
+                // Find the first entry with a key (end-range) > key
+                // Since we use exclusive end, we want the first range-end that is >= key
+                let entry = ranges.range(key.to_string()..).next();
+                entry.map(|(_, shard_id)| shard_id.clone())
+            }
         }
+    }
 
-        let hash = self.hash_key(key);
+    /// Add a split point for Range sharding.
+    pub fn split_shard(
+        &mut self,
+        split_key: String,
+        new_shard_id: ShardId,
+        peers: Vec<String>,
+    ) -> bool {
+        if let ShardingStrategy::Range { ranges } = &mut self.strategy {
+            if self.shards.contains(&new_shard_id) {
+                return false;
+            }
 
-        // Find the first entry with a key >= hash
-        // If not found (end of ring), wrap around to the first entry
-        let entry = self
-            .ring
-            .range(hash..)
-            .next()
-            .or_else(|| self.ring.iter().next());
+            // Find the shard that currently contains the split_key
+            if let Some(old_shard_end) = ranges
+                .range(split_key.clone()..)
+                .next()
+                .map(|(k, _)| k.clone())
+            {
+                let _old_shard_id = ranges.get(&old_shard_end).unwrap().clone();
 
-        entry.map(|(_, shard_id)| shard_id.clone())
+                // Insert the new split point.
+                // The new shard will cover [previous_end, split_key)
+                // The old shard will cover [split_key, old_shard_end)
+                // Actually, if we want [ ..., split_key) -> new_shard, we insert (split_key, new_shard)
+                ranges.insert(split_key, new_shard_id.clone());
+                self.shards.insert(new_shard_id.clone());
+                self.shard_peers.insert(new_shard_id, peers);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all registered shards
+    pub fn get_all_shards(&self) -> Vec<ShardId> {
+        self.shards.iter().cloned().collect()
     }
 
     /// Get peers for a specific shard.
@@ -96,16 +199,9 @@ impl ShardMap {
         self.shard_peers.get(shard_id).cloned()
     }
 
-    /// Helper to compute hash of a string key.
-    fn hash_key(&self, key: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Get all registered shards
-    pub fn get_all_shards(&self) -> Vec<ShardId> {
-        self.shards.iter().cloned().collect()
+    /// Create a new ShardMap with a default configuration (Consistent Hashing for backward compatibility).
+    pub fn new(virtual_nodes: usize) -> Self {
+        Self::new_consistent_hash(virtual_nodes)
     }
 }
 
@@ -310,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_consistent_hashing_stability() {
-        let mut map = ShardMap::new(100);
+        let mut map = ShardMap::new_consistent_hash(100);
         map.add_shard("shard-A".to_string(), vec![]);
         map.add_shard("shard-B".to_string(), vec![]);
 
@@ -321,10 +417,45 @@ mod tests {
         assert_eq!(shard1, map.get_shard(key).unwrap());
 
         // New map, same configuration -> same result
-        let mut map2 = ShardMap::new(100);
+        let mut map2 = ShardMap::new_consistent_hash(100);
         map2.add_shard("shard-A".to_string(), vec![]);
         map2.add_shard("shard-B".to_string(), vec![]);
 
         assert_eq!(shard1, map2.get_shard(key).unwrap());
+    }
+
+    #[test]
+    fn test_range_sharding() {
+        let mut map = ShardMap::new_range();
+        // Initial shard covers everything up to max char
+        map.add_shard("shard-0".to_string(), vec![]);
+
+        // Split at "m" -> shard-1 takes ["", "m"), shard-0 remains as ["m", max)
+        map.split_shard("m".to_string(), "shard-1".to_string(), vec![]);
+
+        // Split at "t" -> shard-2 takes ["m", "t"), shard-0 remains as ["t", max)
+        map.split_shard("t".to_string(), "shard-2".to_string(), vec![]);
+
+        assert_eq!(map.get_shard("apple").unwrap(), "shard-1");
+        assert_eq!(map.get_shard("banana").unwrap(), "shard-1");
+        assert_eq!(map.get_shard("mango").unwrap(), "shard-2");
+        assert_eq!(map.get_shard("orange").unwrap(), "shard-2");
+        assert_eq!(map.get_shard("zebra").unwrap(), "shard-0");
+    }
+
+    #[test]
+    fn test_prefix_locality() {
+        let mut map = ShardMap::new_range();
+        map.add_shard("shard-initial".to_string(), vec![]);
+
+        // Ensure "user1/" and "user2/" go to different shards
+        map.split_shard("user2/".to_string(), "shard-user1".to_string(), vec![]);
+        map.split_shard("user3/".to_string(), "shard-user2".to_string(), vec![]);
+
+        assert_eq!(map.get_shard("user1/file1").unwrap(), "shard-user1");
+        assert_eq!(map.get_shard("user1/file2").unwrap(), "shard-user1");
+        assert_eq!(map.get_shard("user2/file1").unwrap(), "shard-user2");
+        assert_eq!(map.get_shard("user2/file2").unwrap(), "shard-user2");
+        assert_eq!(map.get_shard("user3/file1").unwrap(), "shard-initial");
     }
 }

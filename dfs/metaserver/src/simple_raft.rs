@@ -126,6 +126,12 @@ pub enum MasterCommand {
     DeleteTransactionRecord {
         tx_id: String,
     },
+    /// Split current shard into two at the given split point (lexicographical).
+    SplitShard {
+        split_key: String,
+        new_shard_id: String,
+        new_shard_peers: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +142,12 @@ pub enum ConfigCommand {
     },
     RemoveShard {
         shard_id: String,
+    },
+    SplitShard {
+        shard_id: String,
+        split_key: String,
+        new_shard_id: String,
+        new_shard_peers: Vec<String>,
     },
 }
 
@@ -1761,6 +1773,31 @@ impl RaftNode {
                                 );
                             }
                         }
+                        MasterCommand::SplitShard {
+                            split_key,
+                            new_shard_id,
+                            new_shard_peers: _,
+                        } => {
+                            // Collect files that belong to the new shard (lexicographical >= split_key)
+                            let to_move: Vec<String> = master_state
+                                .files
+                                .keys()
+                                .filter(|k| **k >= *split_key)
+                                .cloned()
+                                .collect();
+
+                            let count = to_move.len();
+                            for path in to_move {
+                                master_state.files.remove(&path);
+                            }
+
+                            tracing::info!(
+                                "Shard split at {}: removed {} files to new shard {}",
+                                split_key,
+                                count,
+                                new_shard_id
+                            );
+                        }
                     }
                 } else {
                     tracing::error!("Error: Received MasterCommand but state is not MasterState");
@@ -1774,6 +1811,18 @@ impl RaftNode {
                         }
                         ConfigCommand::RemoveShard { shard_id } => {
                             shard_map.remove_shard(shard_id);
+                        }
+                        ConfigCommand::SplitShard {
+                            shard_id: _,
+                            split_key,
+                            new_shard_id,
+                            new_shard_peers,
+                        } => {
+                            shard_map.split_shard(
+                                split_key.clone(),
+                                new_shard_id.clone(),
+                                new_shard_peers.clone(),
+                            );
                         }
                     }
                 } else {

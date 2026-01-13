@@ -28,18 +28,19 @@ pub struct Client {
     master_addrs: Vec<String>,
     shard_map: Arc<RwLock<ShardMap>>,
     host_aliases: Arc<RwLock<HashMap<String, String>>>,
+    config_server_addrs: Vec<String>,
     max_retries: usize,
     initial_backoff_ms: u64,
 }
 
 impl Client {
-    pub fn new(master_addrs: Vec<String>) -> Self {
+    pub fn new(master_addrs: Vec<String>, config_server_addrs: Vec<String>) -> Self {
         // Initialize with default (empty) ShardMap.
-        // In a real scenario, we would fetch this from a Config Server.
         Self {
             master_addrs,
             shard_map: Arc::new(RwLock::new(ShardMap::new(100))),
             host_aliases: Arc::new(RwLock::new(HashMap::new())),
+            config_server_addrs,
             max_retries: MAX_RETRIES,
             initial_backoff_ms: INITIAL_BACKOFF_MS,
         }
@@ -537,7 +538,16 @@ impl Client {
                             let parts: Vec<&str> = msg.splitn(2, ':').collect();
                             if parts.len() > 1 && !parts[1].is_empty() {
                                 leader_hint = Some(parts[1].to_string());
-                                tracing::info!("Received SHARD REDIRECT to: {}", parts[1]);
+                                tracing::info!(
+                                    "Received SHARD REDIRECT to: {}. Refreshing ShardMap...",
+                                    parts[1]
+                                );
+
+                                // Refresh shard map in background or inline
+                                let self_clone = self.clone();
+                                tokio::spawn(async move {
+                                    let _ = self_clone.refresh_shard_map().await;
+                                });
                                 break;
                             }
                         }
@@ -573,5 +583,40 @@ impl Client {
         }
 
         bail!("No available leader found after retries")
+    }
+
+    pub async fn refresh_shard_map(&self) -> anyhow::Result<()> {
+        if self.config_server_addrs.is_empty() {
+            return Ok(());
+        }
+
+        use crate::dfs::config_service_client::ConfigServiceClient;
+        use crate::dfs::FetchShardMapRequest;
+
+        for addr in &self.config_server_addrs {
+            let resolved_addr = self.resolve_url(&format!("http://{}", addr));
+            if let Ok(mut client) = ConfigServiceClient::connect(resolved_addr).await {
+                if let Ok(resp) = client.fetch_shard_map(FetchShardMapRequest {}).await {
+                    let shards_data = resp.into_inner().shards;
+                    let mut new_map = ShardMap::new_range(); // Assume range strategy for dynamic sharding
+
+                    for (shard_id, peers_info) in shards_data {
+                        new_map.add_shard(shard_id, peers_info.peers);
+                    }
+
+                    // Note: We might need a better way to recover the exact split points
+                    // if they are not returned by fetch_shard_map.
+                    // For now, assume fetch_shard_map returns the correct boundaries if updated.
+
+                    self.set_shard_map(new_map);
+                    tracing::info!(
+                        "Successfully refreshed ShardMap from Config server {}",
+                        addr
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        bail!("Failed to refresh ShardMap from any Config server")
     }
 }

@@ -175,6 +175,20 @@
 - [ ] Implement background encoding for cold files
 - [ ] Add reconstruction logic for failed EC blocks
 
+### 20. Dynamic Sharding (Load-based Splitting)
+**Status**: Planning
+**Priority**: High
+**Effort**: Large
+
+**Objective**: Split shards based on read/write throughput (PPS/BPS) and ensure prefix locality (S3/Colossus style).
+
+**Tasks**:
+- [ ] Transition from Consistent Hashing to Range-based Sharding
+- [ ] Implement throughput monitoring per prefix/shard
+- [ ] Implement Shard Split logic in Raft and Master state
+- [ ] Implement Client-side handling of shard redirects for dynamic ranges
+- [ ] Add auto-scaling/load-balancing logic for shards
+
 ---
 
 ## ✅ Completed & Archived
@@ -235,11 +249,12 @@
 - 🟡 Lease-based Heartbeats & Reliability
 - ✅ Code Quality & Tech Debt Reduction (Phase 1)
 
-### Phase 5: Advanced Ecosystem (Future)
+### Phase 5: Advanced Ecosystem & Scalability (Next)
+- 🟡 Dynamic Sharding: Load-based range splitting
 - 🟢 High-performance S3 (Presigned URLs, efficient CopyObject)
 - 🟢 Security (TLS, AuthN/AuthZ)
 - 🟢 Storage Efficiency (Erasure Coding)
 - 🟢 Rack Awareness
 
-**Last Updated**: 2026-01-06
+**Last Updated**: 2026-01-13
 **Maintainer**: Development Team

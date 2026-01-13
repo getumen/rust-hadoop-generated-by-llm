@@ -113,4 +113,43 @@ impl ConfigService for MyConfigServer {
             Err(_) => Err(Status::internal("Raft response error")),
         }
     }
+
+    async fn split_shard(
+        &self,
+        request: Request<crate::dfs::SplitShardRequest>,
+    ) -> Result<Response<crate::dfs::SplitShardResponse>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::SplitShard {
+                    shard_id: req.shard_id,
+                    split_key: req.split_key,
+                    new_shard_id: req.new_shard_id,
+                    new_shard_peers: req.new_shard_peers,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(crate::dfs::SplitShardResponse {
+                success: true,
+                error_message: "".to_string(),
+                leader_hint: "".to_string(),
+            })),
+            Ok(Err(leader_opt)) => Ok(Response::new(crate::dfs::SplitShardResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
 }

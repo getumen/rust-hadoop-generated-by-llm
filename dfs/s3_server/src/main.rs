@@ -25,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Connecting to Master at {}", master_addr);
 
-    // The Client::new expects Vec<String>
-    let client = Client::new(vec![master_addr]);
+    // The Client::new expects (master_addrs, config_server_addrs)
+    let client = Client::new(vec![master_addr], vec![]);
 
     // Load shard map if config is provided
     let shard_config_path = std::env::var("SHARD_CONFIG").ok();

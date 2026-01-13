@@ -190,6 +190,7 @@ service ConfigService {
   rpc FetchShardMap (FetchShardMapRequest) returns (FetchShardMapResponse);
   rpc AddShard (AddShardRequest) returns (AddShardResponse);
   rpc RemoveShard (RemoveShardRequest) returns (RemoveShardResponse);
+  rpc SplitShard (SplitShardRequest) returns (SplitShardResponse);
 }
 
 message FetchShardMapRequest {}
@@ -218,6 +219,19 @@ message RemoveShardRequest {
 }
 
 message RemoveShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message SplitShardRequest {
+  string shard_id = 1;
+  string split_key = 2;
+  string new_shard_id = 3;
+  repeated string new_shard_peers = 4;
+}
+
+message SplitShardResponse {
   bool success = 1;
   string error_message = 2;
   string leader_hint = 3;

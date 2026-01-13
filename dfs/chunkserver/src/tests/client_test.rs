@@ -14,7 +14,7 @@ async fn test_client_integration() -> Result<(), Box<dyn std::error::Error>> {
     // In a CI env, we'd start it here. For now, assume user ran `start_sharded_cluster.sh`.
 
     let masters: Vec<String> = MASTER_ADDRS.iter().map(|s| s.to_string()).collect();
-    let client = Client::new(masters);
+    let client = Client::new(masters, vec![]);
 
     // Register host aliases for Docker -> Localhost mapping
     // Shard 1

@@ -43,6 +43,9 @@ struct Args {
 
     #[arg(long)]
     shard_config: Option<String>,
+
+    #[arg(long, value_delimiter = ',')]
+    config_servers: Vec<String>,
 }
 
 // Axum state for sharing the Raft channel
@@ -143,7 +146,13 @@ async fn main() -> anyhow::Result<()> {
         dfs_metaserver::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100);
     let shard_map = Arc::new(Mutex::new(shard_map));
 
-    let master = MyMaster::new(state, raft_tx_for_master, shard_map, args.shard_id.clone());
+    let master = MyMaster::new(
+        state,
+        raft_tx_for_master,
+        shard_map,
+        args.shard_id.clone(),
+        args.config_servers.clone(),
+    );
 
     tracing::info!("Master gRPC server listening on {}", addr);
 
