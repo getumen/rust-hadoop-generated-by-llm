@@ -15,6 +15,7 @@ use dfs_metaserver::simple_raft::{
 use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -60,16 +61,24 @@ impl IntoResponse for InternalError {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "master=debug,dfs_metaserver=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let args = Args::parse();
     let addr = args.addr.parse()?;
     let advertise_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
 
-    println!("Master node {} starting...", args.id);
-    println!("Peers: {:?}", args.peers);
-    println!("HTTP Port: {}", args.http_port);
-    println!("Advertise Addr: {}", advertise_addr);
-    println!("Storage Dir: {}", args.storage_dir);
+    tracing::info!("Master node {} starting...", args.id);
+    tracing::info!("Peers: {:?}", args.peers);
+    tracing::info!("HTTP Port: {}", args.http_port);
+    tracing::info!("Advertise Addr: {}", advertise_addr);
+    tracing::info!("Storage Dir: {}", args.storage_dir);
 
     let state = {
         let mut master_state = MasterState::default();
@@ -124,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start HTTP Server for Raft RPC
     let http_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.http_port).into();
     tokio::spawn(async move {
+        tracing::info!("HTTP server listening on {}", http_addr);
         let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
@@ -135,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let master = MyMaster::new(state, raft_tx_for_master, shard_map, args.shard_id.clone());
 
-    println!("Master listening on {}", addr);
+    tracing::info!("Master gRPC server listening on {}", addr);
 
     Server::builder()
         .add_service(MasterServiceServer::new(master).max_decoding_message_size(100 * 1024 * 1024))

@@ -1,8 +1,46 @@
+//! # Simple Raft Consensus Implementation
+//!
+//! This module implements the Raft consensus algorithm for distributed state machine
+//! replication in the DFS Master server.
+//!
+//! ## Overview
+//!
+//! The implementation follows the Raft paper (Ongaro & Ousterhout, 2014) and includes:
+//!
+//! - **Leader Election**: Randomized election timeouts with majority voting
+//! - **Log Replication**: Append-only log with strong consistency guarantees
+//! - **Persistence**: RocksDB-backed storage for term, vote, and log entries
+//! - **Snapshotting**: Automatic log compaction with state machine snapshots
+//! - **Membership Changes**: Single-server configuration changes
+//! - **ReadIndex**: Linearizable reads without log replication
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         RaftNode                                │
+//! │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
+//! │  │  State   │  │   Log    │  │ RocksDB  │  │   HTTP Client    │ │
+//! │  │ Machine  │  │ Entries  │  │ Persist  │  │ (Peer Comm)      │ │
+//! │  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘ │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Key Types
+//!
+//! - [`RaftNode`]: The main Raft node implementation
+//! - [`Role`]: Node role (Follower, Candidate, Leader)
+//! - [`Command`]: Application commands to be replicated
+//! - [`Event`]: Events processed by the Raft event loop
+//! - [`RpcMessage`]: Raft RPC messages (RequestVote, AppendEntries, etc.)
+
 use crate::master::MasterState;
 use crate::sharding::ShardMap;
+use anyhow::{Context, Result};
 use rand::Rng;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -173,6 +211,14 @@ pub struct InstallSnapshotReply {
     pub peer_id: usize,
 }
 
+pub struct ReadIndexRequest {
+    pub read_index: usize,
+    pub term: u64,
+    pub acks: HashSet<usize>,
+    pub majority_confirmed: bool,
+    pub reply_tx: tokio::sync::oneshot::Sender<Result<usize, Option<String>>>,
+}
+
 pub enum Event {
     Rpc {
         msg: RpcMessage,
@@ -187,6 +233,9 @@ pub enum Event {
     },
     GetClusterInfo {
         reply_tx: tokio::sync::oneshot::Sender<ClusterInfo>,
+    },
+    GetReadIndex {
+        reply_tx: tokio::sync::oneshot::Sender<Result<usize, Option<String>>>,
     },
 }
 
@@ -205,35 +254,85 @@ pub struct ClusterInfo {
     pub votes_received: usize,
 }
 
+/// A single Raft consensus node.
+///
+/// The `RaftNode` manages all Raft state including:
+/// - Persistent state: current term, voted_for, log entries (backed by RocksDB)
+/// - Volatile state: commit_index, last_applied, role
+/// - Leader state: next_index and match_index for each follower
+///
+/// # Event Loop
+///
+/// The node runs an async event loop that:
+/// 1. Handles incoming RPC messages from peers
+/// 2. Processes client requests (log append)
+/// 3. Triggers elections on timeout (followers/candidates)
+/// 4. Sends heartbeats (leaders)
+/// 5. Applies committed log entries to the state machine
+///
+/// # Thread Safety
+///
+/// The node itself is single-threaded (owned by one tokio task).
+/// The `app_state` is wrapped in `Arc<Mutex<>>` for cross-task access.
 pub struct RaftNode {
+    /// Unique identifier for this node in the cluster (0-indexed).
     pub id: usize,
+    /// HTTP addresses of peer nodes for RPC communication.
     pub peers: Vec<String>,
+    /// Address advertised to clients for redirection hints.
     pub client_address: String,
+    /// Current role in the Raft cluster.
     pub role: Role,
+    /// Latest term this server has seen (persisted to disk).
     pub current_term: u64,
+    /// Candidate ID that received our vote in current term (persisted).
     pub voted_for: Option<usize>,
+    /// Log entries; first entry is dummy (index 0 = last_included_index).
     pub log: Vec<LogEntry>,
+    /// Index of highest log entry known to be committed.
     pub commit_index: usize,
+    /// Index of highest log entry applied to state machine.
     pub last_applied: usize,
+    /// For each peer: index of next log entry to send (leader only).
     pub next_index: Vec<usize>,
+    /// For each peer: index of highest log entry known to be replicated (leader only).
     pub match_index: Vec<usize>,
+    /// ID of the current leader (if known).
     pub current_leader: Option<usize>,
+    /// Address of the current leader (for client redirection).
     pub current_leader_address: Option<String>,
 
     // Snapshot metadata
+    /// Index of the last log entry included in the most recent snapshot.
     pub last_included_index: usize,
+    /// Term of the last log entry included in the most recent snapshot.
     pub last_included_term: u64,
 
+    /// Randomized election timeout (typically 150-300ms range, extended here).
     pub election_timeout: Duration,
+    /// Timestamp of the last election timeout reset.
     pub last_election_time: Instant,
 
+    /// Channel receiver for incoming events (RPCs, client requests).
     pub inbox: mpsc::Receiver<Event>,
+    /// Self-sender for queuing internal events (e.g., RPC responses).
     pub self_tx: mpsc::Sender<Event>,
+    /// Shared application state (the actual state machine being replicated).
     pub app_state: Arc<Mutex<AppState>>,
+    /// Number of votes received in the current election (candidate only).
     pub votes_received: usize,
 
-    pub db: Arc<DB>, // RocksDB instance
+    /// RocksDB instance for persistent storage.
+    pub db: Arc<DB>,
+    /// HTTP client for sending RPCs to peers.
     pub http_client: reqwest::Client,
+
+    /// Pending ReadIndex requests awaiting majority confirmation.
+    pub pending_read_indices: Vec<ReadIndexRequest>,
+    /// Timestamp of the last heartbeat sent (leader only).
+    pub last_heartbeat_time: Instant,
+    /// Timestamp of the last majority acknowledgment received.
+    pub last_majority_ack_time: Instant,
 }
 
 impl RaftNode {
@@ -258,7 +357,7 @@ impl RaftNode {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(500))
             .build()
-            .unwrap();
+            .expect("Failed to build HTTP client");
 
         RaftNode {
             id,
@@ -284,6 +383,9 @@ impl RaftNode {
             votes_received: 0,
             db,
             http_client,
+            pending_read_indices: vec![],
+            last_heartbeat_time: Instant::now(),
+            last_majority_ack_time: Instant::now(),
         }
     }
 
@@ -295,7 +397,7 @@ impl RaftNode {
             Ok(Some(val)) => match val.try_into() {
                 Ok(bytes) => u64::from_be_bytes(bytes),
                 Err(_) => {
-                    eprintln!("Error: Corrupted term data in DB");
+                    tracing::error!("Error: Corrupted term data in DB");
                     0
                 }
             },
@@ -305,7 +407,7 @@ impl RaftNode {
             Ok(Some(val)) => match val.try_into() {
                 Ok(bytes) => Some(usize::from_be_bytes(bytes)),
                 Err(_) => {
-                    eprintln!("Error: Corrupted vote data in DB");
+                    tracing::error!("Error: Corrupted vote data in DB");
                     None
                 }
             },
@@ -321,16 +423,17 @@ impl RaftNode {
                         if let Ok(Some(snapshot_data)) = db.get(b"snapshot_data") {
                             match serde_json::from_slice::<AppState>(&snapshot_data) {
                                 Ok(state) => {
-                                    *app_state.lock().unwrap() = state;
+                                    *app_state.lock().expect("Mutex poisoned") = state;
                                 }
                                 Err(_) => {
                                     // Try legacy MasterState
                                     match serde_json::from_slice::<MasterState>(&snapshot_data) {
                                         Ok(state) => {
-                                            *app_state.lock().unwrap() = AppState::Master(state);
+                                            *app_state.lock().expect("Mutex poisoned") =
+                                                AppState::Master(state);
                                         }
                                         Err(e) => {
-                                            eprintln!(
+                                            tracing::error!(
                                                 "Error: Failed to deserialize snapshot data: {}",
                                                 e
                                             );
@@ -342,7 +445,7 @@ impl RaftNode {
                         meta
                     }
                     Err(e) => {
-                        eprintln!("Error: Failed to deserialize snapshot metadata: {}", e);
+                        tracing::error!("Error: Failed to deserialize snapshot metadata: {}", e);
                         (0, 0)
                     }
                 }
@@ -364,9 +467,10 @@ impl RaftNode {
                         index += 1;
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::error!(
                             "Error: Failed to deserialize log entry at index {}: {}",
-                            index, e
+                            index,
+                            e
                         );
                         break;
                     }
@@ -384,55 +488,82 @@ impl RaftNode {
         )
     }
 
-    fn save_term(&self) {
+    fn save_term(&self) -> Result<()> {
         self.db
             .put(b"term", self.current_term.to_be_bytes())
-            .expect("Failed to save term to DB");
+            .context("Failed to save term to DB")?;
+        Ok(())
     }
 
-    fn save_vote(&self) {
+    fn save_vote(&self) -> Result<()> {
         if let Some(vote) = self.voted_for {
             self.db
                 .put(b"vote", vote.to_be_bytes())
-                .expect("Failed to save vote to DB");
+                .context("Failed to save vote to DB")?;
         } else {
             self.db
                 .delete(b"vote")
-                .expect("Failed to delete vote from DB");
+                .context("Failed to delete vote from DB")?;
+        }
+        Ok(())
+    }
+
+    fn save_log_entry(&self, index: usize, entry: &LogEntry) -> Result<()> {
+        let key = format!("log:{}", index);
+        let val = serde_json::to_vec(entry).context("Failed to serialize log entry")?;
+        self.db
+            .put(key.as_bytes(), val)
+            .context("Failed to save log entry to DB")?;
+        Ok(())
+    }
+
+    fn check_read_indices(&mut self) {
+        let mut satisfied_indices = Vec::new();
+        for (idx, req) in self.pending_read_indices.iter().enumerate() {
+            if req.majority_confirmed && self.last_applied >= req.read_index {
+                satisfied_indices.push(idx);
+            }
+        }
+
+        for idx in satisfied_indices.into_iter().rev() {
+            let req = self.pending_read_indices.remove(idx);
+            tracing::info!(
+                "Node {} (L) satisfying ReadIndex request with read_index {} (last_applied: {})",
+                self.id,
+                req.read_index,
+                self.last_applied
+            );
+            let _ = req.reply_tx.send(Ok(req.read_index));
         }
     }
 
-    fn save_log_entry(&self, index: usize, entry: &LogEntry) {
-        let key = format!("log:{}", index);
-        let val = serde_json::to_vec(entry).expect("Failed to serialize log entry");
-        self.db
-            .put(key.as_bytes(), val)
-            .expect("Failed to save log entry to DB");
-    }
-
-    fn delete_log_entries_from(&self, start_index: usize) {
+    fn delete_log_entries_from(&self, start_index: usize) -> Result<()> {
         let mut index = start_index;
         loop {
             let key = format!("log:{}", index);
             if self
                 .db
                 .get(key.as_bytes())
-                .expect("Failed to read from DB")
+                .context("Failed to read from DB")?
                 .is_none()
             {
                 break;
             }
             self.db
                 .delete(key.as_bytes())
-                .expect("Failed to delete from DB");
+                .context("Failed to delete from DB")?;
             index += 1;
         }
+        Ok(())
     }
 
-    fn create_snapshot(&mut self) {
+    fn create_snapshot(&mut self) -> Result<()> {
         // Serialize current app state
-        let state = self.app_state.lock().unwrap();
-        let snapshot_data = serde_json::to_vec(&*state).expect("Failed to serialize app state");
+        let state = self
+            .app_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
+        let snapshot_data = serde_json::to_vec(&*state).context("Failed to serialize app state")?;
         drop(state);
 
         // Save snapshot metadata
@@ -443,29 +574,31 @@ impl RaftNode {
                 .map(|e| e.term)
                 .unwrap_or(self.last_included_term)
         } else {
-            eprintln!(
+            tracing::error!(
                 "Warning: last_applied {} < last_included_index {} during snapshot creation",
-                self.last_applied, self.last_included_index
+                self.last_applied,
+                self.last_included_index
             );
             self.last_included_term
         };
         let meta = (self.last_applied, term);
-        let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
+        let meta_bytes =
+            serde_json::to_vec(&meta).context("Failed to serialize snapshot metadata")?;
         self.db
             .put(b"snapshot_meta", meta_bytes)
-            .expect("Failed to save snapshot metadata to DB");
+            .context("Failed to save snapshot metadata to DB")?;
 
         // Save snapshot data
         self.db
             .put(b"snapshot_data", snapshot_data)
-            .expect("Failed to save snapshot data to DB");
+            .context("Failed to save snapshot data to DB")?;
 
         // Delete old log entries
         for i in (self.last_included_index + 1)..=self.last_applied {
             let key = format!("log:{}", i);
             self.db
                 .delete(key.as_bytes())
-                .expect("Failed to delete old log entry from DB");
+                .context("Failed to delete old log entry from DB")?;
         }
 
         // Update snapshot metadata
@@ -482,31 +615,45 @@ impl RaftNode {
 
         self.last_included_index = self.last_applied;
 
-        println!(
+        tracing::info!(
             "Node {} created snapshot at index {}",
-            self.id, self.last_included_index
+            self.id,
+            self.last_included_index
         );
+        Ok(())
     }
 
-    fn install_snapshot(&mut self, snapshot: Snapshot) {
+    fn install_snapshot(&mut self, snapshot: Snapshot) -> Result<()> {
         // Save snapshot to disk
         let meta = (snapshot.last_included_index, snapshot.last_included_term);
-        let meta_bytes = serde_json::to_vec(&meta).expect("Failed to serialize snapshot metadata");
+        let meta_bytes =
+            serde_json::to_vec(&meta).context("Failed to serialize snapshot metadata")?;
         self.db
             .put(b"snapshot_meta", meta_bytes)
-            .expect("Failed to save snapshot metadata to DB");
+            .context("Failed to save snapshot metadata to DB")?;
         self.db
             .put(b"snapshot_data", &snapshot.data)
-            .expect("Failed to save snapshot data to DB");
+            .context("Failed to save snapshot data to DB")?;
 
         // Restore app state
         match serde_json::from_slice::<AppState>(&snapshot.data) {
-            Ok(state) => *self.app_state.lock().unwrap() = state,
-            Err(_) => {
+            Ok(state) => {
+                *self
+                    .app_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Mutex poisoned"))? = state
+            }
+            Err(_e) => {
                 // Try legacy MasterState
                 match serde_json::from_slice::<MasterState>(&snapshot.data) {
-                    Ok(state) => *self.app_state.lock().unwrap() = AppState::Master(state),
-                    Err(e) => eprintln!("Error: Failed to deserialize snapshot data: {}", e),
+                    Ok(state) => {
+                        *self
+                            .app_state
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("Mutex poisoned"))? =
+                            AppState::Master(state)
+                    }
+                    Err(e) => tracing::error!("Error: Failed to deserialize snapshot data: {}", e),
                 }
             }
         }
@@ -516,7 +663,7 @@ impl RaftNode {
             let key = format!("log:{}", i);
             self.db
                 .delete(key.as_bytes())
-                .expect("Failed to delete old log entry from DB");
+                .context("Failed to delete old log entry from DB")?;
         }
 
         // Update state
@@ -529,10 +676,12 @@ impl RaftNode {
         self.commit_index = snapshot.last_included_index;
         self.last_applied = snapshot.last_included_index;
 
-        println!(
+        tracing::info!(
             "Node {} installed snapshot at index {}",
-            self.id, self.last_included_index
+            self.id,
+            self.last_included_index
         );
+        Ok(())
     }
 
     pub async fn run(&mut self) {
@@ -545,24 +694,28 @@ impl RaftNode {
         loop {
             tokio::select! {
                 _ = tick_interval.tick() => {
-                    self.tick().await;
+                    if let Err(e) = self.tick().await {
+                         tracing::error!("Error in tick: {:?}", e);
+                    }
                 }
                 Some(event) = self.inbox.recv() => {
-                    self.handle_event(event).await;
+                    if let Err(e) = self.handle_event(event).await {
+                        tracing::error!("Error in handle_event: {:?}", e);
+                    }
                 }
             }
         }
     }
 
-    async fn tick(&mut self) {
+    async fn tick(&mut self) -> Result<()> {
         match self.role {
             Role::Follower | Role::Candidate => {
                 if self.last_election_time.elapsed() > self.election_timeout {
-                    self.start_election().await;
+                    self.start_election().await?;
                 }
             }
             Role::Leader => {
-                self.send_heartbeats().await;
+                self.send_heartbeats().await?;
             }
         }
         self.apply_logs();
@@ -570,29 +723,31 @@ impl RaftNode {
         // Create snapshot if log is too large (threshold: 100 entries)
         const SNAPSHOT_THRESHOLD: usize = 100;
         if self.log.len() > SNAPSHOT_THRESHOLD && self.last_applied > self.last_included_index {
-            self.create_snapshot();
+            self.create_snapshot()?;
         }
+        Ok(())
     }
 
-    async fn start_election(&mut self) {
+    async fn start_election(&mut self) -> Result<()> {
         self.role = Role::Candidate;
         self.current_term += 1;
-        self.save_term(); // Persist term
+        self.save_term()?; // Persist term
 
         self.voted_for = Some(self.id);
-        self.save_vote(); // Persist vote
+        self.save_vote()?; // Persist vote
 
         self.votes_received = 1;
         self.last_election_time = Instant::now();
         self.election_timeout = Duration::from_millis(rand::rng().random_range(1500..3000));
 
-        println!(
+        tracing::info!(
             "Node {} starting election for term {}",
-            self.id, self.current_term
+            self.id,
+            self.current_term
         );
 
-        let last_log_index = self.log.len() - 1;
-        let last_log_term = self.log[last_log_index].term;
+        let last_log_index = self.log.len() - 1 + self.last_included_index;
+        let last_log_term = self.log[self.log.len() - 1].term;
 
         let args = RequestVoteArgs {
             term: self.current_term,
@@ -604,7 +759,7 @@ impl RaftNode {
         let total_nodes = self.peers.len() + 1;
         if total_nodes == 1 {
             self.become_leader();
-            return;
+            return Ok(());
         }
 
         for peer in self.peers.iter() {
@@ -631,14 +786,15 @@ impl RaftNode {
                                 break;
                             }
                             Err(e) => {
-                                eprintln!(
+                                tracing::error!(
                                     "Failed to parse RequestVoteResponse from {}: {}",
-                                    url, e
+                                    url,
+                                    e
                                 );
                             }
                         },
                         Err(e) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "RequestVote failed to {} (attempt {}/{}): {}",
                                 url,
                                 attempt + 1,
@@ -657,12 +813,14 @@ impl RaftNode {
                 }
             });
         }
+        Ok(())
     }
 
     fn become_leader(&mut self) {
-        println!(
-            "Node {} becoming LEADER for term {}",
-            self.id, self.current_term
+        tracing::info!(
+            "Node {} became Leader for term {}",
+            self.id,
+            self.current_term
         );
         self.role = Role::Leader;
         self.current_leader = Some(self.id);
@@ -670,29 +828,47 @@ impl RaftNode {
         self.next_index = vec![self.log.len() + self.last_included_index; self.peers.len()];
         self.match_index = vec![self.last_included_index; self.peers.len()];
 
+        // For multi-node cluster, we append a NoOp entry to commit entries from previous terms.
+        // This is required for ReadIndex safety.
+        let entry = LogEntry {
+            term: self.current_term,
+            command: Command::NoOp,
+        };
+        self.log.push(entry.clone());
+        let absolute_index = self.log.len() - 1 + self.last_included_index;
+        if let Err(e) = self.save_log_entry(absolute_index, &entry) {
+            tracing::error!("Failed to save log entry in become_leader: {:?}", e);
+        }
         // For single-node clusters, immediately commit everything in the log upon becoming leader.
-        // This is necessary because there are no peers to replicate to, so we can't rely on
-        // standard consensus flow to advance commit_index for restored logs.
-        if self.peers.is_empty() {
-            let last_index = self.log.len() - 1 + self.last_included_index;
-            if last_index > self.commit_index {
-                println!(
-                    "Single-node cluster: advancing commit_index to {} on leadership",
-                    last_index
-                );
-                self.commit_index = last_index;
-                self.apply_logs();
-            }
+        if self.peers.is_empty() && absolute_index > self.commit_index {
+            tracing::info!(
+                "Single-node cluster: advancing commit_index to {} on leadership",
+                absolute_index
+            );
+            self.commit_index = absolute_index;
+            self.apply_logs();
         }
     }
 
-    async fn send_heartbeats(&mut self) {
+    async fn send_heartbeats(&mut self) -> Result<()> {
         for (i, peer) in self.peers.iter().enumerate() {
             // Check if follower needs a snapshot
             if self.next_index[i] <= self.last_included_index {
                 // Send snapshot instead of AppendEntries
-                let state = self.app_state.lock().unwrap();
-                let snapshot_data = serde_json::to_vec(&*state).unwrap();
+                let state = match self.app_state.lock() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to lock app_state for snapshot: {:?}", e);
+                        continue;
+                    }
+                };
+                let snapshot_data = match serde_json::to_vec(&*state) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Failed to serialize app state for snapshot: {:?}", e);
+                        continue;
+                    }
+                };
                 drop(state);
 
                 let args = InstallSnapshotArgs {
@@ -725,14 +901,15 @@ impl RaftNode {
                                     break;
                                 }
                                 Err(e) => {
-                                    eprintln!(
+                                    tracing::error!(
                                         "Failed to parse InstallSnapshotReply from {}: {}",
-                                        url, e
+                                        url,
+                                        e
                                     );
                                 }
                             },
                             Err(e) => {
-                                eprintln!(
+                                tracing::warn!(
                                     "InstallSnapshot failed to {} (attempt {}/{}): {}",
                                     url,
                                     attempt + 1,
@@ -805,7 +982,7 @@ impl RaftNode {
 
                         Err(e) => {
                             // Log error for debugging
-                            eprintln!("AppendEntries failed to {}: {}", url, e);
+                            tracing::warn!("AppendEntries failed to {}: {}", url, e);
                         }
                     }
 
@@ -818,28 +995,31 @@ impl RaftNode {
                 }
             });
         }
+        Ok(())
     }
 
-    async fn handle_event(&mut self, event: Event) {
+    async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Rpc { msg, reply_tx } => {
-                let response = self.handle_rpc(msg).await;
+                let response = self.handle_rpc(msg).await?;
                 if let Some(tx) = reply_tx {
                     let _ = tx.send(response);
                 }
             }
             Event::ClientRequest { command, reply_tx } => {
-                println!(
+                tracing::info!(
                     "Node {} received ClientRequest (role: {:?})",
-                    self.id, self.role
+                    self.id,
+                    self.role
                 );
                 if self.role != Role::Leader {
-                    println!(
+                    tracing::info!(
                         "Node {} rejecting ClientRequest because not leader (leader: {:?})",
-                        self.id, self.current_leader_address
+                        self.id,
+                        self.current_leader_address
                     );
                     let _ = reply_tx.send(Err(self.current_leader_address.clone()));
-                    return;
+                    return Ok(());
                 }
 
                 let entry = LogEntry {
@@ -848,10 +1028,23 @@ impl RaftNode {
                 };
                 self.log.push(entry.clone());
                 let absolute_index = self.log.len() - 1 + self.last_included_index;
-                self.save_log_entry(absolute_index, &entry); // Persist log entry
+                self.save_log_entry(absolute_index, &entry)?; // Persist log entry
 
-                self.commit_index = absolute_index;
-                self.apply_logs();
+                // Leader appends entry, but does not immediately commit it.
+                // It will be committed once replicated to a majority.
+                // The commit index advancement is handled after sending heartbeats
+                // or in the AppendEntriesResponse handler.
+
+                // For single-node clusters, we advance commit_index immediately.
+                if self.peers.is_empty() && absolute_index > self.commit_index {
+                    self.commit_index = absolute_index;
+                    self.apply_logs();
+                }
+
+                // The original code had `self.commit_index = absolute_index; self.apply_logs();` here.
+                // This is incorrect for a multi-node cluster as it commits before replication.
+                // For single-node clusters, this is handled in `become_leader`.
+                // For multi-node, commit_index is advanced in `handle_append_entries_response`.
 
                 let _ = reply_tx.send(Ok(()));
             }
@@ -873,101 +1066,163 @@ impl RaftNode {
                 };
                 let _ = reply_tx.send(info);
             }
+            Event::GetReadIndex { reply_tx } => {
+                if self.role != Role::Leader {
+                    let _ = reply_tx.send(Err(self.current_leader_address.clone()));
+                    return Ok(());
+                }
+
+                // ReadIndex optimization:
+                // 1. Record the current commit_index as the read_index.
+                // 2. Add to pending_read_indices.
+                // 3. Trigger immediate heartbeats to confirm leadership.
+
+                let mut acks = HashSet::new();
+                acks.insert(self.id); // Acknowledge self
+
+                let total_nodes = self.peers.len() + 1;
+                let majority_confirmed = acks.len() > total_nodes / 2;
+
+                self.pending_read_indices.push(ReadIndexRequest {
+                    read_index: self.commit_index,
+                    term: self.current_term,
+                    acks,
+                    majority_confirmed,
+                    reply_tx,
+                });
+
+                if majority_confirmed {
+                    self.check_read_indices();
+                }
+
+                // Trigger heartbeats immediately to speed up ReadIndex (for multi-node clusters)
+                if !self.peers.is_empty() {
+                    self.send_heartbeats().await?;
+                }
+            }
         }
+        Ok(())
     }
 
-    async fn handle_rpc(&mut self, msg: RpcMessage) -> RpcMessage {
+    async fn handle_rpc(&mut self, msg: RpcMessage) -> Result<RpcMessage> {
         match msg {
             RpcMessage::RequestVote(args) => {
-                println!(
+                tracing::info!(
                     "Node {} received RequestVote from Node {} for term {}",
-                    self.id, args.candidate_id, args.term
+                    self.id,
+                    args.candidate_id,
+                    args.term
                 );
                 let mut vote_granted = false;
                 if args.term >= self.current_term {
                     if args.term > self.current_term {
-                        println!(
+                        tracing::info!(
                             "Node {} updating term to {} (was {})",
-                            self.id, args.term, self.current_term
+                            self.id,
+                            args.term,
+                            self.current_term
                         );
                         self.current_term = args.term;
-                        self.save_term(); // Persist term
+                        self.save_term()?; // Persist term
 
                         self.role = Role::Follower;
                         self.voted_for = None;
-                        self.save_vote(); // Persist vote (None)
+                        self.save_vote()?; // Persist vote (None)
 
                         self.current_leader = None;
                         self.current_leader_address = None;
                     }
 
+                    let last_log_index_local = self.log.len() - 1 + self.last_included_index;
+                    let last_log_term_local = self.log[self.log.len() - 1].term;
+
+                    // Raft election restriction: candidate's log must be at least as up-to-date
+                    let log_is_up_to_date = args.last_log_term > last_log_term_local
+                        || (args.last_log_term == last_log_term_local
+                            && args.last_log_index >= last_log_index_local);
+
                     if (self.voted_for.is_none() || self.voted_for == Some(args.candidate_id))
-                        && args.last_log_index >= self.log.len() - 1 + self.last_included_index
+                        && log_is_up_to_date
                     {
-                        println!(
-                            "Node {} granting vote to Node {}",
-                            self.id, args.candidate_id
+                        tracing::info!(
+                            "Node {} granting vote to Node {} for term {}",
+                            self.id,
+                            args.candidate_id,
+                            args.term
                         );
                         self.voted_for = Some(args.candidate_id);
-                        self.save_vote(); // Persist vote
+                        self.save_vote()?; // Persist vote
 
                         self.last_election_time = Instant::now();
                         vote_granted = true;
                     } else {
-                        println!(
-                            "Node {} denying vote to Node {} (voted_for: {:?}, log check: {})",
+                        tracing::info!(
+                            "Node {} denying vote to Node {} (voted_for: {:?}, log_is_up_to_date: {})",
                             self.id,
                             args.candidate_id,
                             self.voted_for,
-                            args.last_log_index >= self.log.len() - 1 + self.last_included_index
+                            log_is_up_to_date
                         );
                     }
                 } else {
-                    println!(
-                        "Node {} denying vote to Node {} (term {} < {})",
-                        self.id, args.candidate_id, args.term, self.current_term
+                    tracing::info!(
+                        "Node {} denying vote to Node {} (candidate term {} < current term {})",
+                        self.id,
+                        args.candidate_id,
+                        args.term,
+                        self.current_term
                     );
                 }
-                RpcMessage::RequestVoteResponse(RequestVoteReply {
+                Ok(RpcMessage::RequestVoteResponse(RequestVoteReply {
                     term: self.current_term,
                     vote_granted,
-                })
+                }))
             }
             RpcMessage::RequestVoteResponse(reply) => {
                 if self.role == Role::Candidate
                     && self.current_term == reply.term
                     && reply.vote_granted
                 {
-                    println!("Node {} received vote", self.id);
+                    tracing::info!("Node {} received vote", self.id);
                     self.votes_received += 1;
                     let total_nodes = self.peers.len() + 1;
                     if self.votes_received > total_nodes / 2 {
                         self.become_leader();
                     }
                 } else if reply.term > self.current_term {
-                    println!(
+                    tracing::info!(
                         "Node {} received higher term {} in RequestVoteResponse",
-                        self.id, reply.term
+                        self.id,
+                        reply.term
                     );
                     self.current_term = reply.term;
-                    self.save_term(); // Persist term
+                    self.save_term()?; // Persist term
 
                     self.role = Role::Follower;
                     self.voted_for = None;
-                    self.save_vote(); // Persist vote
+                    self.save_vote()?; // Persist vote
 
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
-                RpcMessage::RequestVoteResponse(reply)
+                Ok(RpcMessage::RequestVoteResponse(reply))
             }
             RpcMessage::AppendEntries(args) => {
                 let mut success = false;
                 let mut match_index = 0;
 
                 if args.term >= self.current_term {
-                    self.current_term = args.term;
-                    self.save_term();
+                    if args.term > self.current_term {
+                        tracing::info!(
+                            "Node {} updating term to {} from AppendEntries RPC",
+                            self.id,
+                            args.term
+                        );
+                        self.current_term = args.term;
+                        self.save_term()?;
+                        self.voted_for = None; // Clear vote on new term
+                        self.save_vote()?;
+                    }
 
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
@@ -976,12 +1231,33 @@ impl RaftNode {
 
                     // Check if prev_log_index is in snapshot
                     if args.prev_log_index < self.last_included_index {
-                        // Follower is ahead, reject
+                        // Leader's prev_log_index is older than our snapshot,
+                        // meaning we are ahead. This should not happen if leader is healthy.
+                        // Or, leader needs to send a snapshot.
+                        tracing::warn!(
+                            "Node {} (F) prev_log_index {} < last_included_index {}. Leader needs to send snapshot.",
+                            self.id, args.prev_log_index, self.last_included_index
+                        );
                         success = false;
+                        match_index = self.last_included_index; // Suggest leader to send snapshot from here
                     } else if args.prev_log_index == self.last_included_index {
                         // Prev log is the snapshot point
                         success = args.prev_log_term == self.last_included_term;
                         if success {
+                            // Delete any conflicting entries starting from after snapshot
+                            let log_start_index = 0; // Relative index in self.log
+                            if self.log.len() > log_start_index {
+                                // If there are entries after snapshot, check for conflicts
+                                if self.log[log_start_index].term != args.prev_log_term {
+                                    tracing::info!(
+                                        "Node {} (F) conflicting entry at snapshot point. Truncating log.",
+                                        self.id
+                                    );
+                                    self.log.truncate(log_start_index);
+                                    self.delete_log_entries_from(self.last_included_index + 1)?;
+                                }
+                            }
+
                             // Append all entries
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
@@ -989,46 +1265,80 @@ impl RaftNode {
 
                                 if log_index < self.log.len() {
                                     if self.log[log_index].term != entry.term {
+                                        tracing::info!(
+                                            "Node {} (F) conflicting entry at index {}. Truncating log.",
+                                            self.id, absolute_index
+                                        );
                                         self.log.truncate(log_index);
-                                        self.delete_log_entries_from(absolute_index);
+                                        self.delete_log_entries_from(absolute_index)?;
 
                                         self.log.push(entry.clone());
-                                        self.save_log_entry(absolute_index, entry);
+                                        self.save_log_entry(absolute_index, entry)?;
                                     }
                                 } else {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry);
+                                    self.save_log_entry(absolute_index, entry)?;
                                 }
                             }
                             match_index = args.prev_log_index + args.entries.len();
+                        } else {
+                            tracing::info!(
+                                "Node {} (F) prev_log_term mismatch at snapshot point. Expected {}, got {}.",
+                                self.id, self.last_included_term, args.prev_log_term
+                            );
                         }
                     } else {
-                        // Normal case
+                        // Normal case: prev_log_index is after snapshot
                         let prev_log_index_local = args.prev_log_index - self.last_included_index;
                         if prev_log_index_local < self.log.len()
                             && self.log[prev_log_index_local].term == args.prev_log_term
                         {
                             success = true;
 
+                            // Delete any conflicting entries
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
 
                                 if log_index < self.log.len() {
                                     if self.log[log_index].term != entry.term {
+                                        tracing::info!(
+                                            "Node {} (F) conflicting entry at index {}. Truncating log.",
+                                            self.id, absolute_index
+                                        );
                                         self.log.truncate(log_index);
-                                        self.delete_log_entries_from(absolute_index);
-
-                                        self.log.push(entry.clone());
-                                        self.save_log_entry(absolute_index, entry);
+                                        self.delete_log_entries_from(absolute_index)?;
+                                        break; // Stop checking, start appending from here
                                     }
                                 } else {
+                                    break; // No more local entries to check for conflict
+                                }
+                            }
+
+                            // Append new entries (or re-append from conflict point)
+                            for (i, entry) in args.entries.iter().enumerate() {
+                                let absolute_index = args.prev_log_index + 1 + i;
+                                let log_index = absolute_index - self.last_included_index;
+
+                                if log_index >= self.log.len() {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry);
+                                    self.save_log_entry(absolute_index, entry)?;
                                 }
                             }
 
                             match_index = args.prev_log_index + args.entries.len();
+                        } else {
+                            tracing::info!(
+                                "Node {} (F) log mismatch: prev_log_index_local {} (log len {}), term mismatch (expected {}, got {}).",
+                                self.id, prev_log_index_local, self.log.len(),
+                                self.log.get(prev_log_index_local).map(|e| e.term).unwrap_or(0),
+                                args.prev_log_term
+                            );
+                            success = false;
+                            match_index = self.last_included_index; // Fallback to snapshot index
+                            if prev_log_index_local < self.log.len() {
+                                match_index = self.last_included_index + prev_log_index_local;
+                            }
                         }
                     }
 
@@ -1038,22 +1348,126 @@ impl RaftNode {
                             .min(self.log.len() - 1 + self.last_included_index);
                         self.apply_logs();
                     }
+                } else {
+                    tracing::info!(
+                        "Node {} (F) rejecting AppendEntries from leader {} (term {} < current term {})",
+                        self.id, args.leader_id, args.term, self.current_term
+                    );
                 }
-                RpcMessage::AppendEntriesResponse(AppendEntriesReply {
+                Ok(RpcMessage::AppendEntriesResponse(AppendEntriesReply {
                     term: self.current_term,
                     success,
                     match_index,
                     peer_id: self.id,
-                })
+                }))
             }
             RpcMessage::AppendEntriesResponse(reply) => {
                 // Leader receives this - could update next_index/match_index here
-                RpcMessage::AppendEntriesResponse(reply)
+                if self.role == Role::Leader && reply.term == self.current_term {
+                    // Find the peer index
+                    if let Some(peer_idx) = self.peers.iter().position(|p| {
+                        // This is a simplification. In a real implementation,
+                        // we'd need a better way to map addresses to IDs or
+                        // include the peer's ID in the reply.
+                        p.contains(&reply.peer_id.to_string())
+                    }) {
+                        if reply.success {
+                            self.next_index[peer_idx] = reply.match_index + 1;
+                            self.match_index[peer_idx] = reply.match_index;
+
+                            // Update ReadIndex acks
+                            let total_nodes = self.peers.len() + 1;
+                            for req in self.pending_read_indices.iter_mut() {
+                                if req.term == self.current_term {
+                                    req.acks.insert(reply.peer_id);
+                                    if req.acks.len() > total_nodes / 2 {
+                                        req.majority_confirmed = true;
+                                    }
+                                }
+                            }
+                            self.check_read_indices();
+
+                            tracing::debug!(
+                                "Node {} (L) updated peer {} next_index to {}, match_index to {}",
+                                self.id,
+                                reply.peer_id,
+                                self.next_index[peer_idx],
+                                self.match_index[peer_idx]
+                            );
+                        } else {
+                            // Decrement next_index and retry
+                            if self.next_index[peer_idx] > self.last_included_index + 1 {
+                                self.next_index[peer_idx] -= 1;
+                                tracing::info!(
+                                    "Node {} (L) decremented peer {} next_index to {} due to AppendEntries failure",
+                                    self.id, reply.peer_id, self.next_index[peer_idx]
+                                );
+                            } else {
+                                // If next_index is already at last_included_index + 1,
+                                // it means the follower is too far behind or needs a snapshot.
+                                // The heartbeat logic should detect this and send a snapshot.
+                                tracing::warn!(
+                                    "Node {} (L) peer {} AppendEntries failed, next_index already at {}. Consider sending snapshot.",
+                                    self.id, reply.peer_id, self.next_index[peer_idx]
+                                );
+                            }
+                        }
+                    }
+
+                    // Check for commit_index advancement
+                    // Include leader's own match index (which is absolute_index)
+                    let mut all_match_indices = self.match_index.clone();
+                    let absolute_index = self.log.len() - 1 + self.last_included_index;
+                    all_match_indices.push(absolute_index);
+                    all_match_indices.sort_unstable();
+
+                    let total_nodes = self.peers.len() + 1;
+                    let majority_match_index = all_match_indices[total_nodes / 2];
+
+                    if majority_match_index > self.commit_index {
+                        // Only commit if the entry is from the current term
+                        let log_index_relative = majority_match_index - self.last_included_index;
+                        if log_index_relative < self.log.len()
+                            && self.log[log_index_relative].term == self.current_term
+                        {
+                            tracing::info!(
+                                "Node {} (L) advancing commit_index to {}",
+                                self.id,
+                                majority_match_index
+                            );
+                            self.commit_index = majority_match_index;
+                            self.apply_logs();
+                        }
+                    }
+                } else if reply.term > self.current_term {
+                    tracing::info!(
+                        "Node {} (L) received higher term {} in AppendEntriesResponse",
+                        self.id,
+                        reply.term
+                    );
+                    self.current_term = reply.term;
+                    self.save_term()?;
+                    self.role = Role::Follower;
+                    self.voted_for = None;
+                    self.save_vote()?;
+                    self.current_leader = None;
+                    self.current_leader_address = None;
+                }
+                Ok(RpcMessage::AppendEntriesResponse(reply))
             }
             RpcMessage::InstallSnapshot(args) => {
                 if args.term >= self.current_term {
-                    self.current_term = args.term;
-                    self.save_term();
+                    if args.term > self.current_term {
+                        tracing::info!(
+                            "Node {} updating term to {} from InstallSnapshot RPC",
+                            self.id,
+                            args.term
+                        );
+                        self.current_term = args.term;
+                        self.save_term()?;
+                        self.voted_for = None; // Clear vote on new term
+                        self.save_vote()?;
+                    }
 
                     self.role = Role::Follower;
                     self.current_leader = Some(args.leader_id);
@@ -1061,19 +1475,35 @@ impl RaftNode {
 
                     // Only install if snapshot is newer than our current state
                     if args.last_included_index > self.last_included_index {
+                        tracing::info!(
+                            "Node {} (F) installing snapshot from leader {} at index {}",
+                            self.id,
+                            args.leader_id,
+                            args.last_included_index
+                        );
                         let snapshot = Snapshot {
                             last_included_index: args.last_included_index,
                             last_included_term: args.last_included_term,
                             data: args.data,
                         };
-                        self.install_snapshot(snapshot);
+                        self.install_snapshot(snapshot)?;
+                    } else {
+                        tracing::info!(
+                            "Node {} (F) rejecting snapshot from leader {} at index {} (current snapshot index {} is newer or same)",
+                            self.id, args.leader_id, args.last_included_index, self.last_included_index
+                        );
                     }
+                } else {
+                    tracing::info!(
+                        "Node {} (F) rejecting InstallSnapshot from leader {} (term {} < current term {})",
+                        self.id, args.leader_id, args.term, self.current_term
+                    );
                 }
-                RpcMessage::InstallSnapshotResponse(InstallSnapshotReply {
+                Ok(RpcMessage::InstallSnapshotResponse(InstallSnapshotReply {
                     term: self.current_term,
                     last_included_index: self.last_included_index,
                     peer_id: self.id,
-                })
+                }))
             }
             RpcMessage::InstallSnapshotResponse(reply) => {
                 // Leader receives this - snapshot transfer completed
@@ -1084,20 +1514,45 @@ impl RaftNode {
                         // In a real implementation, we'd need a better way to map addresses to IDs
                         p.contains(&reply.peer_id.to_string())
                     }) {
-                        // Update next_index and match_index
-                        self.next_index[peer_idx] = reply.last_included_index + 1;
-                        self.match_index[peer_idx] = reply.last_included_index;
+                        if reply.term == self.current_term {
+                            // Update next_index and match_index
+                            self.next_index[peer_idx] = reply.last_included_index + 1;
+                            self.match_index[peer_idx] = reply.last_included_index;
+
+                            // Update ReadIndex acks
+                            let total_nodes = self.peers.len() + 1;
+                            for req in self.pending_read_indices.iter_mut() {
+                                if req.term == self.current_term {
+                                    req.acks.insert(reply.peer_id);
+                                    if req.acks.len() > total_nodes / 2 {
+                                        req.majority_confirmed = true;
+                                    }
+                                }
+                            }
+                            self.check_read_indices();
+                        }
+                        tracing::info!(
+                            "Node {} (L) peer {} successfully installed snapshot at index {}",
+                            self.id,
+                            reply.peer_id,
+                            reply.last_included_index
+                        );
                     }
                 } else if reply.term > self.current_term {
+                    tracing::info!(
+                        "Node {} (L) received higher term {} in InstallSnapshotResponse",
+                        self.id,
+                        reply.term
+                    );
                     self.current_term = reply.term;
-                    self.save_term();
+                    self.save_term()?;
                     self.role = Role::Follower;
                     self.voted_for = None;
-                    self.save_vote();
+                    self.save_vote()?;
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
-                RpcMessage::InstallSnapshotResponse(reply)
+                Ok(RpcMessage::InstallSnapshotResponse(reply))
             }
         }
     }
@@ -1115,9 +1570,13 @@ impl RaftNode {
                 } else {
                     self.apply_command(&command);
                 }
+                // After applying a log entry, check if any pending read indices can be satisfied
+                self.check_read_indices();
             } else {
-                eprintln!("Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}",
-                    log_index, self.log.len(), self.last_applied, self.last_included_index);
+                tracing::warn!(
+                    "Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}",
+                    log_index, self.log.len(), self.last_applied, self.last_included_index
+                );
             }
         }
     }
@@ -1130,22 +1589,23 @@ impl RaftNode {
             } => {
                 // Check if server already exists
                 if self.peers.iter().any(|p| p == &server_address) {
-                    println!("Server {} already in cluster, skipping", server_address);
+                    tracing::info!("Server {} already in cluster, skipping", server_address);
                     return;
                 }
 
-                println!(
+                tracing::info!(
                     "Adding server {} ({}) to cluster",
-                    server_id, server_address
+                    server_id,
+                    server_address
                 );
                 self.peers.push(server_address);
 
                 // Reinitialize next_index and match_index for the new peer
                 self.next_index
-                    .push(self.log.len() + self.last_included_index + 1);
-                self.match_index.push(0);
+                    .push(self.log.len() + self.last_included_index); // next_index for new peer should be leader's last log index + 1
+                self.match_index.push(self.last_included_index); // match_index for new peer should be 0 (or last_included_index)
 
-                println!(
+                tracing::info!(
                     "Cluster now has {} peers: {:?}",
                     self.peers.len(),
                     self.peers
@@ -1157,12 +1617,13 @@ impl RaftNode {
                     let removed = self.peers.remove(server_id);
                     self.next_index.remove(server_id);
                     self.match_index.remove(server_id);
-                    println!(
+                    tracing::info!(
                         "Removed server {} from cluster. Remaining peers: {:?}",
-                        removed, self.peers
+                        removed,
+                        self.peers
                     );
                 } else {
-                    eprintln!(
+                    tracing::warn!(
                         "Cannot remove server {}: index out of bounds (have {} peers)",
                         server_id,
                         self.peers.len()
@@ -1173,7 +1634,13 @@ impl RaftNode {
     }
 
     fn apply_command(&self, command: &Command) {
-        let mut state = self.app_state.lock().unwrap();
+        let mut state = match self.app_state.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to lock app_state in apply_command: {:?}", e);
+                return;
+            }
+        };
         match command {
             Command::Master(cmd) => {
                 if let AppState::Master(ref mut master_state) = *state {
@@ -1187,10 +1654,11 @@ impl RaftNode {
                                     blocks: vec![],
                                 },
                             );
+                            tracing::info!("Created file {}", path);
                         }
                         MasterCommand::DeleteFile { path } => {
                             if master_state.files.remove(path).is_some() {
-                                println!("Deleted file {}", path);
+                                tracing::info!("Deleted file {}", path);
                             }
                         }
                         MasterCommand::AllocateBlock {
@@ -1204,6 +1672,9 @@ impl RaftNode {
                                     size: 0,
                                     locations: locations.clone(),
                                 });
+                                tracing::info!("Allocated block {} for file {}", block_id, path);
+                            } else {
+                                tracing::warn!("AllocateBlock: file {} not found", path);
                             }
                         }
                         MasterCommand::RegisterChunkServer { address: _ } => {
@@ -1220,33 +1691,37 @@ impl RaftNode {
                             if let Some(mut metadata) = master_state.files.remove(source_path) {
                                 metadata.path = dest_path.clone();
                                 master_state.files.insert(dest_path.clone(), metadata);
-                                println!(
-                                    "Renamed file from {} to {} (same-shard)",
-                                    source_path, dest_path
+                                tracing::info!(
+                                    "Renamed file from {} to {}",
+                                    source_path,
+                                    dest_path
                                 );
                             } else {
-                                eprintln!("RenameFile: source file {} not found", source_path);
+                                tracing::warn!("RenameFile: source file {} not found", source_path);
                             }
                         }
                         MasterCommand::CreateTransactionRecord { record } => {
                             master_state
                                 .transaction_records
                                 .insert(record.tx_id.clone(), record.clone());
-                            println!(
+                            tracing::info!(
                                 "Created transaction record: tx_id={}, state={:?}",
-                                record.tx_id, record.state
+                                record.tx_id,
+                                record.state
                             );
                         }
                         MasterCommand::UpdateTransactionState { tx_id, new_state } => {
                             if let Some(record) = master_state.transaction_records.get_mut(tx_id) {
                                 let old_state = record.state.clone();
                                 record.state = new_state.clone();
-                                println!(
+                                tracing::info!(
                                     "Updated transaction {} state: {:?} -> {:?}",
-                                    tx_id, old_state, new_state
+                                    tx_id,
+                                    old_state,
+                                    new_state
                                 );
                             } else {
-                                eprintln!(
+                                tracing::error!(
                                     "UpdateTransactionState: transaction {} not found",
                                     tx_id
                                 );
@@ -1257,23 +1732,28 @@ impl RaftNode {
                             match &operation.op_type {
                                 crate::master::TxOpType::Delete { path } => {
                                     if master_state.files.remove(path).is_some() {
-                                        println!("Transaction {}: deleted file {}", tx_id, path);
+                                        tracing::info!(
+                                            "Transaction {}: deleted file {}",
+                                            tx_id,
+                                            path
+                                        );
                                     } else {
-                                        eprintln!(
-                                            "Transaction {}: file {} not found for deletion",
-                                            tx_id, path
+                                        tracing::error!(
+                                            "Transaction {}: failed to delete file {}: not found",
+                                            tx_id,
+                                            path
                                         );
                                     }
                                 }
                                 crate::master::TxOpType::Create { path, metadata } => {
                                     master_state.files.insert(path.clone(), metadata.clone());
-                                    println!("Transaction {}: created file {}", tx_id, path);
+                                    tracing::info!("Transaction {}: created file {}", tx_id, path);
                                 }
                             }
                         }
                         MasterCommand::DeleteTransactionRecord { tx_id } => {
                             if master_state.transaction_records.remove(tx_id).is_some() {
-                                println!("Deleted transaction record: tx_id={}", tx_id);
+                                tracing::info!("Deleted transaction record: tx_id={}", tx_id);
                             } else {
                                 eprintln!(
                                     "DeleteTransactionRecord: transaction {} not found",
@@ -1283,7 +1763,7 @@ impl RaftNode {
                         }
                     }
                 } else {
-                    eprintln!("Error: Received MasterCommand but state is not MasterState");
+                    tracing::error!("Error: Received MasterCommand but state is not MasterState");
                 }
             }
             Command::Config(cmd) => {
@@ -1297,13 +1777,13 @@ impl RaftNode {
                         }
                     }
                 } else {
-                    eprintln!("Error: Received ConfigCommand but state is not ConfigState");
+                    tracing::error!("Error: Received ConfigCommand but state is not ConfigState");
                 }
             }
             Command::Membership(cmd) => {
                 // Membership commands are handled separately in apply_membership_command
                 // They modify the RaftNode's peer list, not the application state
-                println!("Membership command applied via log: {:?}", cmd);
+                tracing::info!("Membership command applied via log: {:?}", cmd);
             }
             Command::NoOp => {}
         }

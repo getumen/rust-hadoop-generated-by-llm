@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 #[derive(Debug, Clone)]
 pub struct MyChunkServer {
@@ -13,7 +14,7 @@ pub struct MyChunkServer {
 
 impl MyChunkServer {
     pub fn new(storage_dir: PathBuf, master_addrs: Vec<String>) -> Self {
-        fs::create_dir_all(&storage_dir).unwrap();
+        fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
         MyChunkServer {
             storage_dir,
             master_addrs,
@@ -92,7 +93,7 @@ impl MyChunkServer {
     }
 
     async fn recover_block(&self, block_id: &str) -> Result<(), String> {
-        eprintln!(
+        tracing::info!(
             "Attempting to recover block {} from healthy replica",
             block_id
         );
@@ -120,12 +121,16 @@ impl MyChunkServer {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to get block locations from {}: {}", master_addr, e);
+                            tracing::error!(
+                                "Failed to get block locations from {}: {}",
+                                master_addr,
+                                e
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to connect to master {}: {}", master_addr, e);
+                    tracing::error!("Failed to connect to master {}: {}", master_addr, e);
                 }
             }
         }
@@ -141,7 +146,7 @@ impl MyChunkServer {
                 continue; // Skip ourselves
             }
 
-            eprintln!("Trying to fetch block {} from {}", block_id, location);
+            tracing::info!("Trying to fetch block {} from {}", block_id, location);
 
             match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
                 format!("http://{}", location),
@@ -161,26 +166,30 @@ impl MyChunkServer {
                             if self.verify_block(block_id, &data).is_ok() {
                                 // 4. Replace corrupted block
                                 if let Err(e) = self.write_block_local(block_id, &data) {
-                                    eprintln!("Failed to write recovered block: {}", e);
+                                    tracing::error!("Failed to write recovered block: {}", e);
                                     continue;
                                 }
 
-                                eprintln!(
+                                tracing::info!(
                                     "Successfully recovered block {} from {}",
-                                    block_id, location
+                                    block_id,
+                                    location
                                 );
                                 return Ok(());
                             } else {
-                                eprintln!("Fetched block from {} is also corrupted", location);
+                                tracing::error!(
+                                    "Fetched block from {} is also corrupted",
+                                    location
+                                );
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to read block from {}: {}", location, e);
+                            tracing::error!("Failed to read block from {}: {}", location, e);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to connect to {}: {}", location, e);
+                    tracing::error!("Failed to connect to {}: {}", location, e);
                 }
             }
         }
@@ -241,7 +250,7 @@ impl MyChunkServer {
 
         loop {
             tokio::time::sleep(interval).await;
-            println!("Starting background block scrubber...");
+            tracing::info!("Starting background block scrubber...");
 
             let server_clone = server.clone();
             let storage_dir_clone = storage_dir.clone();
@@ -268,20 +277,22 @@ impl MyChunkServer {
                                 match fs::read(&path) {
                                     Ok(data) => match server_clone.verify_block(block_id, &data) {
                                         Ok(_) => {}
-                                        Err(e) => {
-                                            eprintln!(
-                                                "CRITICAL: Scrubber detected corruption in block {}: {}",
-                                                block_id, e
+                                        Err(_e) => {
+                                            tracing::error!(
+                                                "Corruption detected in block {} by scrubber!",
+                                                block_id
                                             );
                                             corrupted_blocks.push(block_id.to_string());
                                         }
                                     },
-                                    Err(e) => eprintln!("Failed to read block {}: {}", block_id, e),
+                                    Err(_e) => {
+                                        tracing::error!("Failed to read block {}: {}", block_id, _e)
+                                    }
                                 }
                             }
                         }
                     }
-                    Err(e) => eprintln!("Failed to read storage directory: {}", e),
+                    Err(e) => tracing::error!("Failed to read storage directory: {}", e),
                 }
                 corrupted_blocks
             })
@@ -290,16 +301,20 @@ impl MyChunkServer {
             match result {
                 Ok(corrupted_blocks) => {
                     for block_id in corrupted_blocks {
-                        eprintln!("Attempting background recovery for block {}", block_id);
+                        tracing::info!("Attempting background recovery for block {}", block_id);
                         if let Err(e) = server.recover_block(&block_id).await {
-                            eprintln!("Background recovery failed for block {}: {}", block_id, e);
+                            tracing::error!(
+                                "Background recovery failed for block {}: {}",
+                                block_id,
+                                e
+                            );
                         }
                     }
                 }
-                Err(e) => eprintln!("Scrubber task failed: {}", e),
+                Err(e) => tracing::error!("Scrubber task failed: {}", e),
             }
 
-            println!("Background block scrubber finished.");
+            tracing::info!("Background block scrubber finished.");
         }
     }
 }
@@ -310,170 +325,195 @@ impl ChunkServerService for MyChunkServer {
         &self,
         request: Request<WriteBlockRequest>,
     ) -> Result<Response<WriteBlockResponse>, Status> {
-        let req = request.into_inner();
+        let request_id = dfs_common::telemetry::get_request_id(&request);
+        let span = tracing::info_span!("write_block", request_id = %request_id);
+        async move {
+            let req = request.into_inner();
+            // ...
 
-        // Write block locally with checksums
-        if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
-            return Ok(Response::new(WriteBlockResponse {
-                success: false,
-                error_message: e.to_string(),
-            }));
-        }
+            // Write block locally with checksums
+            if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
+                return Ok(Response::new(WriteBlockResponse {
+                    success: false,
+                    error_message: e.to_string(),
+                }));
+            }
 
-        // If there are next servers in the pipeline, replicate to them
-        if !req.next_servers.is_empty() {
-            let next_server = &req.next_servers[0];
-            let remaining_servers = req.next_servers[1..].to_vec();
+            // If there are next servers in the pipeline, replicate to them
+            if !req.next_servers.is_empty() {
+                let next_server = &req.next_servers[0];
+                let remaining_servers = req.next_servers[1..].to_vec();
 
-            // Forward to next server in pipeline
-            let next_addr = format!("http://{}", next_server);
-            match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
-                next_addr,
-            )
-            .await
-            {
-                Ok(client) => {
-                    let mut client = client.max_decoding_message_size(100 * 1024 * 1024);
-                    let replicate_req = crate::dfs::ReplicateBlockRequest {
-                        block_id: req.block_id,
-                        data: req.data,
-                        next_servers: remaining_servers,
-                    };
+                // Forward to next server in pipeline
+                let next_addr = format!("http://{}", next_server);
+                match tonic::transport::Endpoint::from_shared(next_addr.clone()) {
+                    Ok(endpoint) => match endpoint.connect().await {
+                        Ok(channel) => {
+                            let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id.clone()))
+                                .max_decoding_message_size(100 * 1024 * 1024);
+                            let replicate_req = crate::dfs::ReplicateBlockRequest {
+                                block_id: req.block_id,
+                                data: req.data,
+                                next_servers: remaining_servers,
+                            };
 
-                    if let Err(e) = client.replicate_block(replicate_req).await {
-                        eprintln!("Failed to replicate to {}: {}", next_server, e);
-                        // Continue even if replication fails
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Failed to connect to {} for replication: {}",
-                        next_server, e
-                    );
+                            if let Err(e) = client.replicate_block(replicate_req).await {
+                                tracing::error!("Failed to replicate to {}: {}", next_server, e);
+                                // Continue even if replication fails
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to connect to {} for replication: {}",
+                                next_server,
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => tracing::error!("Invalid URL {}: {}", next_addr, e),
                 }
             }
-        }
 
-        Ok(Response::new(WriteBlockResponse {
-            success: true,
-            error_message: "".to_string(),
-        }))
+            Ok(Response::new(WriteBlockResponse {
+                success: true,
+                error_message: "".to_string(),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn read_block(
         &self,
         request: Request<ReadBlockRequest>,
     ) -> Result<Response<ReadBlockResponse>, Status> {
-        let req = request.into_inner();
-        let path = self.storage_dir.join(&req.block_id);
+        let request_id = dfs_common::telemetry::get_request_id(&request);
+        let span = tracing::info_span!("read_block", request_id = %request_id);
+        async move {
+            let req = request.into_inner();
+            let path = self.storage_dir.join(&req.block_id);
 
-        match fs::File::open(&path) {
-            Ok(mut file) => {
-                let mut data = Vec::new();
-                if let Err(e) = file.read_to_end(&mut data) {
-                    return Err(Status::internal(e.to_string()));
-                }
+            match fs::File::open(&path) {
+                Ok(mut file) => {
+                    let mut data = Vec::new();
+                    if let Err(e) = file.read_to_end(&mut data) {
+                        return Err(Status::internal(e.to_string()));
+                    }
 
-                // Verify checksums
-                if let Err(e) = self.verify_block(&req.block_id, &data) {
-                    eprintln!(
-                        "CRITICAL: Data corruption detected for block {}: {}",
-                        req.block_id, e
-                    );
+                    // Verify checksums
+                    if let Err(e) = self.verify_block(&req.block_id, &data) {
+                        tracing::error!(
+                            "CRITICAL: Data corruption detected for block {}: {}",
+                            req.block_id,
+                            e
+                        );
 
-                    // Attempt automatic recovery
-                    eprintln!("Attempting automatic recovery for block {}", req.block_id);
-                    match self.recover_block(&req.block_id).await {
-                        Ok(_) => {
-                            eprintln!(
-                                "Block {} successfully recovered, retrying read",
-                                req.block_id
-                            );
-                            // Re-read the recovered block
-                            let mut file = fs::File::open(&path)
-                                .map_err(|e| Status::internal(e.to_string()))?;
-                            let mut recovered_data = Vec::new();
-                            file.read_to_end(&mut recovered_data)
-                                .map_err(|e| Status::internal(e.to_string()))?;
+                        // Attempt automatic recovery
+                        tracing::warn!("Attempting automatic recovery for block {}", req.block_id);
+                        match self.recover_block(&req.block_id).await {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "Block {} successfully recovered, retrying read",
+                                    req.block_id
+                                );
+                                // Re-read the recovered block
+                                let mut file = fs::File::open(&path)
+                                    .map_err(|e| Status::internal(e.to_string()))?;
+                                let mut recovered_data = Vec::new();
+                                file.read_to_end(&mut recovered_data)
+                                    .map_err(|e| Status::internal(e.to_string()))?;
 
-                            // Verify recovered data
-                            if let Err(e) = self.verify_block(&req.block_id, &recovered_data) {
+                                // Verify recovered data
+                                if let Err(e) = self.verify_block(&req.block_id, &recovered_data) {
+                                    return Err(Status::data_loss(format!(
+                                        "Recovered block is still corrupted: {}",
+                                        e
+                                    )));
+                                }
+
+                                return Ok(Response::new(ReadBlockResponse {
+                                    data: recovered_data,
+                                }));
+                            }
+                            Err(recovery_err) => {
+                                tracing::error!(
+                                    "Failed to recover block {}: {}",
+                                    req.block_id,
+                                    recovery_err
+                                );
                                 return Err(Status::data_loss(format!(
-                                    "Recovered block is still corrupted: {}",
-                                    e
+                                    "Data corruption detected: {}. Recovery failed: {}",
+                                    e, recovery_err
                                 )));
                             }
-
-                            return Ok(Response::new(ReadBlockResponse {
-                                data: recovered_data,
-                            }));
-                        }
-                        Err(recovery_err) => {
-                            eprintln!("Failed to recover block {}: {}", req.block_id, recovery_err);
-                            return Err(Status::data_loss(format!(
-                                "Data corruption detected: {}. Recovery failed: {}",
-                                e, recovery_err
-                            )));
                         }
                     }
-                }
 
-                Ok(Response::new(ReadBlockResponse { data }))
+                    Ok(Response::new(ReadBlockResponse { data }))
+                }
+                Err(_) => Err(Status::not_found("Block not found")),
             }
-            Err(_) => Err(Status::not_found("Block not found")),
         }
+        .instrument(span)
+        .await
     }
 
     async fn replicate_block(
         &self,
         request: Request<crate::dfs::ReplicateBlockRequest>,
     ) -> Result<Response<crate::dfs::ReplicateBlockResponse>, Status> {
-        let req = request.into_inner();
+        let request_id = dfs_common::telemetry::get_request_id(&request);
+        let span = tracing::info_span!("replicate_block", request_id = %request_id);
+        async move {
+            let req = request.into_inner();
 
-        // Write block locally with checksums
-        if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
-            return Ok(Response::new(crate::dfs::ReplicateBlockResponse {
-                success: false,
-                error_message: e.to_string(),
-            }));
-        }
+            // Write block locally with checksums
+            if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
+                return Ok(Response::new(crate::dfs::ReplicateBlockResponse {
+                    success: false,
+                    error_message: e.to_string(),
+                }));
+            }
 
-        // If there are more servers in the pipeline, continue replication
-        if !req.next_servers.is_empty() {
-            let next_server = &req.next_servers[0];
-            let remaining_servers = req.next_servers[1..].to_vec();
+            if !req.next_servers.is_empty() {
+                let next_server = &req.next_servers[0];
+                let remaining_servers = req.next_servers[1..].to_vec();
 
-            let next_addr = format!("http://{}", next_server);
-            match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
-                next_addr,
-            )
-            .await
-            {
-                Ok(client) => {
-                    let mut client = client.max_decoding_message_size(100 * 1024 * 1024);
-                    let replicate_req = crate::dfs::ReplicateBlockRequest {
-                        block_id: req.block_id,
-                        data: req.data,
-                        next_servers: remaining_servers,
-                    };
+                let next_addr = format!("http://{}", next_server);
+                match tonic::transport::Endpoint::from_shared(next_addr.clone()) {
+                    Ok(endpoint) => match endpoint.connect().await {
+                        Ok(channel) => {
+                            let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id))
+                                .max_decoding_message_size(100 * 1024 * 1024);
+                            let replicate_req = crate::dfs::ReplicateBlockRequest {
+                                block_id: req.block_id,
+                                data: req.data,
+                                next_servers: remaining_servers,
+                            };
 
-                    if let Err(e) = client.replicate_block(replicate_req).await {
-                        eprintln!("Failed to replicate to {}: {}", next_server, e);
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Failed to connect to {} for replication: {}",
-                        next_server, e
-                    );
+                            if let Err(e) = client.replicate_block(replicate_req).await {
+                                tracing::error!("Failed to replicate to {}: {}", next_server, e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to connect to {} for replication: {}",
+                                next_server,
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => tracing::error!("Invalid URL {}: {}", next_addr, e),
                 }
             }
-        }
 
-        Ok(Response::new(crate::dfs::ReplicateBlockResponse {
-            success: true,
-            error_message: "".to_string(),
-        }))
+            Ok(Response::new(crate::dfs::ReplicateBlockResponse {
+                success: true,
+                error_message: "".to_string(),
+            }))
+        }
+        .instrument(span)
+        .await
     }
 }
 

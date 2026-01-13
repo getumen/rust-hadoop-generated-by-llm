@@ -22,19 +22,23 @@ prost = "0.14"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.19", features = ["v4"] }
+uuid = { version = "1.11", features = ["v4"] }
 clap = { version = "4.0", features = ["derive"] }
-futures = "0.3"
+
 bytes = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
 axum = "0.8"
-tower = "0.5"
+
 tower-http = { version = "0.6", features = ["trace"] }
 rand = "0.9"
 rocksdb = "0.24"
 tonic-prost = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+dfs-common = { path = "../common" }
 
-async-trait = "0.1"
+
 prometheus = "0.13"
 
 [build-dependencies]

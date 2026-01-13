@@ -5,6 +5,7 @@ use dfs_chunkserver::dfs::master_service_client::MasterServiceClient;
 use dfs_chunkserver::dfs::RegisterChunkServerRequest;
 use std::path::PathBuf;
 use tonic::transport::Server;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -24,7 +25,15 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "chunkserver=debug,dfs_chunkserver=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let args = Args::parse();
     let addr = args.addr.parse()?;
 
@@ -70,17 +79,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         match client.register_chunk_server(request).await {
                             Ok(_) => {
-                                println!("✓ Registered with Master at {}", master_addr);
+                                tracing::info!("✓ Registered with Master at {}", master_addr);
                                 registered = true;
                                 // We try to register with all masters initially
                             }
                             Err(e) => {
-                                eprintln!("Failed to register with Master {}: {}", master_addr, e)
+                                tracing::error!(
+                                    "Failed to register with Master {}: {}",
+                                    master_addr,
+                                    e
+                                )
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to connect to Master {}: {}", master_addr, e);
+                        tracing::error!("Failed to connect to Master {}: {}", master_addr, e);
                     }
                 }
             }
@@ -88,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if registered {
                 break;
             } else {
-                eprintln!("✗ Failed to register with any Master. Retrying...");
+                tracing::warn!("✗ Failed to register with any Master. Retrying...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
         }
@@ -160,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    println!("ChunkServer listening on {}", addr);
+    tracing::info!("ChunkServer listening on {}", addr);
 
     Server::builder()
         .add_service(

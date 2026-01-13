@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dfs_client::Client;
 use std::path::PathBuf;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(
@@ -82,7 +83,15 @@ enum ClusterAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "dfs_cli=info,dfs_client=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let cli = Cli::parse();
 
     let master_addrs: Vec<String> = cli

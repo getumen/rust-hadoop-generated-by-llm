@@ -11,6 +11,7 @@ use crate::dfs::{
     ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
 use crate::sharding::ShardMap;
+use anyhow::{anyhow, bail};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -70,10 +71,7 @@ impl Client {
         url.to_string()
     }
 
-    pub async fn list_files(
-        &self,
-        path: &str,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn list_files(&self, path: &str) -> anyhow::Result<Vec<String>> {
         let (response, _) = self
             .execute_rpc(Some(path), |mut client| {
                 let path = path.to_string();
@@ -87,9 +85,7 @@ impl Client {
         Ok(response.into_inner().files)
     }
 
-    pub async fn list_all_files(
-        &self,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn list_all_files(&self) -> anyhow::Result<Vec<String>> {
         let (shards, default_masters) = {
             let map = self.shard_map.read().unwrap();
             (map.get_all_shards(), self.master_addrs.clone())
@@ -151,7 +147,7 @@ impl Client {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to list files from shard {}: {}", shard_id, e);
+                        tracing::warn!("Failed to list files from shard {}: {}", shard_id, e);
                         return Err(e);
                     }
                 }
@@ -161,11 +157,7 @@ impl Client {
         Ok(all_files.into_iter().collect())
     }
 
-    pub async fn create_file(
-        &self,
-        source: &Path,
-        dest: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn create_file(&self, source: &Path, dest: &str) -> anyhow::Result<()> {
         // 1. Create file on Master
         let (create_resp, success_addr) = self
             .execute_rpc(Some(dest), |mut client| {
@@ -187,7 +179,7 @@ impl Client {
         let create_resp = create_resp.into_inner();
 
         if !create_resp.success {
-            return Err(format!("Failed to create file: {}", create_resp.error_message).into());
+            bail!("Failed to create file: {}", create_resp.error_message);
         }
 
         // 2. Read local file
@@ -231,24 +223,33 @@ impl Client {
             .await?;
         let alloc_resp = alloc_resp.into_inner();
 
-        let block = alloc_resp.block.ok_or("No block allocated")?;
+        let block = alloc_resp
+            .block
+            .ok_or_else(|| anyhow!("No block allocated"))?;
         let chunk_servers = alloc_resp.chunk_server_addresses;
 
         if chunk_servers.is_empty() {
-            return Err("No chunk servers available".into());
+            bail!("No chunk servers available");
         }
 
-        println!(
-            "Replicating to {} servers: {:?}",
-            chunk_servers.len(),
-            chunk_servers
+        tracing::info!(
+            block_id = %block.block_id,
+            chunk_servers = ?chunk_servers,
+            "Writing block to chunk servers"
         );
 
         // 4. Write to first chunk server with replication pipeline
         let chunk_server_addr = format!("http://{}", chunk_servers[0]);
         let resolved_addr = self.resolve_url(&chunk_server_addr);
-        let mut chunk_client = ChunkServerServiceClient::connect(resolved_addr)
-            .await?
+        let channel = tonic::transport::Endpoint::from_shared(resolved_addr.clone())?
+            .connect()
+            .await?;
+        let mut chunk_client =
+            crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(
+                channel,
+                dfs_common::telemetry::tracing_interceptor
+                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            )
             .max_decoding_message_size(100 * 1024 * 1024);
 
         let next_servers = chunk_servers[1..].to_vec();
@@ -261,17 +262,13 @@ impl Client {
 
         let write_resp = chunk_client.write_block(write_req).await?.into_inner();
         if !write_resp.success {
-            return Err(format!("Failed to write block: {}", write_resp.error_message).into());
+            bail!("Failed to write block: {}", write_resp.error_message);
         }
 
         Ok(())
     }
 
-    pub async fn get_file(
-        &self,
-        source: &str,
-        dest: &Path,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_file(&self, source: &str, dest: &Path) -> anyhow::Result<()> {
         // 1. Get file info from Master
         let (info_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -285,16 +282,16 @@ impl Client {
         let info_resp = info_resp.into_inner();
 
         if !info_resp.found {
-            return Err("File not found".into());
+            bail!("File not found");
         }
 
-        let metadata = info_resp.metadata.ok_or("No metadata")?;
+        let metadata = info_resp.metadata.ok_or_else(|| anyhow!("No metadata"))?;
         let mut file = File::create(dest)?;
 
         // 2. Read blocks from ChunkServers
         for block in metadata.blocks {
             if block.locations.is_empty() {
-                eprintln!("Block {} has no locations", block.block_id);
+                tracing::warn!("Block {} has no locations", block.block_id);
                 continue;
             }
 
@@ -302,28 +299,42 @@ impl Client {
             for location in block.locations {
                 let chunk_server_addr = format!("http://{}", location);
                 let resolved_addr = self.resolve_url(&chunk_server_addr);
-                match ChunkServerServiceClient::connect(resolved_addr).await {
-                    Ok(client) => {
-                        let mut chunk_client = client.max_decoding_message_size(100 * 1024 * 1024);
-                        let read_req = tonic::Request::new(ReadBlockRequest {
-                            block_id: block.block_id.clone(),
-                        });
-                        match chunk_client.read_block(read_req).await {
-                            Ok(response) => {
-                                let data = response.into_inner().data;
-                                file.write_all(&data)?;
-                                success = true;
-                                break;
+                let channel_res = tonic::transport::Endpoint::from_shared(resolved_addr.clone());
+                match channel_res {
+                    Ok(endpoint) => match endpoint.connect().await {
+                        Ok(channel) => {
+                            let mut client = ChunkServerServiceClient::with_interceptor(
+                                channel,
+                                dfs_common::telemetry::tracing_interceptor
+                                    as fn(
+                                        tonic::Request<()>,
+                                    )
+                                        -> Result<tonic::Request<()>, tonic::Status>,
+                            )
+                            .max_decoding_message_size(100 * 1024 * 1024);
+                            let request = tonic::Request::new(ReadBlockRequest {
+                                block_id: block.block_id.clone(),
+                            });
+                            match client.read_block(request).await {
+                                Ok(response) => {
+                                    let data = response.into_inner().data;
+                                    file.write_all(&data)?;
+                                    success = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to read block from {}: {}", location, e)
+                                }
                             }
-                            Err(e) => eprintln!("Failed to read block from {}: {}", location, e),
                         }
-                    }
-                    Err(e) => eprintln!("Failed to connect to {}: {}", location, e),
+                        Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
+                    },
+                    Err(e) => tracing::error!("Invalid URL {}: {}", resolved_addr, e),
                 }
             }
 
             if !success {
-                return Err(format!("Failed to read block {}", block.block_id).into());
+                bail!("Failed to read block {} from any location", block.block_id);
             }
         }
 
@@ -346,10 +357,7 @@ impl Client {
         Ok(info_resp.into_inner().found)
     }
 
-    pub async fn delete_file(
-        &self,
-        path: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
         let (delete_resp, _) = self
             .execute_rpc(Some(path), |mut client| {
                 let path = path.to_string();
@@ -370,17 +378,13 @@ impl Client {
         let delete_resp = delete_resp.into_inner();
 
         if !delete_resp.success {
-            return Err(format!("Failed to delete file: {}", delete_resp.error_message).into());
+            bail!("Failed to delete file: {}", delete_resp.error_message);
         }
 
         Ok(())
     }
 
-    pub async fn rename_file(
-        &self,
-        source: &str,
-        dest: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn rename_file(&self, source: &str, dest: &str) -> anyhow::Result<()> {
         // Use source path for routing
         let (rename_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -415,18 +419,21 @@ impl Client {
         if rename_resp.success {
             Ok(())
         } else {
-            Err(format!("Failed to rename file: {}", rename_resp.error_message).into())
+            bail!("Failed to rename file: {}", rename_resp.error_message);
         }
     }
 
-    async fn execute_rpc<F, Fut, T>(
-        &self,
-        key: Option<&str>,
-        f: F,
-    ) -> Result<(T, String), Box<dyn std::error::Error + Send + Sync>>
+    async fn execute_rpc<F, Fut, R>(&self, key: Option<&str>, f: F) -> anyhow::Result<(R, String)>
     where
-        F: Fn(MasterServiceClient<Channel>) -> Fut,
-        Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+        F: Fn(
+            MasterServiceClient<
+                tonic::service::interceptor::InterceptedService<
+                    Channel,
+                    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                >,
+            >,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<R, tonic::Status>>,
     {
         let mut initial_targets = Vec::new();
         if let Some(k) = key {
@@ -457,9 +464,16 @@ impl Client {
         max_retries: usize,
         initial_backoff_ms: u64,
         f: F,
-    ) -> Result<(T, String), Box<dyn std::error::Error + Send + Sync>>
+    ) -> anyhow::Result<(T, String)>
     where
-        F: Fn(MasterServiceClient<Channel>) -> Fut,
+        F: Fn(
+            MasterServiceClient<
+                tonic::service::interceptor::InterceptedService<
+                    Channel,
+                    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                >,
+            >,
+        ) -> Fut,
         Fut: std::future::Future<Output = Result<T, tonic::Status>>,
     {
         let mut attempt = 0;
@@ -475,7 +489,7 @@ impl Client {
                 } else {
                     format!("http://{}", hint)
                 };
-                eprintln!("Using leader hint with prefix: {}", hint_with_prefix);
+                tracing::info!("Using leader hint with prefix: {}", hint_with_prefix);
                 let mut t = vec![hint_with_prefix];
                 t.extend_from_slice(masters);
                 t
@@ -489,16 +503,30 @@ impl Client {
                 }
 
                 let resolved_addr = self.resolve_url(&master_addr);
-                let client = match MasterServiceClient::connect(resolved_addr.clone()).await {
-                    Ok(c) => c,
+                let channel = match tonic::transport::Endpoint::from_shared(resolved_addr.clone()) {
+                    Ok(endpoint) => match endpoint.connect().await {
+                        Ok(channel) => channel,
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to connect to {} (resolved: {}): {}",
+                                master_addr,
+                                resolved_addr,
+                                e
+                            );
+                            continue;
+                        }
+                    },
                     Err(e) => {
-                        eprintln!(
-                            "Failed to connect to {} (resolved: {}): {}",
-                            master_addr, resolved_addr, e
-                        );
+                        tracing::error!("Invalid URL {}: {}", resolved_addr, e);
                         continue;
                     }
                 };
+
+                let client = MasterServiceClient::with_interceptor(
+                    channel,
+                    dfs_common::telemetry::tracing_interceptor
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                );
                 let client = client.max_decoding_message_size(100 * 1024 * 1024);
 
                 match f(client).await {
@@ -509,7 +537,7 @@ impl Client {
                             let parts: Vec<&str> = msg.splitn(2, ':').collect();
                             if parts.len() > 1 && !parts[1].is_empty() {
                                 leader_hint = Some(parts[1].to_string());
-                                eprintln!("Received SHARD REDIRECT to: {}", parts[1]);
+                                tracing::info!("Received SHARD REDIRECT to: {}", parts[1]);
                                 break;
                             }
                         }
@@ -518,7 +546,7 @@ impl Client {
                             let parts: Vec<&str> = msg.split('|').collect();
                             if parts.len() > 1 && !parts[1].is_empty() {
                                 leader_hint = Some(parts[1].to_string());
-                                eprintln!("Received leader hint: {}", parts[1]);
+                                tracing::info!("Received leader hint: {}", parts[1]);
                                 break;
                             }
                         }
@@ -526,7 +554,7 @@ impl Client {
                         if msg.contains("Not Leader") || status.code() == tonic::Code::Unavailable {
                             continue;
                         }
-                        return Err(Box::new(status));
+                        return Err(status.into());
                     }
                 }
             }
@@ -536,14 +564,14 @@ impl Client {
             }
 
             if leader_hint.is_some() {
-                eprintln!("Retrying with leader hint...");
+                tracing::info!("Retrying with leader hint...");
             } else {
-                eprintln!("No leader found, retrying in {:?}...", backoff);
+                tracing::info!("No leader found, retrying in {:?}...", backoff);
                 sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, Duration::from_secs(5));
             }
         }
 
-        Err("No available leader found after retries".into())
+        bail!("No available leader found after retries")
     }
 }
