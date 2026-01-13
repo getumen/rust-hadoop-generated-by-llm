@@ -14,6 +14,7 @@ use quick_xml::se::to_string;
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -115,66 +116,80 @@ pub async fn handle_request(
     headers: HeaderMap,
     method: Method,
     body: Body,
-) -> impl IntoResponse {
-    let body_bytes = axum::body::to_bytes(body, 1024 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
+) -> Response {
+    let request_id = headers
+        .get(dfs_common::telemetry::REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
-    let bucket = parts[0];
-    let key = if parts.len() > 1 { parts[1] } else { "" };
+    let span =
+        tracing::info_span!("s3_request", method = %method, path = %path, request_id = %request_id);
 
-    if key.is_empty() {
-        match method {
-            Method::PUT => create_bucket(state, bucket).await,
-            Method::DELETE => delete_bucket(state, bucket).await,
-            Method::HEAD => head_bucket(state, bucket).await,
-            Method::GET => {
-                if let Some(2) = params.list_type {
-                    list_objects_v2(state, bucket, params).await
-                } else {
-                    list_objects(state, bucket, params).await
+    async move {
+        let body_bytes = axum::body::to_bytes(body, 1024 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        let bucket = parts[0];
+        let key = if parts.len() > 1 { parts[1] } else { "" };
+
+        if key.is_empty() {
+            match method {
+                Method::PUT => create_bucket(state, bucket).await,
+                Method::DELETE => delete_bucket(state, bucket).await,
+                Method::HEAD => head_bucket(state, bucket).await,
+                Method::GET => {
+                    if let Some(2) = params.list_type {
+                        list_objects_v2(state, bucket, params).await
+                    } else {
+                        list_objects(state, bucket, params).await
+                    }
                 }
+                _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
             }
-            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-        }
-    } else {
-        // Multipart Upload Routing
-        if params.uploads.is_some() && method == Method::POST {
-            return initiate_multipart_upload(state, bucket, key).await;
-        }
-        if params.delete.is_some() && method == Method::POST {
-            return delete_multiple_objects(state, bucket, body_bytes).await;
-        }
-        if let Some(upload_id) = params.upload_id {
-            if let Some(part_number) = params.part_number {
-                if method == Method::PUT {
-                    return upload_part(state, bucket, key, upload_id, part_number, body_bytes)
+        } else {
+            // Multipart Upload Routing
+            if params.uploads.is_some() && method == Method::POST {
+                return initiate_multipart_upload(state, bucket, key).await;
+            }
+            if params.delete.is_some() && method == Method::POST {
+                return delete_multiple_objects(state, bucket, body_bytes).await;
+            }
+            if let Some(upload_id) = params.upload_id {
+                if let Some(part_number) = params.part_number {
+                    if method == Method::PUT {
+                        return upload_part(state, bucket, key, upload_id, part_number, body_bytes)
+                            .await;
+                    }
+                }
+                if method == Method::POST {
+                    return complete_multipart_upload(state, bucket, key, upload_id, body_bytes)
                         .await;
                 }
+                if method == Method::DELETE {
+                    return abort_multipart_upload(state, bucket, key, upload_id).await;
+                }
             }
-            if method == Method::POST {
-                return complete_multipart_upload(state, bucket, key, upload_id, body_bytes).await;
-            }
-            if method == Method::DELETE {
-                return abort_multipart_upload(state, bucket, key, upload_id).await;
-            }
-        }
 
-        // Copy Object Routing
-        if method == Method::PUT && headers.contains_key("x-amz-copy-source") {
-            let source = headers.get("x-amz-copy-source").unwrap().to_str().unwrap();
-            return copy_object(state, bucket, key, source).await;
-        }
+            // Copy Object Routing
+            if method == Method::PUT && headers.contains_key("x-amz-copy-source") {
+                let source = headers.get("x-amz-copy-source").unwrap().to_str().unwrap();
+                return copy_object(state, bucket, key, source).await;
+            }
 
-        match method {
-            Method::PUT => put_object(state, bucket, key, body_bytes, headers).await,
-            Method::GET => get_object(state, bucket, key, headers).await,
-            Method::DELETE => delete_object(state, bucket, key).await,
-            Method::HEAD => head_object(state, bucket, key).await,
-            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+            match method {
+                Method::PUT => put_object(state, bucket, key, body_bytes, headers).await,
+                Method::GET => get_object(state, bucket, key, headers).await,
+                Method::DELETE => delete_object(state, bucket, key).await,
+                Method::HEAD => head_object(state, bucket, key).await,
+                _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+            }
         }
     }
+    .instrument(span)
+    .await
 }
 
 async fn initiate_multipart_upload(state: S3AppState, bucket: &str, key: &str) -> Response {

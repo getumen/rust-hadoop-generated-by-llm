@@ -1,0 +1,18 @@
+# Rustfmt configuration for rust-hadoop project
+# See: https://rust-lang.github.io/rustfmt/
+
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+use_small_heuristics = "Default"
+reorder_imports = true
+reorder_modules = true
+
+# Unstable options (require nightly rustfmt):
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"
+# format_code_in_doc_comments = true
+# format_strings = false
+# wrap_comments = true
+# comment_width = 80
+# normalize_comments = true

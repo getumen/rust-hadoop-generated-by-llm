@@ -13,6 +13,7 @@ serde_json = "1.0"
 quick-xml = { version = "0.38", features = ["serialize"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dfs-common = { path = "../common" }
 anyhow = "1.0"
 dfs-client = { path = "../client" }
 bytes = "1.0"
