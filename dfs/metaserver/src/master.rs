@@ -339,7 +339,7 @@ impl MasterState {
     }
 }
 
-use crate::sharding::{ShardId, ShardMap};
+use dfs_common::sharding::{ShardId, ShardMap};
 
 // ============================================================================
 // Throughput Monitoring for Dynamic Sharding

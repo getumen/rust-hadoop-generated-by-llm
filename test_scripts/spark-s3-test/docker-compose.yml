@@ -43,9 +43,12 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--master-addr", "dfs-master1-shard1:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "dfs-chunkserver1-shard1:50052" ]
+    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--config-servers", "http://dfs-master1-shard1:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "dfs-chunkserver1-shard1:50052" ]
     volumes:
       - cs1-shard1-data:/data/chunks
+      - ../../shard_config.json:/app/shard_config.json:ro
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
     depends_on:
       - master1-shard1
     networks:
@@ -58,9 +61,12 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--master-addr", "dfs-master1-shard2:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "dfs-chunkserver1-shard2:50052" ]
+    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--config-servers", "http://dfs-master1-shard2:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "dfs-chunkserver1-shard2:50052" ]
     volumes:
       - cs1-shard2-data:/data/chunks
+      - ../../shard_config.json:/app/shard_config.json:ro
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
     depends_on:
       - master1-shard2
     networks:
@@ -77,6 +83,7 @@ services:
     environment:
       - MASTER_ADDR=http://dfs-master1-shard1:50051
       - SHARD_CONFIG=/app/shard_config.json
+      - RUST_LOG=dfs_client=debug,s3_server=debug,tower_http=debug
     volumes:
       - ../../shard_config.json:/app/shard_config.json:ro
     ports:

@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let shard_config_path = std::env::var("SHARD_CONFIG").ok();
     if let Some(path) = shard_config_path {
         tracing::info!("Loading shard config from {}", path);
-        let shard_map = dfs_client::sharding::load_shard_map_from_config(Some(&path), 100);
+        let shard_map = dfs_common::sharding::load_shard_map_from_config(Some(&path), 100);
         client.set_shard_map(shard_map);
     }
 

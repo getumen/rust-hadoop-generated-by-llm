@@ -55,13 +55,23 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(async move {
         // 1. Initial Discovery
-        loop {
-            if chunk_server_heartbeat.refresh_shard_map().await.is_ok() {
-                tracing::info!("✓ Initial shard map fetched");
-                break;
+        // Check if shard map is already loaded
+        let needs_fetch = {
+            let shard_map = chunk_server_heartbeat.shard_map.lock().unwrap();
+            shard_map.get_all_masters().is_empty()
+        };
+
+        if needs_fetch {
+            loop {
+                if chunk_server_heartbeat.refresh_shard_map().await.is_ok() {
+                    tracing::info!("✓ Initial shard map fetched");
+                    break;
+                }
+                tracing::warn!("✗ Failed to fetch initial shard map. Retrying...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
-            tracing::warn!("✗ Failed to fetch initial shard map. Retrying...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        } else {
+            tracing::info!("✓ Shard map already loaded from config file");
         }
 
         // 2. Main Loop: Refresh ShardMap & Heartbeat to all Masters

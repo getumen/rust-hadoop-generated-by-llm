@@ -2,16 +2,14 @@ pub mod dfs {
     include!(concat!(env!("OUT_DIR"), "/dfs.rs"));
 }
 
-pub mod sharding;
-
 use crate::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use crate::dfs::master_service_client::MasterServiceClient;
 use crate::dfs::{
     AllocateBlockRequest, CreateFileRequest, DeleteFileRequest, GetFileInfoRequest,
     ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
-use crate::sharding::ShardMap;
 use anyhow::{anyhow, bail};
+use dfs_common::sharding::ShardMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -534,6 +532,12 @@ impl Client {
                     Ok(res) => return Ok((res, master_addr)),
                     Err(status) => {
                         let msg = status.message();
+                        tracing::info!(
+                            "RPC to {} failed: code={:?}, message={}",
+                            master_addr,
+                            status.code(),
+                            msg
+                        );
                         if msg.starts_with("REDIRECT:") {
                             let parts: Vec<&str> = msg.splitn(2, ':').collect();
                             if parts.len() > 1 && !parts[1].is_empty() {

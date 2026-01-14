@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
-use dfs_client::sharding::ShardMap;
+use dfs_common::sharding::ShardMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -19,10 +19,22 @@ pub struct MyChunkServer {
 impl MyChunkServer {
     pub fn new(storage_dir: PathBuf, config_server_addrs: Vec<String>) -> Self {
         fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
+
+        // Load shard map from config file if available
+        let shard_config_path = std::env::var("SHARD_CONFIG").ok();
+        let shard_map = if let Some(path) = shard_config_path {
+            tracing::info!("Loading shard config from {}", path);
+            Arc::new(Mutex::new(
+                dfs_common::sharding::load_shard_map_from_config(Some(&path), 100),
+            ))
+        } else {
+            Arc::new(Mutex::new(ShardMap::new(100)))
+        };
+
         MyChunkServer {
             storage_dir,
             config_server_addrs,
-            shard_map: Arc::new(Mutex::new(ShardMap::new(100))),
+            shard_map,
         }
     }
 

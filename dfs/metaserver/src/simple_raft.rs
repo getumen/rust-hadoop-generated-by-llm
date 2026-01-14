@@ -36,8 +36,8 @@
 
 use crate::dfs::FileMetadata;
 use crate::master::MasterState;
-use crate::sharding::ShardMap;
 use anyhow::{Context, Result};
+use dfs_common::sharding::ShardMap;
 use rand::Rng;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};

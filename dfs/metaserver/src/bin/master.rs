@@ -144,9 +144,9 @@ async fn main() -> anyhow::Result<()> {
     // Load Shard Map
     let shard_map = if !args.config_servers.is_empty() {
         // Dynamic sharding mode -> use Range strategy
-        dfs_metaserver::sharding::ShardMap::new_range()
+        dfs_common::sharding::ShardMap::new_range()
     } else {
-        dfs_metaserver::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100)
+        dfs_common::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100)
     };
     let shard_map = Arc::new(Mutex::new(shard_map));
 
