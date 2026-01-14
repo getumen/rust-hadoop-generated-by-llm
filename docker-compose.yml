@@ -1,21 +1,34 @@
 version: '3.8'
 
 services:
+  config-server:
+    build: .
+    container_name: dfs-config-server
+    command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://config-server:50050
+    ports:
+      - "50050:50050"
+      - "8080:8080"
+    networks:
+      - dfs-sharded-network
+    volumes:
+      - config-server-data:/data/config-raft
+
   # ==========================================
   # Shard 1
   # ==========================================
   master1-shard1:
     build: .
     container_name: dfs-master1-shard1
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard1:50051 --shard-id shard-1 --shard-config /app/shard_config.json
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard1:50051 --shard-id shard-1 --config-servers http://config-server:50050
     ports:
       - "50051:50051"
       - "8081:8080"
     networks:
       - dfs-sharded-network
+    depends_on:
+      - config-server
     volumes:
       - master1-shard1-data:/data/raft
-      - ./shard_config.json:/app/shard_config.json
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -25,13 +38,14 @@ services:
   chunkserver1-shard1:
     build: .
     container_name: dfs-chunkserver1-shard1
-    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr dfs-master1-shard1:50051 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
     ports:
       - "50052:50052"
     networks:
       - dfs-sharded-network
     depends_on:
       - master1-shard1
+      - config-server
     volumes:
       - cs1-shard1-data:/data/cs1
 
@@ -41,15 +55,16 @@ services:
   master1-shard2:
     build: .
     container_name: dfs-master1-shard2
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard2:50051 --shard-id shard-2 --shard-config /app/shard_config.json
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard2:50051 --shard-id shard-2 --config-servers http://config-server:50050
     ports:
       - "50061:50051"
       - "8091:8080"
     networks:
       - dfs-sharded-network
+    depends_on:
+      - config-server
     volumes:
       - master1-shard2-data:/data/raft
-      - ./shard_config.json:/app/shard_config.json
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -59,13 +74,14 @@ services:
   chunkserver1-shard2:
     build: .
     container_name: dfs-chunkserver1-shard2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --master-addr dfs-master1-shard2:50051 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
     ports:
       - "50062:50052"
     networks:
       - dfs-sharded-network
     depends_on:
       - master1-shard2
+      - config-server
     volumes:
       - cs1-shard2-data:/data/cs1
 
@@ -75,21 +91,21 @@ services:
     command: /app/s3-server
     environment:
       - MASTER_ADDR=http://dfs-master1-shard1:50051
-      - SHARD_CONFIG=/app/shard_config.json
-    volumes:
-      - ./shard_config.json:/app/shard_config.json
+      - CONFIG_SERVERS=http://config-server:50050
     ports:
       - "9000:9000"
     networks:
       - dfs-sharded-network
     depends_on:
       - master1-shard1
+      - config-server
 
 networks:
   dfs-sharded-network:
     driver: bridge
 
 volumes:
+  config-server-data:
   master1-shard1-data:
   cs1-shard1-data:
   master1-shard2-data:

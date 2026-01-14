@@ -2,7 +2,6 @@ use clap::Parser;
 use dfs_chunkserver::chunkserver::MyChunkServer;
 use dfs_chunkserver::dfs::chunk_server_service_server::ChunkServerServiceServer;
 use dfs_chunkserver::dfs::master_service_client::MasterServiceClient;
-use dfs_chunkserver::dfs::RegisterChunkServerRequest;
 use std::path::PathBuf;
 use tonic::transport::Server;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -13,8 +12,8 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:50052")]
     addr: String,
 
-    #[arg(short, long, default_value = "127.0.0.1:50051")]
-    master_addr: String,
+    #[arg(short, long, value_delimiter = ',')]
+    config_servers: Vec<String>,
 
     #[arg(short, long, default_value = "/tmp/chunkserver_data")]
     storage_dir: PathBuf,
@@ -37,90 +36,63 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let addr = args.addr.parse()?;
 
-    let master_addrs_raw: Vec<String> =
-        args.master_addr.split(',').map(|s| s.to_string()).collect();
-
-    let chunk_server = MyChunkServer::new(args.storage_dir.clone(), master_addrs_raw.clone());
+    let chunk_server = MyChunkServer::new(args.storage_dir.clone(), args.config_servers.clone());
 
     // Start background scrubber
-    let storage_dir_scrubber = args.storage_dir.clone();
-    let master_addrs_for_scrubber = master_addrs_raw.clone();
+    let server_for_scrubber = chunk_server.clone();
     tokio::spawn(async move {
-        // Run scrubber every 60 seconds
         MyChunkServer::run_background_scrubber(
-            storage_dir_scrubber,
-            master_addrs_for_scrubber,
+            server_for_scrubber,
             std::time::Duration::from_secs(60),
         )
         .await;
     });
 
-    // Register with Master
-    let master_addrs: Vec<String> = args
-        .master_addr
-        .split(',')
-        .map(|s| format!("http://{}", s))
-        .collect();
+    // Registration and Heartbeat Loop
     let my_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
     let storage_dir_heartbeat = args.storage_dir.clone();
     let chunk_server_heartbeat = chunk_server.clone();
 
     tokio::spawn(async move {
-        // 1. Initial Registration
+        // 1. Initial Discovery
         loop {
-            let mut registered = false;
-            for master_addr in &master_addrs {
-                match MasterServiceClient::connect(master_addr.clone()).await {
-                    Ok(mut client) => {
-                        let request = tonic::Request::new(RegisterChunkServerRequest {
-                            address: my_addr.clone(),
-                            capacity: 1024 * 1024 * 1024, // 1GB dummy capacity
-                        });
-
-                        match client.register_chunk_server(request).await {
-                            Ok(_) => {
-                                tracing::info!("✓ Registered with Master at {}", master_addr);
-                                registered = true;
-                                // We try to register with all masters initially
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to register with Master {}: {}",
-                                    master_addr,
-                                    e
-                                )
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to connect to Master {}: {}", master_addr, e);
-                    }
-                }
-            }
-
-            if registered {
+            if chunk_server_heartbeat.refresh_shard_map().await.is_ok() {
+                tracing::info!("✓ Initial shard map fetched");
                 break;
-            } else {
-                tracing::warn!("✗ Failed to register with any Master. Retrying...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
+            tracing::warn!("✗ Failed to fetch initial shard map. Retrying...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         }
 
-        // 2. Heartbeat Loop
-        println!("Starting heartbeat loop...");
+        // 2. Main Loop: Refresh ShardMap & Heartbeat to all Masters
         loop {
+            // Periodically refresh shard map
+            let _ = chunk_server_heartbeat.refresh_shard_map().await;
+
             // Gather stats
             let available_space = fs2::free_space(&storage_dir_heartbeat).unwrap_or(0);
             let total_space = fs2::total_space(&storage_dir_heartbeat).unwrap_or(0);
             let used_space = total_space.saturating_sub(available_space);
 
-            // Count chunks (files in storage dir)
+            // Count chunks
             let chunk_count = std::fs::read_dir(&storage_dir_heartbeat)
                 .map(|read_dir| read_dir.count())
                 .unwrap_or(0) as u64;
 
-            for master_addr in &master_addrs {
-                match MasterServiceClient::connect(master_addr.clone()).await {
+            // Identify all master leaders from ShardMap
+            let masters = {
+                let shard_map = chunk_server_heartbeat.shard_map.lock().unwrap();
+                shard_map.get_all_masters()
+            };
+
+            for master_addr in masters {
+                let master_url = if master_addr.starts_with("http://") {
+                    master_addr.clone()
+                } else {
+                    format!("http://{}", master_addr)
+                };
+                tracing::debug!("Heartbeating to master: {}", master_url);
+                match MasterServiceClient::connect(master_url.clone()).await {
                     Ok(mut client) => {
                         let request = tonic::Request::new(dfs_chunkserver::dfs::HeartbeatRequest {
                             chunk_server_address: my_addr.clone(),
@@ -131,44 +103,35 @@ async fn main() -> anyhow::Result<()> {
 
                         match client.heartbeat(request).await {
                             Ok(response) => {
+                                tracing::debug!("Heartbeat successful to {}", master_url);
                                 let resp = response.into_inner();
                                 for command in resp.commands {
                                     if command.r#type == 1 {
                                         // REPLICATE
-                                        println!(
-                                            "Received replication command for block {} to {}",
-                                            command.block_id, command.target_chunk_server_address
-                                        );
                                         let chunk_server_clone = chunk_server_heartbeat.clone();
                                         let block_id = command.block_id.clone();
                                         let target = command.target_chunk_server_address.clone();
 
                                         tokio::spawn(async move {
-                                            if let Err(e) = chunk_server_clone
+                                            let _ = chunk_server_clone
                                                 .initiate_replication(&block_id, &target)
-                                                .await
-                                            {
-                                                eprintln!("Replication failed: {}", e);
-                                            } else {
-                                                println!(
-                                                    "Replication of block {} to {} completed",
-                                                    block_id, target
-                                                );
-                                            }
+                                                .await;
                                         });
                                     }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Heartbeat failed to {}: {}", master_addr, e);
+                                tracing::warn!("Heartbeat failed to {}: {}", master_url, e);
+                                // Master might not be leader or is down
                             }
                         }
                     }
-                    Err(_) => {
-                        // Silent failure for connection error (master might be down)
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to master {}: {}", master_url, e);
                     }
                 }
             }
+
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });

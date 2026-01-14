@@ -594,13 +594,21 @@ impl Client {
         use crate::dfs::FetchShardMapRequest;
 
         for addr in &self.config_server_addrs {
-            let resolved_addr = self.resolve_url(&format!("http://{}", addr));
+            let config_addr_with_prefix = if addr.starts_with("http://") {
+                addr.clone()
+            } else {
+                format!("http://{}", addr)
+            };
+            let resolved_addr = self.resolve_url(&config_addr_with_prefix);
             if let Ok(mut client) = ConfigServiceClient::connect(resolved_addr).await {
                 if let Ok(resp) = client.fetch_shard_map(FetchShardMapRequest {}).await {
                     let shards_data = resp.into_inner().shards;
+                    let mut shards_vec: Vec<_> = shards_data.into_iter().collect();
+                    shards_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
                     let mut new_map = ShardMap::new_range(); // Assume range strategy for dynamic sharding
 
-                    for (shard_id, peers_info) in shards_data {
+                    for (shard_id, peers_info) in shards_vec {
                         new_map.add_shard(shard_id, peers_info.peers);
                     }
 

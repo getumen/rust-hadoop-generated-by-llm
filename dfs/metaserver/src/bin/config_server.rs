@@ -14,6 +14,7 @@ use dfs_metaserver::simple_raft::{
 };
 use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -54,18 +55,33 @@ impl IntoResponse for InternalError {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "config_server=debug,dfs_metaserver=debug".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let args = Args::parse();
     let addr = args.addr.parse()?;
     let advertise_addr = args.advertise_addr.unwrap_or_else(|| args.addr.clone());
 
+    let peers: Vec<String> = args.peers.into_iter().filter(|p| !p.is_empty()).collect();
+
     println!("Config Server node {} starting...", args.id);
-    println!("Peers: {:?}", args.peers);
+    println!("Peers: {:?}", peers);
     println!("HTTP Port: {}", args.http_port);
     println!("Advertise Addr: {}", advertise_addr);
     println!("Storage Dir: {}", args.storage_dir);
 
-    // Initialize with empty ShardMap (100 virtual nodes)
-    let state = Arc::new(Mutex::new(AppState::Config(ShardMap::new(100))));
+    // Initialize with empty ShardMap (Range-based)
+    let state = Arc::new(Mutex::new(AppState::Config(
+        dfs_metaserver::simple_raft::ConfigStateInner {
+            shard_map: ShardMap::new_range(),
+            masters: std::collections::HashMap::new(),
+        },
+    )));
     let (raft_tx, raft_rx) = tokio::sync::mpsc::channel(100);
 
     let raft_tx_for_node = raft_tx.clone();
@@ -74,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut raft_node = RaftNode::new(
         args.id,
-        args.peers.clone(),
+        peers.clone(),
         advertise_addr,
         args.storage_dir.clone(),
         state.clone(),

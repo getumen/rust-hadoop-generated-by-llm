@@ -21,18 +21,27 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let master_addr =
-        std::env::var("MASTER_ADDR").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        std::env::var("MASTER_ADDR").unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
+    let config_servers_env = std::env::var("CONFIG_SERVERS").unwrap_or_default();
+    let config_servers: Vec<String> = config_servers_env
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
 
-    tracing::info!("Connecting to Master at {}", master_addr);
+    tracing::info!(
+        "Connecting to Master at {}, Config Servers: {:?}",
+        master_addr,
+        config_servers
+    );
 
     // The Client::new expects (master_addrs, config_server_addrs)
-    let client = Client::new(vec![master_addr], vec![]);
+    let client = Client::new(vec![master_addr], config_servers);
 
-    // Load shard map if config is provided
+    // Load shard map if config is provided (optional, Config Server is preferred)
     let shard_config_path = std::env::var("SHARD_CONFIG").ok();
     if let Some(path) = shard_config_path {
         tracing::info!("Loading shard config from {}", path);
-        // Default virtual nodes = 100
         let shard_map = dfs_client::sharding::load_shard_map_from_config(Some(&path), 100);
         client.set_shard_map(shard_map);
     }

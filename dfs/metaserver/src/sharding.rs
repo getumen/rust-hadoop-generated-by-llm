@@ -69,11 +69,11 @@ impl ShardMap {
 
     /// Add a new Shard to the map with its peers.
     pub fn add_shard(&mut self, shard_id: ShardId, peers: Vec<String>) {
+        self.shard_peers.insert(shard_id.clone(), peers.clone());
         if self.shards.contains(&shard_id) {
             return;
         }
         self.shards.insert(shard_id.clone());
-        self.shard_peers.insert(shard_id.clone(), peers);
 
         match &mut self.strategy {
             ShardingStrategy::ConsistentHash {
@@ -90,13 +90,27 @@ impl ShardMap {
                 // If it's the first shard, it covers everything.
                 if ranges.is_empty() {
                     ranges.insert("\u{10FFFF}".to_string(), shard_id);
+                } else if ranges.len() == 1 {
+                    // If we have one shard covering everything, split it at '/m' to provide some balance
+                    // Move the old range end to a mid-point
+                    let old_shard = ranges.values().next().unwrap().clone();
+                    ranges.clear();
+                    ranges.insert("/m".to_string(), shard_id);
+                    ranges.insert("\u{10FFFF}".to_string(), old_shard);
                 } else {
-                    // In dynamic sharding, add_shard for Range usually happens via a split operation.
-                    // For static config, we'll just append it for now (this needs refinement).
+                    // For subsequent shards, just append for now
                     ranges.insert(format!("z-{}", shard_id), shard_id);
                 }
             }
         }
+    }
+
+    pub fn has_shard(&self, shard_id: &ShardId) -> bool {
+        self.shards.contains(shard_id)
+    }
+
+    pub fn get_peers(&self, shard_id: &ShardId) -> Option<Vec<String>> {
+        self.shard_peers.get(shard_id).cloned()
     }
 
     /// Remove a Shard from the map.

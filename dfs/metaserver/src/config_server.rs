@@ -28,10 +28,10 @@ impl ConfigService for MyConfigServer {
         _request: Request<FetchShardMapRequest>,
     ) -> Result<Response<FetchShardMapResponse>, Status> {
         let state_lock = self.state.lock().unwrap();
-        if let AppState::Config(ref shard_map) = *state_lock {
+        if let AppState::Config(ref config_state) = *state_lock {
             let mut shards = HashMap::new();
-            for shard_id in shard_map.get_all_shards() {
-                if let Some(peers) = shard_map.get_shard_peers(&shard_id) {
+            for shard_id in config_state.shard_map.get_all_shards() {
+                if let Some(peers) = config_state.shard_map.get_shard_peers(&shard_id) {
                     shards.insert(shard_id, ShardPeers { peers });
                 }
             }
@@ -118,8 +118,32 @@ impl ConfigService for MyConfigServer {
         &self,
         request: Request<crate::dfs::SplitShardRequest>,
     ) -> Result<Response<crate::dfs::SplitShardResponse>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Automatic Peer Allocation
+        if req.new_shard_peers.is_empty() {
+            let state_lock = self.state.lock().unwrap();
+            if let AppState::Config(ref config_state) = *state_lock {
+                // Heuristic: Pick up to 3 healthiest (most recent heartbeat) masters
+                let mut available: Vec<_> = config_state.masters.values().collect();
+                available.sort_by_key(|m| std::cmp::Reverse(m.last_heartbeat));
+                req.new_shard_peers = available
+                    .iter()
+                    .take(3)
+                    .map(|m| m.address.clone())
+                    .collect();
+            }
+        }
+
+        if req.new_shard_peers.is_empty() {
+            return Ok(Response::new(crate::dfs::SplitShardResponse {
+                success: false,
+                error_message: "No available master nodes for new shard".to_string(),
+                leader_hint: "".to_string(),
+                new_shard_peers: vec![],
+            }));
+        }
 
         if self
             .raft_tx
@@ -128,7 +152,7 @@ impl ConfigService for MyConfigServer {
                     shard_id: req.shard_id,
                     split_key: req.split_key,
                     new_shard_id: req.new_shard_id,
-                    new_shard_peers: req.new_shard_peers,
+                    new_shard_peers: req.new_shard_peers.clone(),
                 }),
                 reply_tx: tx,
             })
@@ -143,11 +167,79 @@ impl ConfigService for MyConfigServer {
                 success: true,
                 error_message: "".to_string(),
                 leader_hint: "".to_string(),
+                new_shard_peers: req.new_shard_peers,
             })),
             Ok(Err(leader_opt)) => Ok(Response::new(crate::dfs::SplitShardResponse {
                 success: false,
                 error_message: "Not Leader".to_string(),
                 leader_hint: leader_opt.unwrap_or_default(),
+                new_shard_peers: vec![],
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    async fn register_master(
+        &self,
+        request: Request<crate::dfs::RegisterMasterRequest>,
+    ) -> Result<Response<crate::dfs::RegisterMasterResponse>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::RegisterMaster {
+                    address: req.address,
+                    shard_id: req.shard_id,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(crate::dfs::RegisterMasterResponse {
+                success: true,
+            })),
+            Ok(Err(_)) => Ok(Response::new(crate::dfs::RegisterMasterResponse {
+                success: false,
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    async fn shard_heartbeat(
+        &self,
+        request: Request<crate::dfs::ShardHeartbeatRequest>,
+    ) -> Result<Response<crate::dfs::ShardHeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::ShardHeartbeat {
+                    address: req.address,
+                    rps_per_prefix: req.rps_per_prefix,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(crate::dfs::ShardHeartbeatResponse {
+                success: true,
+            })),
+            Ok(Err(_)) => Ok(Response::new(crate::dfs::ShardHeartbeatResponse {
+                success: false,
             })),
             Err(_) => Err(Status::internal("Raft response error")),
         }

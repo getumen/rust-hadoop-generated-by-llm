@@ -373,6 +373,7 @@ dependencies = [
  "bytes",
  "clap",
  "crc32fast",
+ "dfs-client",
  "dfs-common",
  "fs2",
  "prost",

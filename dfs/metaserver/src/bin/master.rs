@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let mut raft_node = RaftNode::new(
         args.id,
         peers.clone(),
-        advertise_addr,
+        advertise_addr.clone(),
         args.storage_dir.clone(),
         state.clone(),
         raft_rx,
@@ -142,8 +142,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Load Shard Map
-    let shard_map =
-        dfs_metaserver::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100);
+    let shard_map = if !args.config_servers.is_empty() {
+        // Dynamic sharding mode -> use Range strategy
+        dfs_metaserver::sharding::ShardMap::new_range()
+    } else {
+        dfs_metaserver::sharding::load_shard_map_from_config(args.shard_config.as_deref(), 100)
+    };
     let shard_map = Arc::new(Mutex::new(shard_map));
 
     let master = MyMaster::new(
@@ -152,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         shard_map,
         args.shard_id.clone(),
         args.config_servers.clone(),
+        advertise_addr,
     );
 
     tracing::info!("Master gRPC server listening on {}", addr);

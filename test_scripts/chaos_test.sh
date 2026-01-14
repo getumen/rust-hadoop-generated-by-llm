@@ -40,7 +40,7 @@ create_test_data() {
 upload_file() {
     echo "📤 Uploading file to DFS..."
     docker cp $TEST_FILE $MASTER_CONTAINER:/tmp/$TEST_FILE
-    docker exec $MASTER_CONTAINER /app/dfs_cli --master http://localhost:50051 put /tmp/$TEST_FILE $DFS_PATH
+    docker exec $MASTER_CONTAINER /app/dfs_cli --config-servers http://config-server:50050 put /tmp/$TEST_FILE $DFS_PATH
     echo "✓ File uploaded"
 }
 
@@ -48,7 +48,7 @@ upload_file() {
 download_file() {
     local output_file=$1
     echo "📥 Downloading file from DFS..."
-    docker exec $MASTER_CONTAINER /app/dfs_cli --master http://localhost:50051 get $DFS_PATH /tmp/$output_file
+    docker exec $MASTER_CONTAINER /app/dfs_cli --config-servers http://config-server:50050 get $DFS_PATH /tmp/$output_file
     docker cp $MASTER_CONTAINER:/tmp/$output_file ./$output_file
     echo "✓ File downloaded to $output_file"
 }
@@ -87,7 +87,7 @@ restart_chunkserver() {
 # Function to list files
 list_files() {
     echo "📋 Listing files in DFS..."
-    docker exec $MASTER_CONTAINER /app/dfs_cli --master http://localhost:50051 ls || true
+    docker exec $MASTER_CONTAINER /app/dfs_cli --config-servers http://config-server:50050 ls || true
 }
 
 # Function to get cluster status
@@ -111,6 +111,11 @@ cluster_status() {
             echo "  ✗ $master: STOPPED"
         fi
     done
+    if docker ps --filter "name=dfs-config-server" --filter "status=running" | grep -q "dfs-config-server"; then
+        echo "  ✓ config-server: RUNNING"
+    else
+        echo "  ✗ config-server: STOPPED"
+    fi
     echo ""
 }
 
@@ -177,7 +182,7 @@ main() {
 
     # Try to access via Shard 2
     echo "Attempting to list files via Shard 2..."
-    docker exec dfs-master1-shard2 /app/dfs_cli --master http://localhost:50051 ls || true
+    docker exec dfs-master1-shard2 /app/dfs_cli --config-servers http://config-server:50050 ls || true
 
     # Restart Master
     docker compose -f $COMPOSE_FILE start master1-shard1

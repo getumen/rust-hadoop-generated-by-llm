@@ -99,6 +99,14 @@ impl ShardMap {
         }
     }
 
+    pub fn has_shard(&self, shard_id: &ShardId) -> bool {
+        self.shards.contains(shard_id)
+    }
+
+    pub fn get_peers(&self, shard_id: &ShardId) -> Option<Vec<String>> {
+        self.shard_peers.get(shard_id).cloned()
+    }
+
     /// Remove a Shard from the map.
     pub fn remove_shard(&mut self, shard_id: &ShardId) {
         if !self.shards.contains(shard_id) {
@@ -197,6 +205,17 @@ impl ShardMap {
     /// Get peers for a specific shard.
     pub fn get_shard_peers(&self, shard_id: &ShardId) -> Option<Vec<String>> {
         self.shard_peers.get(shard_id).cloned()
+    }
+
+    /// Get all master addresses across all shards.
+    pub fn get_all_masters(&self) -> Vec<String> {
+        let mut masters = HashSet::new();
+        for peers in self.shard_peers.values() {
+            for peer in peers {
+                masters.insert(peer.clone());
+            }
+        }
+        masters.into_iter().collect()
     }
 
     /// Create a new ShardMap with a default configuration (Consistent Hashing for backward compatibility).
@@ -457,5 +476,24 @@ mod tests {
         assert_eq!(map.get_shard("user2/file1").unwrap(), "shard-user2");
         assert_eq!(map.get_shard("user2/file2").unwrap(), "shard-user2");
         assert_eq!(map.get_shard("user3/file1").unwrap(), "shard-initial");
+    }
+
+    #[test]
+    fn test_get_all_masters() {
+        let mut map = ShardMap::new_range();
+        map.add_shard(
+            "shard-1".to_string(),
+            vec!["127.0.0.1:5001".to_string(), "127.0.0.1:5002".to_string()],
+        );
+        map.add_shard(
+            "shard-2".to_string(),
+            vec!["127.0.0.1:5003".to_string(), "127.0.0.1:5001".to_string()],
+        );
+
+        let masters = map.get_all_masters();
+        assert_eq!(masters.len(), 3);
+        assert!(masters.contains(&"127.0.0.1:5001".to_string()));
+        assert!(masters.contains(&"127.0.0.1:5002".to_string()));
+        assert!(masters.contains(&"127.0.0.1:5003".to_string()));
     }
 }

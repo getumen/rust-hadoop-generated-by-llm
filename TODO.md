@@ -176,17 +176,20 @@
 - [ ] Add reconstruction logic for failed EC blocks
 
 ### 20. Dynamic Sharding (Load-based Splitting)
-**Status**: Planning
+**Status**: **Mostly Completed** (Phase 1, 2 & 3)
 **Priority**: High
 **Effort**: Large
 
 **Objective**: Split shards based on read/write throughput (PPS/BPS) and ensure prefix locality (S3/Colossus style).
 
 **Tasks**:
-- [ ] Transition from Consistent Hashing to Range-based Sharding
-- [ ] Implement throughput monitoring per prefix/shard
-- [ ] Implement Shard Split logic in Raft and Master state
-- [ ] Implement Client-side handling of shard redirects for dynamic ranges
+- [x] Transition from Consistent Hashing to Range-based Sharding
+- [x] Implement throughput monitoring per prefix/shard
+- [x] Implement Shard Split logic in Raft and Master state
+- [x] Implement Client-side handling of shard redirects for dynamic ranges
+- [x] Master registration & Heartbeats (Metadata migration support)
+- [x] ChunkServer dynamic master discovery (Phase 3)
+- [ ] Implement actual block data migration (Data Shuffling)
 - [ ] Add auto-scaling/load-balancing logic for shards
 
 ---
@@ -250,7 +253,7 @@
 - ✅ Code Quality & Tech Debt Reduction (Phase 1)
 
 ### Phase 5: Advanced Ecosystem & Scalability (Next)
-- 🟡 Dynamic Sharding: Load-based range splitting
+- ✅ Dynamic Sharding: Load-based range splitting (Core, Phase 2 & 3)
 - 🟢 High-performance S3 (Presigned URLs, efficient CopyObject)
 - 🟢 Security (TLS, AuthN/AuthZ)
 - 🟢 Storage Efficiency (Erasure Coding)
