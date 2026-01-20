@@ -91,6 +91,38 @@ services:
       - cs1-shard2-data:/data/cs1
       - ./shard_config.json:/app/shard_config.json:ro
 
+  chunkserver-extra:
+    build: .
+    container_name: dfs-chunkserver-extra
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
+    ports:
+      - "50072:50052"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - cs-extra-data:/data/cs-extra
+      - ./shard_config.json:/app/shard_config.json:ro
+
+  chunkserver-extra2:
+    build: .
+    container_name: dfs-chunkserver-extra2
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
+    ports:
+      - "50082:50052"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - cs-extra2-data:/data/cs-extra2
+      - ./shard_config.json:/app/shard_config.json:ro
+
   s3-server:
     build: .
     container_name: dfs-s3-server
@@ -119,3 +151,5 @@ volumes:
   cs1-shard1-data:
   master1-shard2-data:
   cs1-shard2-data:
+  cs-extra-data:
+  cs-extra2-data:

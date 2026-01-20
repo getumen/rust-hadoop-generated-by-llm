@@ -5,8 +5,8 @@ pub mod dfs {
 use crate::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use crate::dfs::master_service_client::MasterServiceClient;
 use crate::dfs::{
-    AllocateBlockRequest, CreateFileRequest, DeleteFileRequest, GetFileInfoRequest,
-    ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
+    AllocateBlockRequest, CompleteFileRequest, CreateFileRequest, DeleteFileRequest,
+    GetFileInfoRequest, ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
 use anyhow::{anyhow, bail};
 use dfs_common::sharding::ShardMap;
@@ -188,6 +188,7 @@ impl Client {
 
         // 3. Allocate block
         // Use the master that handled create_file successfully to ensure read-your-writes consistency
+        let buffer_len = buffer.len() as u64;
         let alloc_masters = {
             let mut m = vec![success_addr];
             for addr in &self.master_addrs {
@@ -264,7 +265,40 @@ impl Client {
             bail!("Failed to write block: {}", write_resp.error_message);
         }
 
+        // 5. Complete file
+        let (complete_resp, _) = self
+            .execute_rpc(Some(dest), |mut client| {
+                let dest = dest.to_string();
+                let size = buffer_len;
+                async move {
+                    let complete_req =
+                        tonic::Request::new(CompleteFileRequest { path: dest, size });
+                    client.complete_file(complete_req).await
+                }
+            })
+            .await?;
+
+        if !complete_resp.into_inner().success {
+            bail!("Failed to complete file");
+        }
+
         Ok(())
+    }
+
+    pub async fn get_file_info(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<crate::dfs::FileMetadata>> {
+        let (info_resp, _) = self
+            .execute_rpc(Some(path), |mut client| {
+                let path = path.to_string();
+                async move {
+                    let info_req = tonic::Request::new(GetFileInfoRequest { path });
+                    client.get_file_info(info_req).await
+                }
+            })
+            .await?;
+        Ok(info_resp.into_inner().metadata)
     }
 
     pub async fn get_file(&self, source: &str, dest: &Path) -> anyhow::Result<()> {
@@ -414,11 +448,41 @@ impl Client {
             })
             .await?;
         let rename_resp = rename_resp.into_inner();
-
         if rename_resp.success {
             Ok(())
         } else {
             bail!("Failed to rename file: {}", rename_resp.error_message);
+        }
+    }
+
+    pub async fn initiate_shuffle(&self, prefix: &str) -> anyhow::Result<()> {
+        let (resp, _) = self
+            .execute_rpc(Some(prefix), |mut client| {
+                let prefix = prefix.to_string();
+                async move {
+                    let req = tonic::Request::new(crate::dfs::InitiateShuffleRequest { prefix });
+                    let response = client.initiate_shuffle(req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!(
+                            "Not Leader|{}",
+                            inner.leader_hint
+                        )));
+                    }
+                    if !inner.error_message.is_empty()
+                        && inner.error_message.starts_with("REDIRECT:")
+                    {
+                        return Err(tonic::Status::out_of_range(inner.error_message.clone()));
+                    }
+                    Ok(response)
+                }
+            })
+            .await?;
+
+        if resp.into_inner().success {
+            Ok(())
+        } else {
+            bail!("Failed to initiate shuffle")
         }
     }
 

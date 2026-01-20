@@ -40,6 +40,9 @@ service MasterService {
 
   // Metadata ingestion for shard splitting
   rpc IngestMetadata (IngestMetadataRequest) returns (IngestMetadataResponse);
+
+  // Trigger background data shuffling
+  rpc InitiateShuffle (InitiateShuffleRequest) returns (InitiateShuffleResponse);
 }
 
 message HeartbeatRequest {
@@ -104,6 +107,7 @@ message AllocateBlockResponse {
 
 message CompleteFileRequest {
   string path = 1;
+  uint64 size = 2;
 }
 
 message CompleteFileResponse {
@@ -400,4 +404,14 @@ message ShardHeartbeatRequest {
 
 message ShardHeartbeatResponse {
   bool success = 1;
+}
+
+message InitiateShuffleRequest {
+  string prefix = 1;
+}
+
+message InitiateShuffleResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
 }

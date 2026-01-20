@@ -38,6 +38,10 @@ enum Commands {
         source: String,
         dest: PathBuf,
     },
+    /// Inspect file metadata (including block locations)
+    Inspect {
+        path: String,
+    },
     /// Rename a file (supports cross-shard rename)
     Rename {
         /// Source file path
@@ -54,6 +58,10 @@ enum Commands {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+    /// Trigger background data shuffling for a prefix
+    Shuffle {
+        prefix: String,
     },
 }
 
@@ -120,6 +128,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Get { source, dest } => {
             client.get_file(&source, &dest).await?;
             println!("File downloaded successfully");
+        }
+        Commands::Inspect { path } => {
+            let metadata = client.get_file_info(&path).await?;
+            if let Some(meta) = metadata {
+                println!("File Metadata for: {}", meta.path);
+                println!("  Size: {} bytes", meta.size);
+                println!("  Blocks: {}", meta.blocks.len());
+                for (i, block) in meta.blocks.iter().enumerate() {
+                    println!(
+                        "    Block {}: ID={}, Size={}, Locations={:?}",
+                        i, block.block_id, block.size, block.locations
+                    );
+                }
+            } else {
+                println!("File not found: {}", path);
+            }
         }
         Commands::Rename { source, dest } => {
             client.rename_file(&source, &dest).await?;
@@ -256,6 +280,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Commands::Shuffle { prefix } => {
+            client.initiate_shuffle(&prefix).await?;
+            println!("Triggered background shuffling for prefix: {}", prefix);
         }
     }
 

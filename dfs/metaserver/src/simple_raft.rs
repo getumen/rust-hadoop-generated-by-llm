@@ -136,6 +136,19 @@ pub enum MasterCommand {
     IngestBatch {
         files: Vec<FileMetadata>,
     },
+    /// Trigger background data shuffling for a prefix
+    TriggerShuffle {
+        prefix: String,
+    },
+    /// Finalize file (update size)
+    CompleteFile {
+        path: String,
+        size: u64,
+    },
+    /// Stop background data shuffling for a prefix
+    StopShuffle {
+        prefix: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1830,6 +1843,20 @@ impl RaftNode {
                                 master_state.files.insert(file.path.clone(), file.clone());
                             }
                             tracing::info!("Ingested batch of {} files into shard", count);
+                        }
+                        MasterCommand::TriggerShuffle { prefix } => {
+                            master_state.shuffling_prefixes.insert(prefix.clone());
+                            tracing::info!("Triggered background shuffling for prefix: {}", prefix);
+                        }
+                        MasterCommand::CompleteFile { path, size } => {
+                            if let Some(file) = master_state.files.get_mut(path) {
+                                file.size = *size;
+                                tracing::info!("Completed file {}: size={} bytes", path, size);
+                            }
+                        }
+                        MasterCommand::StopShuffle { prefix } => {
+                            master_state.shuffling_prefixes.remove(prefix.as_str());
+                            tracing::info!("Stopped background shuffling for prefix: {}", prefix);
                         }
                     }
                 } else {
