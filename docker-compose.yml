@@ -38,7 +38,7 @@ services:
   chunkserver1-shard1:
     build: .
     container_name: dfs-chunkserver1-shard1
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
     ports:
       - "50052:50052"
     networks:
@@ -46,8 +46,11 @@ services:
     depends_on:
       - master1-shard1
       - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
     volumes:
       - cs1-shard1-data:/data/cs1
+      - ./shard_config.json:/app/shard_config.json:ro
 
   # ==========================================
   # Shard 2
@@ -74,7 +77,7 @@ services:
   chunkserver1-shard2:
     build: .
     container_name: dfs-chunkserver1-shard2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
     ports:
       - "50062:50052"
     networks:
@@ -82,8 +85,11 @@ services:
     depends_on:
       - master1-shard2
       - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
     volumes:
       - cs1-shard2-data:/data/cs1
+      - ./shard_config.json:/app/shard_config.json:ro
 
   s3-server:
     build: .
@@ -92,6 +98,9 @@ services:
     environment:
       - MASTER_ADDR=http://dfs-master1-shard1:50051
       - CONFIG_SERVERS=http://config-server:50050
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - ./shard_config.json:/app/shard_config.json:ro
     ports:
       - "9000:9000"
     networks:

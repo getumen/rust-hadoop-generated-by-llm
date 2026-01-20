@@ -55,7 +55,15 @@ echo "Finding a target path on the same shard..."
 TARGET_PATH=""
 
 for i in {1..100}; do
-    TEST_PATH="/target_same_$i.txt"
+    # Try different path prefixes to find one on the same shard
+    # With range sharding split at "/m", shard-2 gets "" -> "/m", shard-1 gets "/m" -> max
+    if [ "$CURRENT_SHARD" == "shard-2" ]; then
+        # Need paths < "/m": try /a, /b, /c, ...  /l
+        TEST_PATH="/dest_${i}.txt"
+    else
+        # Need paths >= "/m": try /m, /n, /o, ... /z
+        TEST_PATH="/renamed_${i}.txt"
+    fi
 
     # We check where this path belongs by querying Master 1
     OUTPUT=$(docker exec dfs-master1-shard1 /app/dfs_cli --master http://localhost:50051 get $TEST_PATH /tmp/ignore 2>&1 || true)

@@ -242,9 +242,12 @@ impl ShardConfig {
         Ok(config)
     }
 
-    pub fn to_shard_map(&self, virtual_nodes: usize) -> ShardMap {
-        let mut map = ShardMap::new(virtual_nodes);
-        for (shard_id, peers) in &self.shards {
+    pub fn to_shard_map(&self, _virtual_nodes: usize) -> ShardMap {
+        let mut map = ShardMap::new_range();
+        // Sort shard IDs for deterministic ordering
+        let mut sorted_shards: Vec<_> = self.shards.iter().collect();
+        sorted_shards.sort_by_key(|(shard_id, _)| *shard_id);
+        for (shard_id, peers) in sorted_shards {
             map.add_shard(shard_id.clone(), peers.clone());
         }
         map
