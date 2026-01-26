@@ -8,7 +8,7 @@ Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Ra
 - ✅ **分散ストレージ**: 複数のChunkServerにデータを分散保存
 - ✅ **レプリケーション**: デフォルトで3つのレプリカを作成（冗長性確保）
 - ✅ **高可用性 (HA)**: RaftコンセンサスアルゴリズムによるMasterの冗長化
-- ✅ **スケーラビリティ (シャーディング)**: 複数のMasterグループによるメタデータの水平分割、Consistent Hashingによる負荷分散
+- ✅ **ダイナミックシャーディング**: Range-basedシャーディングによる複数のMasterグループでのメタデータ水平分割、負荷に応じた自動シャード分割（Split/Merge）、S3/Colossusスタイルのプレフィックス局所性
 - ✅ **トランザクション**: クロスシャード操作（Rename等）をAtomicに実行するTransaction Recordの実装
 - ✅ **データ整合性**: Raftログレプリケーションによるメタデータの一貫性保証
 - ✅ **パイプラインレプリケーション**: 効率的なデータ複製
@@ -29,12 +29,14 @@ Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Ra
           │ (ShardMap Fetch)                   │
           ▼                                    ▼
 ┌───────────────────────┐            ┌───────────────────────┐
-│     Shard-1 (A-M)     │            │     Shard-2 (N-Z)     │
+│ Shard-1 (""-"/m")     │            │ Shard-2 ("/m"-"")     │
 │ ┌───────────────────┐ │            │ ┌───────────────────┐ │
 │ │ Master1 (Leader)  │ │            │ │ Master1 (Leader)  │ │
 │ │ Master2 (Follower)│ │            │ │ Master2 (Follower)│ │
 │ │ Master3 (Follower)│ │            │ │ Master3 (Follower)│ │
 │ └───────────────────┘ │            │ └───────────────────┘ │
+│ (Range-based, 負荷に │            │ (高負荷時は自動分割) │
+│  応じて自動Split)      │            │                       │
 └───────────────────────┘            └───────────────────────┘
           │                                    │
           └──────────────────┬─────────────────┘
@@ -104,6 +106,7 @@ cargo test -- --include-ignored
 | `cross_shard_test.sh`       | クロスシャードリネーム（Transaction Record）の正常系テスト |
 | `transaction_abort_test.sh` | クロスシャード操作失敗時のロールバック（Abort）テスト      |
 | `fault_recovery_test.sh`    | トランザクション中のシャード障害からの復旧テスト           |
+| `auto_scaling_test.sh`      | 負荷に応じたシャード自動分割（Dynamic Sharding）のテスト   |
 | `chaos_test.sh`             | ChunkServerの障害などをシミュレートしたカオステスト        |
 | `run_spark_test.sh`         | S3互換API経由でのSpark (CSV/Parquet) 統合テスト            |
 
@@ -145,6 +148,7 @@ rust-hadoop/
 - `CompleteFile`: ファイル書き込み完了
 - `ListFiles`: ファイル一覧
 - `Rename`: ファイル移動・名前変更（クロスシャード対応）
+- `InitiateShuffle`: シャード分割時のデータ移行開始
 
 ### Master Mgmt & Monitoring (HTTP)
 
@@ -176,7 +180,8 @@ rust-hadoop/
 - **通信**: gRPC (tonic)
 - **非同期**: Tokio
 - **合意形成**: 自作Raft実装 + Transaction Record (2PC)
-- **シャーディング**: Consistent Hashing (Virtual Nodes)
+- **シャーディング**: Range-based Dynamic Sharding（負荷監視による自動Split/Merge）
+- **オブザーバビリティ**: 構造化ログ（tracing）、分散トレーシング（Request ID伝播）
 - **コンテナ**: Docker
 
 ## ライセンス
@@ -186,8 +191,10 @@ MIT
 ## 参考資料
 
 - [MASTER_HA.md](MASTER_HA.md) - Master HAとシャーディングの詳細
+- [DYNAMIC_SHARDING.md](DYNAMIC_SHARDING.md) - ダイナミックシャーディングの実装詳細
 - [REPLICATION.md](REPLICATION.md) - レプリケーション機能の詳細
 - [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) - S3互換APIとSpark統合の詳細
 - [CHAOS_TEST.md](CHAOS_TEST.md) - カオステストガイド
 - [Google File System](https://research.google.com/archive/gfs.html)
 - [Spanner: Google's Globally-Distributed Database](https://research.google.com/archive/spanner.html)
+- [Google Colossus](https://cloud.google.com/blog/products/storage-data-transfer/a-peek-behind-colossus-googles-file-system)

@@ -66,18 +66,25 @@
 
 ## 🟡 Medium Priority (Infrastructure & Performance)
 
-### 5. Raft Configuration Management
-**Status**: **Mostly Completed**
+### 5. Dynamic Membership Changes (Raft Configuration Management)
+**Status**: **Partially Completed**
 **Priority**: Medium
 **Effort**: Medium
+
+**Background**:
+動的なメンバーシップ変更は、Raftクラスタの稼働中にノードを追加・削除する機能です。
+基本的な`AddServer`/`RemoveServer`コマンドは実装済みですが、本番運用に必要な安全機構（Joint Consensus）は未実装です。
 
 **Tasks**:
 - [x] Design configuration change protocol
 - [x] Implement AddServer/RemoveServer RPC
 - [x] Add configuration log entries to Raft log
-- [ ] Implement joint consensus phase (using single-server changes for safety)
+- [ ] **Implement joint consensus phase** (Raftの標準安全メカニズム、Split Brain防止)
+- [ ] **Implement automatic leader transfer** (削除対象ノードがLeaderの場合)
+- [ ] **Add comprehensive integration tests** (メンバーシップ変更中の障害シナリオ)
 - [x] Add CLI commands for cluster management
 - [x] Add safety checks (prevent removing majority)
+- [ ] **Add operational documentation** (運用手順、制約事項、ベストプラクティス)
 
 ### 8. Raft Performance Optimizations
 **Status**: Not Started
