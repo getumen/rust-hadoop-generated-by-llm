@@ -179,6 +179,80 @@ impl ConfigService for MyConfigServer {
         }
     }
 
+    async fn merge_shard(
+        &self,
+        request: Request<crate::dfs::MergeShardRequest>,
+    ) -> Result<Response<crate::dfs::MergeShardResponse>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::MergeShard {
+                    victim_shard_id: req.victim_shard_id,
+                    retained_shard_id: req.retained_shard_id,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(crate::dfs::MergeShardResponse {
+                success: true,
+                error_message: "".to_string(),
+                leader_hint: "".to_string(),
+            })),
+            Ok(Err(leader_opt)) => Ok(Response::new(crate::dfs::MergeShardResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
+    async fn rebalance_shard(
+        &self,
+        request: Request<crate::dfs::RebalanceShardRequest>,
+    ) -> Result<Response<crate::dfs::RebalanceShardResponse>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        if self
+            .raft_tx
+            .send(Event::ClientRequest {
+                command: Command::Config(ConfigCommand::RebalanceShard {
+                    old_key: req.old_key,
+                    new_key: req.new_key,
+                }),
+                reply_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::internal("Raft channel closed"));
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(Response::new(crate::dfs::RebalanceShardResponse {
+                success: true,
+                error_message: "".to_string(),
+                leader_hint: "".to_string(),
+            })),
+            Ok(Err(leader_opt)) => Ok(Response::new(crate::dfs::RebalanceShardResponse {
+                success: false,
+                error_message: "Not Leader".to_string(),
+                leader_hint: leader_opt.unwrap_or_default(),
+            })),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
+
     async fn register_master(
         &self,
         request: Request<crate::dfs::RegisterMasterRequest>,

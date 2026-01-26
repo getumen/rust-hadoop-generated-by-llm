@@ -67,6 +67,7 @@ impl ShardMap {
 
     /// Add a new Shard to the map with its peers.
     pub fn add_shard(&mut self, shard_id: ShardId, peers: Vec<String>) {
+        eprintln!("DEBUG: add_shard called for {}", shard_id);
         if self.shards.contains(&shard_id) {
             // Update peers if already exists? For now, we update.
             self.shard_peers.insert(shard_id.clone(), peers.clone());
@@ -74,6 +75,10 @@ impl ShardMap {
         }
         self.shards.insert(shard_id.clone());
         self.shard_peers.insert(shard_id.clone(), peers.clone());
+        eprintln!(
+            "DEBUG: add_shard inserted {}. Shards now: {:?}",
+            shard_id, self.shards
+        );
 
         match &mut self.strategy {
             ShardingStrategy::ConsistentHash {
@@ -181,19 +186,17 @@ impl ShardMap {
             if self.shards.contains(&new_shard_id) {
                 return false;
             }
+            if ranges.contains_key(&split_key) {
+                return false;
+            }
 
             // Find the shard that currently contains the split_key
-            if let Some(old_shard_end) = ranges
+            if let Some(_old_shard_end) = ranges
                 .range(split_key.clone()..)
                 .next()
                 .map(|(k, _)| k.clone())
             {
-                let _old_shard_id = ranges.get(&old_shard_end).unwrap().clone();
-
                 // Insert the new split point.
-                // The new shard will cover [previous_end, split_key)
-                // The old shard will cover [split_key, old_shard_end)
-                // Actually, if we want [ ..., split_key) -> new_shard, we insert (split_key, new_shard)
                 ranges.insert(split_key, new_shard_id.clone());
                 self.shards.insert(new_shard_id.clone());
                 self.shard_peers.insert(new_shard_id, peers);
@@ -203,9 +206,76 @@ impl ShardMap {
         false
     }
 
+    /// Merge two adjacent shards for Range sharding.
+    /// Combined shard will take the identity of retained_shard_id.
+    pub fn merge_shards(&mut self, victim_shard_id: &ShardId, retained_shard_id: &ShardId) -> bool {
+        if let ShardingStrategy::Range { ranges } = &mut self.strategy {
+            if !self.shards.contains(victim_shard_id) || !self.shards.contains(retained_shard_id) {
+                return false;
+            }
+
+            // Find the split key for the victim shard.
+            let victim_key = ranges
+                .iter()
+                .find(|(_, sid)| *sid == victim_shard_id)
+                .map(|(k, _)| k.clone());
+
+            if let Some(vk) = victim_key {
+                ranges.remove(&vk);
+                // Ensure retained_shard_id is still present in the map for its original range or extended range
+                if vk == "\u{10FFFF}" {
+                    // Retained MUST take the max key if victim had it
+                    let retained_key = ranges
+                        .iter()
+                        .find(|(_, sid)| *sid == retained_shard_id)
+                        .map(|(k, _)| k.clone());
+                    if let Some(rk) = retained_key {
+                        ranges.remove(&rk);
+                    }
+                    ranges.insert("\u{10FFFF}".to_string(), retained_shard_id.clone());
+                }
+
+                self.shards.remove(victim_shard_id);
+                self.shard_peers.remove(victim_shard_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Shift the boundary between two adjacent shards.
+    /// This effectively moves keys [min(old_key, new_key), max(old_key, new_key)] between shards.
+    pub fn rebalance_boundary(&mut self, old_key: String, new_key: String) -> bool {
+        if let ShardingStrategy::Range { ranges } = &mut self.strategy {
+            if let Some(shard_id) = ranges.remove(&old_key) {
+                ranges.insert(new_key, shard_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get adjacent shards for a given shard ID.
+    pub fn get_neighbors(&self, shard_id: &ShardId) -> (Option<ShardId>, Option<ShardId>) {
+        if let ShardingStrategy::Range { ranges } = &self.strategy {
+            let mut prev = None;
+            let mut iter = ranges.iter();
+            while let Some((_, sid)) = iter.next() {
+                if sid == shard_id {
+                    let next = iter.next().map(|(_, s)| s.clone());
+                    return (prev, next);
+                }
+                prev = Some(sid.clone());
+            }
+        }
+        (None, None)
+    }
+
     /// Get all registered shards
     pub fn get_all_shards(&self) -> Vec<ShardId> {
-        self.shards.iter().cloned().collect()
+        let shards: Vec<ShardId> = self.shards.iter().cloned().collect();
+        eprintln!("DEBUG: get_all_shards returning: {:?}", shards);
+        shards
     }
 
     /// Get peers for a specific shard.

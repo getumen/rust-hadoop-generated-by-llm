@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libstdc++6 \
     net-tools \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

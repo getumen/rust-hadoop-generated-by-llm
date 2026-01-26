@@ -46,6 +46,15 @@ struct Args {
 
     #[arg(long, value_delimiter = ',')]
     config_servers: Vec<String>,
+
+    #[arg(long, default_value = "100.0")]
+    split_threshold_rps: f64,
+
+    #[arg(long, default_value = "30")]
+    split_cooldown_secs: u64,
+
+    #[arg(long, default_value = "1.0")]
+    merge_threshold_rps: f64,
 }
 
 // Axum state for sharing the Raft channel
@@ -154,9 +163,14 @@ async fn main() -> anyhow::Result<()> {
         state,
         raft_tx_for_master,
         shard_map,
-        args.shard_id.clone(),
-        args.config_servers.clone(),
-        advertise_addr,
+        dfs_metaserver::master::MasterConfig {
+            shard_id: args.shard_id.clone(),
+            config_server_addrs: args.config_servers.clone(),
+            master_address: advertise_addr,
+            split_threshold_rps: args.split_threshold_rps,
+            split_cooldown_secs: args.split_cooldown_secs,
+            merge_threshold_rps: args.merge_threshold_rps,
+        },
     );
 
     tracing::info!("Master gRPC server listening on {}", addr);

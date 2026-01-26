@@ -42,6 +42,7 @@ struct Args {
 #[derive(Clone)]
 struct AxumState {
     raft_tx: tokio::sync::mpsc::Sender<Event>,
+    state: Arc<Mutex<AppState>>,
 }
 
 // Custom error type for Axum
@@ -106,12 +107,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build Axum router for Raft RPC
     let app_state = AxumState {
         raft_tx: raft_tx_for_server,
+        state: state.clone(),
     };
 
     let app = Router::new()
         .route("/raft/vote", post(handle_vote))
         .route("/raft/append", post(handle_append))
         .route("/raft/snapshot", post(handle_snapshot))
+        .route("/shards", axum::routing::get(handle_get_shards))
         .with_state(app_state);
 
     // Start HTTP Server for Raft RPC
@@ -205,5 +208,17 @@ async fn handle_snapshot(
             Ok(Json(serde_json::to_value(&reply).unwrap()))
         }
         _ => Err(InternalError),
+    }
+}
+
+async fn handle_get_shards(
+    State(app_state): State<AxumState>,
+) -> Result<Json<serde_json::Value>, InternalError> {
+    let state_lock = app_state.state.lock().unwrap();
+    if let AppState::Config(ref config_state) = *state_lock {
+        let shards = config_state.shard_map.get_all_shards();
+        Ok(Json(serde_json::json!({ "shards": shards })))
+    } else {
+        Err(InternalError)
     }
 }

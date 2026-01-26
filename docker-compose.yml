@@ -5,6 +5,8 @@ services:
     build: .
     container_name: dfs-config-server
     command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://config-server:50050
+    environment:
+      - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
       - "50050:50050"
       - "8080:8080"
@@ -19,7 +21,9 @@ services:
   master1-shard1:
     build: .
     container_name: dfs-master1-shard1
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard1:50051 --shard-id shard-1 --config-servers http://config-server:50050
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard1:50051 --shard-id shard-1 --config-servers http://config-server:50050 --merge-threshold-rps=-1.0
+    environment:
+      - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
       - "50051:50051"
       - "8081:8080"
@@ -58,7 +62,9 @@ services:
   master1-shard2:
     build: .
     container_name: dfs-master1-shard2
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard2:50051 --shard-id shard-2 --config-servers http://config-server:50050
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard2:50051 --shard-id shard-2 --config-servers http://config-server:50050 --merge-threshold-rps=-1.0
+    environment:
+      - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
       - "50061:50051"
       - "8091:8080"

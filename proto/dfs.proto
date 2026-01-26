@@ -198,6 +198,8 @@ service ConfigService {
   rpc AddShard (AddShardRequest) returns (AddShardResponse);
   rpc RemoveShard (RemoveShardRequest) returns (RemoveShardResponse);
   rpc SplitShard (SplitShardRequest) returns (SplitShardResponse);
+  rpc MergeShard (MergeShardRequest) returns (MergeShardResponse);
+  rpc RebalanceShard (RebalanceShardRequest) returns (RebalanceShardResponse);
 
   // Master node management
   rpc RegisterMaster (RegisterMasterRequest) returns (RegisterMasterResponse);
@@ -247,6 +249,28 @@ message SplitShardResponse {
   string error_message = 2;
   string leader_hint = 3;
   repeated string new_shard_peers = 4;
+}
+
+message MergeShardRequest {
+  string victim_shard_id = 1;
+  string retained_shard_id = 2;
+}
+
+message MergeShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message RebalanceShardRequest {
+  string old_key = 1;
+  string new_key = 2;
+}
+
+message RebalanceShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
 }
 
 // ============================================================================

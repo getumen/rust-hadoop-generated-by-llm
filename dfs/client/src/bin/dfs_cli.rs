@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Ls => {
-            let files = client.list_files("/").await?;
+            let files = client.list_all_files().await?;
             for file in files {
                 println!("{}", file);
             }

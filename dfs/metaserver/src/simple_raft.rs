@@ -132,6 +132,9 @@ pub enum MasterCommand {
         new_shard_id: String,
         new_shard_peers: Vec<String>,
     },
+    MergeShard {
+        victim_shard_id: String,
+    },
     /// Ingest a batch of file metadata (for shard transfers)
     IngestBatch {
         files: Vec<FileMetadata>,
@@ -165,6 +168,14 @@ pub enum ConfigCommand {
         split_key: String,
         new_shard_id: String,
         new_shard_peers: Vec<String>,
+    },
+    MergeShard {
+        victim_shard_id: String,
+        retained_shard_id: String,
+    },
+    RebalanceShard {
+        old_key: String,
+        new_key: String,
     },
     RegisterMaster {
         address: String,
@@ -1830,12 +1841,15 @@ impl RaftNode {
                                 master_state.files.remove(&path);
                             }
 
+                            tracing::info!(count, new_shard_id);
+                        }
+                        MasterCommand::MergeShard { victim_shard_id } => {
                             tracing::info!(
-                                "Shard split at {}: removed {} files to new shard {}",
-                                split_key,
-                                count,
-                                new_shard_id
+                                "Shard merge: {} is being merged into this shard",
+                                victim_shard_id
                             );
+                            // Note: Actual metadata ingestion is handled via IngestBatch RPC
+                            // called by the victim shard's master after the merge is committed.
                         }
                         MasterCommand::IngestBatch { files } => {
                             let count = files.len();
@@ -1885,6 +1899,19 @@ impl RaftNode {
                                 new_shard_id.clone(),
                                 new_shard_peers.clone(),
                             );
+                        }
+                        ConfigCommand::MergeShard {
+                            victim_shard_id,
+                            retained_shard_id,
+                        } => {
+                            config_state
+                                .shard_map
+                                .merge_shards(victim_shard_id, retained_shard_id);
+                        }
+                        ConfigCommand::RebalanceShard { old_key, new_key } => {
+                            config_state
+                                .shard_map
+                                .rebalance_boundary(old_key.clone(), new_key.clone());
                         }
                         ConfigCommand::RegisterMaster { address, shard_id } => {
                             // Automatically add the shard to the map if it doesn't exist.

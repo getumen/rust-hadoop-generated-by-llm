@@ -85,6 +85,11 @@ impl Client {
     }
 
     pub async fn list_all_files(&self) -> anyhow::Result<Vec<String>> {
+        // First, refresh shard map from config server if configured
+        if !self.config_server_addrs.is_empty() {
+            let _ = self.refresh_shard_map().await;
+        }
+
         let (shards, default_masters) = {
             let map = self.shard_map.read().unwrap();
             (map.get_all_shards(), self.master_addrs.clone())
