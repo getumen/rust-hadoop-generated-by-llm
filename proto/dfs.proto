@@ -37,6 +37,12 @@ service MasterService {
   rpc AddRaftServer (AddRaftServerRequest) returns (AddRaftServerResponse);
   rpc RemoveRaftServer (RemoveRaftServerRequest) returns (RemoveRaftServerResponse);
   rpc GetClusterInfo (GetClusterInfoRequest) returns (GetClusterInfoResponse);
+
+  // Metadata ingestion for shard splitting
+  rpc IngestMetadata (IngestMetadataRequest) returns (IngestMetadataResponse);
+
+  // Trigger background data shuffling
+  rpc InitiateShuffle (InitiateShuffleRequest) returns (InitiateShuffleResponse);
 }
 
 message HeartbeatRequest {
@@ -101,6 +107,7 @@ message AllocateBlockResponse {
 
 message CompleteFileRequest {
   string path = 1;
+  uint64 size = 2;
 }
 
 message CompleteFileResponse {
@@ -190,6 +197,13 @@ service ConfigService {
   rpc FetchShardMap (FetchShardMapRequest) returns (FetchShardMapResponse);
   rpc AddShard (AddShardRequest) returns (AddShardResponse);
   rpc RemoveShard (RemoveShardRequest) returns (RemoveShardResponse);
+  rpc SplitShard (SplitShardRequest) returns (SplitShardResponse);
+  rpc MergeShard (MergeShardRequest) returns (MergeShardResponse);
+  rpc RebalanceShard (RebalanceShardRequest) returns (RebalanceShardResponse);
+
+  // Master node management
+  rpc RegisterMaster (RegisterMasterRequest) returns (RegisterMasterResponse);
+  rpc ShardHeartbeat (ShardHeartbeatRequest) returns (ShardHeartbeatResponse);
 }
 
 message FetchShardMapRequest {}
@@ -218,6 +232,42 @@ message RemoveShardRequest {
 }
 
 message RemoveShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message SplitShardRequest {
+  string shard_id = 1;
+  string split_key = 2;
+  string new_shard_id = 3;
+  repeated string new_shard_peers = 4;
+}
+
+message SplitShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+  repeated string new_shard_peers = 4;
+}
+
+message MergeShardRequest {
+  string victim_shard_id = 1;
+  string retained_shard_id = 2;
+}
+
+message MergeShardResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message RebalanceShardRequest {
+  string old_key = 1;
+  string new_key = 2;
+}
+
+message RebalanceShardResponse {
   bool success = 1;
   string error_message = 2;
   string leader_hint = 3;
@@ -346,4 +396,46 @@ message ClusterMember {
   uint32 server_id = 1;             // Server ID (index in peers list)
   string address = 2;               // Server's HTTP address
   bool is_self = 3;                 // True if this is the current node
+}
+
+// ============================================================================
+// Shard Phase 2 Messages
+// ============================================================================
+
+message IngestMetadataRequest {
+  repeated FileMetadata files = 1;
+}
+
+message IngestMetadataResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
+}
+
+message RegisterMasterRequest {
+  string address = 1;               // Master HTTP address
+  string shard_id = 2;              // Shard this master belongs to
+}
+
+message RegisterMasterResponse {
+  bool success = 1;
+}
+
+message ShardHeartbeatRequest {
+  string address = 1;               // Master HTTP address
+  map<string, double> rps_per_prefix = 2; // Current load info for balancing
+}
+
+message ShardHeartbeatResponse {
+  bool success = 1;
+}
+
+message InitiateShuffleRequest {
+  string prefix = 1;
+}
+
+message InitiateShuffleResponse {
+  bool success = 1;
+  string error_message = 2;
+  string leader_hint = 3;
 }

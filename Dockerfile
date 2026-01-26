@@ -1,4 +1,4 @@
-FROM rust:1.91-bookworm as builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /app
 
@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libstdc++6 \
     net-tools \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -30,6 +31,7 @@ WORKDIR /app
 # Copy binaries from builder
 COPY --from=builder /app/target/release/master /app/master
 COPY --from=builder /app/target/release/chunkserver /app/chunkserver
+COPY --from=builder /app/target/release/config_server /app/config_server
 COPY --from=builder /app/target/release/dfs_cli /app/dfs_cli
 COPY --from=builder /app/target/release/s3-server /app/s3-server
 

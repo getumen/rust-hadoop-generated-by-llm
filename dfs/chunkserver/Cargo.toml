@@ -28,6 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 dfs-common = { path = "../common" }
+dfs-client = { path = "../client" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

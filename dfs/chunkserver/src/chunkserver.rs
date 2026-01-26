@@ -6,19 +6,78 @@ use std::path::PathBuf;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
+use dfs_common::sharding::ShardMap;
+use std::sync::{Arc, Mutex};
+
 #[derive(Debug, Clone)]
 pub struct MyChunkServer {
     storage_dir: PathBuf,
-    master_addrs: Vec<String>,
+    config_server_addrs: Vec<String>,
+    pub shard_map: Arc<Mutex<ShardMap>>,
 }
 
 impl MyChunkServer {
-    pub fn new(storage_dir: PathBuf, master_addrs: Vec<String>) -> Self {
+    pub fn new(storage_dir: PathBuf, config_server_addrs: Vec<String>) -> Self {
         fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
+
+        // Load shard map from config file if available
+        let shard_config_path = std::env::var("SHARD_CONFIG").ok();
+        let shard_map = if let Some(path) = shard_config_path {
+            tracing::info!("Loading shard config from {}", path);
+            Arc::new(Mutex::new(
+                dfs_common::sharding::load_shard_map_from_config(Some(&path), 100),
+            ))
+        } else {
+            Arc::new(Mutex::new(ShardMap::new(100)))
+        };
+
         MyChunkServer {
             storage_dir,
-            master_addrs,
+            config_server_addrs,
+            shard_map,
         }
+    }
+
+    pub async fn refresh_shard_map(&self) -> Result<(), String> {
+        for config_addr in &self.config_server_addrs {
+            use crate::dfs::config_service_client::ConfigServiceClient;
+            let addr = if config_addr.starts_with("http") {
+                config_addr.clone()
+            } else {
+                format!("http://{}", config_addr)
+            };
+
+            match ConfigServiceClient::connect(addr).await {
+                Ok(mut client) => {
+                    let request = tonic::Request::new(crate::dfs::FetchShardMapRequest {});
+                    match client.fetch_shard_map(request).await {
+                        Ok(response) => {
+                            let resp = response.into_inner();
+                            let num_shards = resp.shards.len();
+                            let mut shard_map = self.shard_map.lock().unwrap();
+                            // Update shard map from response
+                            for (shard_id, peers) in resp.shards {
+                                shard_map.add_shard(shard_id, peers.peers);
+                            }
+                            let num_masters = shard_map.get_all_masters().len();
+                            tracing::info!(
+                                "Refreshed shard map: {} shards, {} total masters found",
+                                num_shards,
+                                num_masters
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch shard map from {}: {}", config_addr, e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect to config server {}: {}", config_addr, e)
+                }
+            }
+        }
+        Err("Failed to refresh shard map from any config server".to_string())
     }
 
     fn calculate_checksums(data: &[u8]) -> Vec<u32> {
@@ -100,12 +159,18 @@ impl MyChunkServer {
 
         // 1. Query Master for block locations
         let mut locations = Vec::new();
-        for master_addr in &self.master_addrs {
-            match crate::dfs::master_service_client::MasterServiceClient::connect(format!(
-                "http://{}",
-                master_addr
-            ))
-            .await
+        let masters = {
+            let shard_map = self.shard_map.lock().unwrap();
+            shard_map.get_all_masters()
+        };
+
+        for master_addr in masters {
+            let master_url = if master_addr.starts_with("http://") {
+                master_addr.clone()
+            } else {
+                format!("http://{}", master_addr)
+            };
+            match crate::dfs::master_service_client::MasterServiceClient::connect(master_url).await
             {
                 Ok(mut client) => {
                     let request = tonic::Request::new(crate::dfs::GetBlockLocationsRequest {
@@ -238,15 +303,8 @@ impl MyChunkServer {
         }
     }
 
-    pub async fn run_background_scrubber(
-        storage_dir: PathBuf,
-        master_addrs: Vec<String>,
-        interval: std::time::Duration,
-    ) {
-        let server = MyChunkServer {
-            storage_dir: storage_dir.clone(),
-            master_addrs,
-        };
+    pub async fn run_background_scrubber(server: MyChunkServer, interval: std::time::Duration) {
+        let storage_dir = server.storage_dir.clone();
 
         loop {
             tokio::time::sleep(interval).await;

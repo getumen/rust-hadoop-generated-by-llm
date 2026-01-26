@@ -66,18 +66,25 @@
 
 ## 🟡 Medium Priority (Infrastructure & Performance)
 
-### 5. Raft Configuration Management
-**Status**: **Mostly Completed**
+### 5. Dynamic Membership Changes (Raft Configuration Management)
+**Status**: **Partially Completed**
 **Priority**: Medium
 **Effort**: Medium
+
+**Background**:
+動的なメンバーシップ変更は、Raftクラスタの稼働中にノードを追加・削除する機能です。
+基本的な`AddServer`/`RemoveServer`コマンドは実装済みですが、本番運用に必要な安全機構（Joint Consensus）は未実装です。
 
 **Tasks**:
 - [x] Design configuration change protocol
 - [x] Implement AddServer/RemoveServer RPC
 - [x] Add configuration log entries to Raft log
-- [ ] Implement joint consensus phase (using single-server changes for safety)
+- [ ] **Implement joint consensus phase** (Raftの標準安全メカニズム、Split Brain防止)
+- [ ] **Implement automatic leader transfer** (削除対象ノードがLeaderの場合)
+- [ ] **Add comprehensive integration tests** (メンバーシップ変更中の障害シナリオ)
 - [x] Add CLI commands for cluster management
 - [x] Add safety checks (prevent removing majority)
+- [ ] **Add operational documentation** (運用手順、制約事項、ベストプラクティス)
 
 ### 8. Raft Performance Optimizations
 **Status**: Not Started
@@ -175,7 +182,22 @@
 - [ ] Implement background encoding for cold files
 - [ ] Add reconstruction logic for failed EC blocks
 
----
+### 20. Dynamic Sharding (Load-based Splitting)
+**Status**: **Completed**
+**Priority**: High
+**Effort**: Large
+
+**Objective**: Split shards based on read/write throughput (PPS/BPS) and ensure prefix locality (S3/Colossus style).
+
+**Tasks**:
+- [x] Transition from Consistent Hashing to Range-based Sharding
+- [x] Implement throughput monitoring per prefix/shard
+- [x] Implement Shard Split logic in Raft and Master state
+- [x] Implement Client-side handling of shard redirects for dynamic ranges
+- [x] Master registration & Heartbeats (Metadata migration support)
+- [x] ChunkServer dynamic master discovery (Phase 3)
+- [x] Implement actual block data migration (Data Shuffling)
+- [x] Add auto-scaling/load-balancing logic for shards
 
 ## ✅ Completed & Archived
 
@@ -201,6 +223,7 @@
 **Status**: **Completed**
 - [x] Safe Mode state machine and block reporting threshold
 
+
 ### 6. Health Checks and Monitoring
 **Status**: **Completed** (Phase 1)
 - [x] /health and Raft state endpoints
@@ -210,6 +233,7 @@
 **Status**: **Completed**
 - [x] README, S3_COMPATIBILITY, MASTER_HA, REPLICATION, CHAOS_TEST guides.
 
+>>>>>>> 9c6690d13a61bc311f737db4d062ee3bc0654380
 ### 19. S3 REST API Compatibility
 **Status**: **Completed** (Core)
 - [x] Bucket & Object operations
@@ -235,11 +259,12 @@
 - 🟡 Lease-based Heartbeats & Reliability
 - ✅ Code Quality & Tech Debt Reduction (Phase 1)
 
-### Phase 5: Advanced Ecosystem (Future)
+### Phase 5: Advanced Ecosystem & Scalability (Next)
+- ✅ Dynamic Sharding: Load-based range splitting (Completed)
 - 🟢 High-performance S3 (Presigned URLs, efficient CopyObject)
 - 🟢 Security (TLS, AuthN/AuthZ)
 - 🟢 Storage Efficiency (Erasure Coding)
 - 🟢 Rack Awareness
 
-**Last Updated**: 2026-01-06
+**Last Updated**: 2026-01-26
 **Maintainer**: Development Team

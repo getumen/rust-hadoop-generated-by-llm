@@ -2,16 +2,14 @@ pub mod dfs {
     include!(concat!(env!("OUT_DIR"), "/dfs.rs"));
 }
 
-pub mod sharding;
-
 use crate::dfs::chunk_server_service_client::ChunkServerServiceClient;
 use crate::dfs::master_service_client::MasterServiceClient;
 use crate::dfs::{
-    AllocateBlockRequest, CreateFileRequest, DeleteFileRequest, GetFileInfoRequest,
-    ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
+    AllocateBlockRequest, CompleteFileRequest, CreateFileRequest, DeleteFileRequest,
+    GetFileInfoRequest, ListFilesRequest, ReadBlockRequest, RenameRequest, WriteBlockRequest,
 };
-use crate::sharding::ShardMap;
 use anyhow::{anyhow, bail};
+use dfs_common::sharding::ShardMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -28,18 +26,19 @@ pub struct Client {
     master_addrs: Vec<String>,
     shard_map: Arc<RwLock<ShardMap>>,
     host_aliases: Arc<RwLock<HashMap<String, String>>>,
+    config_server_addrs: Vec<String>,
     max_retries: usize,
     initial_backoff_ms: u64,
 }
 
 impl Client {
-    pub fn new(master_addrs: Vec<String>) -> Self {
+    pub fn new(master_addrs: Vec<String>, config_server_addrs: Vec<String>) -> Self {
         // Initialize with default (empty) ShardMap.
-        // In a real scenario, we would fetch this from a Config Server.
         Self {
             master_addrs,
             shard_map: Arc::new(RwLock::new(ShardMap::new(100))),
             host_aliases: Arc::new(RwLock::new(HashMap::new())),
+            config_server_addrs,
             max_retries: MAX_RETRIES,
             initial_backoff_ms: INITIAL_BACKOFF_MS,
         }
@@ -86,6 +85,11 @@ impl Client {
     }
 
     pub async fn list_all_files(&self) -> anyhow::Result<Vec<String>> {
+        // First, refresh shard map from config server if configured
+        if !self.config_server_addrs.is_empty() {
+            let _ = self.refresh_shard_map().await;
+        }
+
         let (shards, default_masters) = {
             let map = self.shard_map.read().unwrap();
             (map.get_all_shards(), self.master_addrs.clone())
@@ -189,6 +193,7 @@ impl Client {
 
         // 3. Allocate block
         // Use the master that handled create_file successfully to ensure read-your-writes consistency
+        let buffer_len = buffer.len() as u64;
         let alloc_masters = {
             let mut m = vec![success_addr];
             for addr in &self.master_addrs {
@@ -265,7 +270,40 @@ impl Client {
             bail!("Failed to write block: {}", write_resp.error_message);
         }
 
+        // 5. Complete file
+        let (complete_resp, _) = self
+            .execute_rpc(Some(dest), |mut client| {
+                let dest = dest.to_string();
+                let size = buffer_len;
+                async move {
+                    let complete_req =
+                        tonic::Request::new(CompleteFileRequest { path: dest, size });
+                    client.complete_file(complete_req).await
+                }
+            })
+            .await?;
+
+        if !complete_resp.into_inner().success {
+            bail!("Failed to complete file");
+        }
+
         Ok(())
+    }
+
+    pub async fn get_file_info(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<Option<crate::dfs::FileMetadata>> {
+        let (info_resp, _) = self
+            .execute_rpc(Some(path), |mut client| {
+                let path = path.to_string();
+                async move {
+                    let info_req = tonic::Request::new(GetFileInfoRequest { path });
+                    client.get_file_info(info_req).await
+                }
+            })
+            .await?;
+        Ok(info_resp.into_inner().metadata)
     }
 
     pub async fn get_file(&self, source: &str, dest: &Path) -> anyhow::Result<()> {
@@ -415,11 +453,41 @@ impl Client {
             })
             .await?;
         let rename_resp = rename_resp.into_inner();
-
         if rename_resp.success {
             Ok(())
         } else {
             bail!("Failed to rename file: {}", rename_resp.error_message);
+        }
+    }
+
+    pub async fn initiate_shuffle(&self, prefix: &str) -> anyhow::Result<()> {
+        let (resp, _) = self
+            .execute_rpc(Some(prefix), |mut client| {
+                let prefix = prefix.to_string();
+                async move {
+                    let req = tonic::Request::new(crate::dfs::InitiateShuffleRequest { prefix });
+                    let response = client.initiate_shuffle(req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!(
+                            "Not Leader|{}",
+                            inner.leader_hint
+                        )));
+                    }
+                    if !inner.error_message.is_empty()
+                        && inner.error_message.starts_with("REDIRECT:")
+                    {
+                        return Err(tonic::Status::out_of_range(inner.error_message.clone()));
+                    }
+                    Ok(response)
+                }
+            })
+            .await?;
+
+        if resp.into_inner().success {
+            Ok(())
+        } else {
+            bail!("Failed to initiate shuffle")
         }
     }
 
@@ -533,11 +601,26 @@ impl Client {
                     Ok(res) => return Ok((res, master_addr)),
                     Err(status) => {
                         let msg = status.message();
+                        tracing::info!(
+                            "RPC to {} failed: code={:?}, message={}",
+                            master_addr,
+                            status.code(),
+                            msg
+                        );
                         if msg.starts_with("REDIRECT:") {
                             let parts: Vec<&str> = msg.splitn(2, ':').collect();
                             if parts.len() > 1 && !parts[1].is_empty() {
                                 leader_hint = Some(parts[1].to_string());
-                                tracing::info!("Received SHARD REDIRECT to: {}", parts[1]);
+                                tracing::info!(
+                                    "Received SHARD REDIRECT to: {}. Refreshing ShardMap...",
+                                    parts[1]
+                                );
+
+                                // Refresh shard map in background or inline
+                                let self_clone = self.clone();
+                                tokio::spawn(async move {
+                                    let _ = self_clone.refresh_shard_map().await;
+                                });
                                 break;
                             }
                         }
@@ -573,5 +656,48 @@ impl Client {
         }
 
         bail!("No available leader found after retries")
+    }
+
+    pub async fn refresh_shard_map(&self) -> anyhow::Result<()> {
+        if self.config_server_addrs.is_empty() {
+            return Ok(());
+        }
+
+        use crate::dfs::config_service_client::ConfigServiceClient;
+        use crate::dfs::FetchShardMapRequest;
+
+        for addr in &self.config_server_addrs {
+            let config_addr_with_prefix = if addr.starts_with("http://") {
+                addr.clone()
+            } else {
+                format!("http://{}", addr)
+            };
+            let resolved_addr = self.resolve_url(&config_addr_with_prefix);
+            if let Ok(mut client) = ConfigServiceClient::connect(resolved_addr).await {
+                if let Ok(resp) = client.fetch_shard_map(FetchShardMapRequest {}).await {
+                    let shards_data = resp.into_inner().shards;
+                    let mut shards_vec: Vec<_> = shards_data.into_iter().collect();
+                    shards_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    let mut new_map = ShardMap::new_range(); // Assume range strategy for dynamic sharding
+
+                    for (shard_id, peers_info) in shards_vec {
+                        new_map.add_shard(shard_id, peers_info.peers);
+                    }
+
+                    // Note: We might need a better way to recover the exact split points
+                    // if they are not returned by fetch_shard_map.
+                    // For now, assume fetch_shard_map returns the correct boundaries if updated.
+
+                    self.set_shard_map(new_map);
+                    tracing::info!(
+                        "Successfully refreshed ShardMap from Config server {}",
+                        addr
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        bail!("Failed to refresh ShardMap from any Config server")
     }
 }

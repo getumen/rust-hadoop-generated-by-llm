@@ -34,13 +34,14 @@
 //! - [`Event`]: Events processed by the Raft event loop
 //! - [`RpcMessage`]: Raft RPC messages (RequestVote, AppendEntries, etc.)
 
+use crate::dfs::FileMetadata;
 use crate::master::MasterState;
-use crate::sharding::ShardMap;
 use anyhow::{Context, Result};
+use dfs_common::sharding::ShardMap;
 use rand::Rng;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -126,6 +127,31 @@ pub enum MasterCommand {
     DeleteTransactionRecord {
         tx_id: String,
     },
+    SplitShard {
+        split_key: String,
+        new_shard_id: String,
+        new_shard_peers: Vec<String>,
+    },
+    MergeShard {
+        victim_shard_id: String,
+    },
+    /// Ingest a batch of file metadata (for shard transfers)
+    IngestBatch {
+        files: Vec<FileMetadata>,
+    },
+    /// Trigger background data shuffling for a prefix
+    TriggerShuffle {
+        prefix: String,
+    },
+    /// Finalize file (update size)
+    CompleteFile {
+        path: String,
+        size: u64,
+    },
+    /// Stop background data shuffling for a prefix
+    StopShuffle {
+        prefix: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,12 +163,48 @@ pub enum ConfigCommand {
     RemoveShard {
         shard_id: String,
     },
+    SplitShard {
+        shard_id: String,
+        split_key: String,
+        new_shard_id: String,
+        new_shard_peers: Vec<String>,
+    },
+    MergeShard {
+        victim_shard_id: String,
+        retained_shard_id: String,
+    },
+    RebalanceShard {
+        old_key: String,
+        new_key: String,
+    },
+    RegisterMaster {
+        address: String,
+        shard_id: String,
+    },
+    ShardHeartbeat {
+        address: String,
+        rps_per_prefix: HashMap<String, f64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterInfo {
+    pub address: String,
+    pub shard_id: String,
+    pub last_heartbeat: u64,
+    pub rps_per_prefix: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigStateInner {
+    pub shard_map: ShardMap,
+    pub masters: HashMap<String, MasterInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AppState {
     Master(MasterState),
-    Config(ShardMap),
+    Config(ConfigStateInner),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1761,19 +1823,143 @@ impl RaftNode {
                                 );
                             }
                         }
+                        MasterCommand::SplitShard {
+                            split_key,
+                            new_shard_id,
+                            new_shard_peers: _,
+                        } => {
+                            // Collect files that belong to the new shard (lexicographical >= split_key)
+                            let to_move: Vec<String> = master_state
+                                .files
+                                .keys()
+                                .filter(|k| **k >= *split_key)
+                                .cloned()
+                                .collect();
+
+                            let count = to_move.len();
+                            for path in to_move {
+                                master_state.files.remove(&path);
+                            }
+
+                            tracing::info!(count, new_shard_id);
+                        }
+                        MasterCommand::MergeShard { victim_shard_id } => {
+                            tracing::info!(
+                                "Shard merge: {} is being merged into this shard",
+                                victim_shard_id
+                            );
+                            // Note: Actual metadata ingestion is handled via IngestBatch RPC
+                            // called by the victim shard's master after the merge is committed.
+                        }
+                        MasterCommand::IngestBatch { files } => {
+                            let count = files.len();
+                            for file in files {
+                                master_state.files.insert(file.path.clone(), file.clone());
+                            }
+                            tracing::info!("Ingested batch of {} files into shard", count);
+                        }
+                        MasterCommand::TriggerShuffle { prefix } => {
+                            master_state.shuffling_prefixes.insert(prefix.clone());
+                            tracing::info!("Triggered background shuffling for prefix: {}", prefix);
+                        }
+                        MasterCommand::CompleteFile { path, size } => {
+                            if let Some(file) = master_state.files.get_mut(path) {
+                                file.size = *size;
+                                tracing::info!("Completed file {}: size={} bytes", path, size);
+                            }
+                        }
+                        MasterCommand::StopShuffle { prefix } => {
+                            master_state.shuffling_prefixes.remove(prefix.as_str());
+                            tracing::info!("Stopped background shuffling for prefix: {}", prefix);
+                        }
                     }
                 } else {
                     tracing::error!("Error: Received MasterCommand but state is not MasterState");
                 }
             }
             Command::Config(cmd) => {
-                if let AppState::Config(ref mut shard_map) = *state {
+                if let AppState::Config(ref mut config_state) = *state {
                     match cmd {
                         ConfigCommand::AddShard { shard_id, peers } => {
-                            shard_map.add_shard(shard_id.clone(), peers.clone());
+                            config_state
+                                .shard_map
+                                .add_shard(shard_id.clone(), peers.clone());
                         }
                         ConfigCommand::RemoveShard { shard_id } => {
-                            shard_map.remove_shard(shard_id);
+                            config_state.shard_map.remove_shard(shard_id);
+                        }
+                        ConfigCommand::SplitShard {
+                            shard_id: _,
+                            split_key,
+                            new_shard_id,
+                            new_shard_peers,
+                        } => {
+                            config_state.shard_map.split_shard(
+                                split_key.clone(),
+                                new_shard_id.clone(),
+                                new_shard_peers.clone(),
+                            );
+                        }
+                        ConfigCommand::MergeShard {
+                            victim_shard_id,
+                            retained_shard_id,
+                        } => {
+                            config_state
+                                .shard_map
+                                .merge_shards(victim_shard_id, retained_shard_id);
+                        }
+                        ConfigCommand::RebalanceShard { old_key, new_key } => {
+                            config_state
+                                .shard_map
+                                .rebalance_boundary(old_key.clone(), new_key.clone());
+                        }
+                        ConfigCommand::RegisterMaster { address, shard_id } => {
+                            // Automatically add the shard to the map if it doesn't exist.
+                            // This simplifies initial cluster setup.
+                            if !config_state.shard_map.has_shard(shard_id) {
+                                tracing::info!(
+                                    "RegisterMaster: Adding new shard {} to ShardMap",
+                                    shard_id
+                                );
+                                config_state
+                                    .shard_map
+                                    .add_shard(shard_id.clone(), vec![address.clone()]);
+                            } else {
+                                // Add this address to the shard's peers if not already present
+                                let mut peers = config_state
+                                    .shard_map
+                                    .get_peers(shard_id)
+                                    .unwrap_or_default();
+                                if !peers.contains(address) {
+                                    peers.push(address.clone());
+                                    config_state.shard_map.add_shard(shard_id.clone(), peers);
+                                }
+                            }
+
+                            config_state.masters.insert(
+                                address.clone(),
+                                MasterInfo {
+                                    address: address.clone(),
+                                    shard_id: shard_id.clone(),
+                                    last_heartbeat: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    rps_per_prefix: HashMap::new(),
+                                },
+                            );
+                        }
+                        ConfigCommand::ShardHeartbeat {
+                            address,
+                            rps_per_prefix,
+                        } => {
+                            if let Some(info) = config_state.masters.get_mut(address) {
+                                info.last_heartbeat = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                info.rps_per_prefix = rps_per_prefix.clone();
+                            }
                         }
                     }
                 } else {

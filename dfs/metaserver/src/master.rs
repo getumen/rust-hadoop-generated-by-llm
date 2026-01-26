@@ -6,7 +6,8 @@ use crate::dfs::{
     CreateFileRequest, CreateFileResponse, DeleteFileRequest, DeleteFileResponse, FileMetadata,
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetClusterInfoRequest,
     GetClusterInfoResponse, GetFileInfoRequest, GetFileInfoResponse, GetSafeModeStatusRequest,
-    GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse, ListFilesRequest,
+    GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse, IngestMetadataRequest,
+    IngestMetadataResponse, InitiateShuffleRequest, InitiateShuffleResponse, ListFilesRequest,
     ListFilesResponse, PrepareTransactionRequest, PrepareTransactionResponse,
     RegisterChunkServerRequest, RegisterChunkServerResponse, RemoveRaftServerRequest,
     RemoveRaftServerResponse, RenameRequest, RenameResponse, SetSafeModeRequest,
@@ -14,8 +15,9 @@ use crate::dfs::{
 };
 use crate::simple_raft::{AppState, Command, Event, MasterCommand, MembershipCommand, Role};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
@@ -185,11 +187,14 @@ pub struct ChunkServerStatus {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MasterState {
-    /// File metadata storage: path -> metadata
+    /// Metadata for files: path -> metadata
     pub files: HashMap<String, FileMetadata>,
 
     /// Transaction records for cross-shard operations: tx_id -> record
     pub transaction_records: HashMap<String, TransactionRecord>,
+
+    /// Prefixes currently undergoing background data shuffling
+    pub shuffling_prefixes: HashSet<String>,
 
     /// ChunkServer status (not persisted via Raft, local state only)
     #[serde(skip)]
@@ -339,7 +344,89 @@ impl MasterState {
     }
 }
 
-use crate::sharding::{ShardId, ShardMap};
+use dfs_common::sharding::{ShardId, ShardMap};
+
+// ============================================================================
+// Throughput Monitoring for Dynamic Sharding
+// ============================================================================
+
+#[derive(Debug, Default, Clone)]
+pub struct PrefixMetrics {
+    pub rps: f64,
+    pub bps: f64,
+    pub last_count: u64,
+    pub last_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct ThroughputMonitor {
+    pub metrics: Mutex<HashMap<String, PrefixMetrics>>,
+    pub split_threshold_rps: f64,
+    pub merge_threshold_rps: f64,
+    pub split_cooldown_secs: u64,
+    pub last_split_time: Mutex<Instant>,
+}
+
+impl ThroughputMonitor {
+    pub fn new(split_threshold: f64, merge_threshold: f64, cooldown: u64) -> Self {
+        Self {
+            metrics: Mutex::new(HashMap::new()),
+            split_threshold_rps: split_threshold,
+            merge_threshold_rps: merge_threshold,
+            split_cooldown_secs: cooldown,
+            last_split_time: Mutex::new(Instant::now() - Duration::from_secs(cooldown)),
+        }
+    }
+
+    pub fn record_request(&self, path: &str, bytes: u64) {
+        let prefix = self.get_path_prefix(path);
+        tracing::info!("Recording request for path: {} (prefix: {})", path, prefix);
+        let mut metrics = self.metrics.lock().expect("Mutex poisoned");
+        let entry = metrics.entry(prefix).or_default();
+        entry.last_count += 1;
+        entry.last_bytes += bytes;
+    }
+
+    fn get_path_prefix(&self, path: &str) -> String {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if !parts.is_empty() {
+            format!("/{}/", parts[0])
+        } else {
+            "/".to_string()
+        }
+    }
+
+    pub fn decay_metrics(&self) {
+        let mut metrics = self.metrics.lock().expect("Mutex poisoned");
+        for (prefix, m) in metrics.iter_mut() {
+            // Simple exponential moving average (EMA)
+            // rps = last_count / interval (we assume 5s interval for now)
+            let current_rps = m.last_count as f64 / 5.0;
+            let current_bps = m.last_bytes as f64 / 5.0;
+
+            m.rps = m.rps * 0.3 + current_rps * 0.7;
+            m.bps = m.bps * 0.3 + current_bps * 0.7;
+
+            if m.rps > 0.1 {
+                tracing::debug!("Prefix {} RPS: {:.2}, BPS: {:.2}", prefix, m.rps, m.bps);
+            }
+
+            m.last_count = 0;
+            m.last_bytes = 0;
+        }
+    }
+}
+
+/// Configuration for MyMaster
+#[derive(Debug, Clone)]
+pub struct MasterConfig {
+    pub shard_id: ShardId,
+    pub config_server_addrs: Vec<String>,
+    pub master_address: String,
+    pub split_threshold_rps: f64,
+    pub split_cooldown_secs: u64,
+    pub merge_threshold_rps: f64,
+}
 
 #[derive(Debug)]
 pub struct MyMaster {
@@ -347,6 +434,9 @@ pub struct MyMaster {
     raft_tx: mpsc::Sender<Event>,
     shard_map: Arc<Mutex<ShardMap>>,
     shard_id: ShardId,
+    monitor: Arc<ThroughputMonitor>,
+    _master_address: String,
+    _config_server_addrs: Vec<String>,
 }
 
 impl MyMaster {
@@ -354,8 +444,13 @@ impl MyMaster {
         state: Arc<Mutex<AppState>>,
         raft_tx: mpsc::Sender<Event>,
         shard_map: Arc<Mutex<ShardMap>>,
-        shard_id: ShardId,
+        config: MasterConfig,
     ) -> Self {
+        let monitor = Arc::new(ThroughputMonitor::new(
+            config.split_threshold_rps,
+            config.merge_threshold_rps,
+            config.split_cooldown_secs,
+        ));
         // Spawn liveness check loop
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -530,11 +625,537 @@ impl MyMaster {
             }
         });
 
+        // Spawn data shuffling task
+        let state_clone_shuffle = state.clone();
+        let raft_tx_shuffle = raft_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+
+                let (prefixes, servers) = {
+                    let state_lock = state_clone_shuffle.lock().expect("Mutex poisoned");
+                    if let AppState::Master(ref state) = *state_lock {
+                        let prefixes: Vec<String> =
+                            state.shuffling_prefixes.iter().cloned().collect();
+                        let servers: Vec<(String, u64)> = state
+                            .chunk_servers
+                            .iter()
+                            .map(|(addr, status)| (addr.clone(), status.available_space))
+                            .collect();
+                        (prefixes, servers)
+                    } else {
+                        (vec![], vec![])
+                    }
+                };
+
+                if prefixes.is_empty() || servers.len() < 2 {
+                    continue;
+                }
+
+                // For each prefix, try to move some blocks from most full to least full servers
+                for prefix in prefixes {
+                    let stop_shuffle = {
+                        let mut state_lock = state_clone_shuffle.lock().expect("Mutex poisoned");
+                        if let AppState::Master(ref mut state) = *state_lock {
+                            let mut sorted_servers = servers.clone();
+                            sorted_servers.sort_by(|a, b| b.1.cmp(&a.1)); // Descending available space (Coolest first)
+
+                            let (least_full_addr, _) = sorted_servers.first().unwrap();
+                            let (most_full_addr, _) = sorted_servers.last().unwrap();
+
+                            // Find blocks with this prefix on the most full server
+                            let mut block_to_shuffle = None;
+                            'outer: for file in state.files.values() {
+                                if file.path.starts_with(&prefix) {
+                                    for block in &file.blocks {
+                                        if block.locations.contains(most_full_addr)
+                                            && !block.locations.contains(least_full_addr)
+                                        {
+                                            block_to_shuffle = Some(block.block_id.clone());
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(block_id) = block_to_shuffle {
+                                let command = ChunkServerCommand {
+                                    r#type: 1, // REPLICATE
+                                    block_id: block_id.clone(),
+                                    target_chunk_server_address: least_full_addr.clone(),
+                                };
+
+                                state
+                                    .pending_commands
+                                    .entry(most_full_addr.clone())
+                                    .or_default()
+                                    .push(command);
+
+                                tracing::info!(
+                                    "Shuffle: Scheduled move of block {} (prefix: {}) from {} to {}",
+                                    block_id,
+                                    prefix,
+                                    most_full_addr,
+                                    least_full_addr
+                                );
+                                false
+                            } else {
+                                // No more blocks to move for this prefix? Or already balanced.
+                                true
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    if stop_shuffle {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let _ = raft_tx_shuffle
+                            .send(Event::ClientRequest {
+                                command: Command::Master(MasterCommand::StopShuffle {
+                                    prefix: prefix.clone(),
+                                }),
+                                reply_tx: tx,
+                            })
+                            .await;
+                        let _ = rx.await;
+                    }
+                }
+            }
+        });
+
+        // Monitor is now initialized at the beginning of new()
+
+        // Spawn metrics decay task
+        let monitor_clone = monitor.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                monitor_clone.decay_metrics();
+            }
+        });
+
+        // Spawn ShardMap refresh task
+        let shard_map_refresh = shard_map.clone();
+        let config_addrs_refresh = config.config_server_addrs.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+
+                if config_addrs_refresh.is_empty() {
+                    continue;
+                }
+
+                for config_addr in &config_addrs_refresh {
+                    let addr_to_connect = if config_addr.starts_with("http://") {
+                        config_addr.clone()
+                    } else {
+                        format!("http://{}", config_addr)
+                    };
+
+                    use crate::dfs::config_service_client::ConfigServiceClient;
+                    if let Ok(mut client) =
+                        ConfigServiceClient::connect(addr_to_connect.clone()).await
+                    {
+                        if let Ok(resp) = client
+                            .fetch_shard_map(crate::dfs::FetchShardMapRequest {})
+                            .await
+                        {
+                            let shards_data = resp.into_inner().shards;
+
+                            // Deterministic sort
+                            let mut shards_vec: Vec<_> = shards_data.into_iter().collect();
+                            shards_vec.sort_by(|a, b| a.0.cmp(&b.0));
+
+                            let mut new_map = ShardMap::new_range();
+
+                            for (shard_id, peers_info) in shards_vec {
+                                new_map.add_shard(shard_id, peers_info.peers);
+                            }
+
+                            // Update local map
+                            let mut w = shard_map_refresh.lock().expect("Mutex poisoned");
+                            *w = new_map;
+                            tracing::debug!(
+                                "Refreshed ShardMap from Config Server {}",
+                                addr_to_connect
+                            );
+                            break; // Success, wait for next interval
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn split detection and heartbeat task
+        let monitor_clone_split = monitor.clone();
+        let raft_tx_split = raft_tx.clone();
+        let shard_id_split = config.shard_id.clone();
+        let config_server_addrs_task = config.config_server_addrs.clone();
+        let master_address_task = config.master_address.clone();
+        let state_clone_split = state.clone();
+        let shard_map_clone_split = shard_map.clone();
+
+        tokio::spawn(async move {
+            let mut registered = false;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+
+                // Loop-local clones to prevent move-after-use in nested closures
+                let state_clone = state_clone_split.clone();
+                let shard_map_clone = shard_map_clone_split.clone();
+                let monitor_clone = monitor_clone_split.clone();
+                let shard_id = shard_id_split.clone();
+                let raft_tx = raft_tx_split.clone();
+                let config_addrs = config_server_addrs_task.clone();
+                let master_addr = master_address_task.clone();
+
+                // 1. Register with Config Server if not already registered
+                if !registered {
+                    for config_addr in &config_addrs {
+                        use crate::dfs::config_service_client::ConfigServiceClient;
+                        let addr_to_connect = if config_addr.starts_with("http://") {
+                            config_addr.clone()
+                        } else {
+                            format!("http://{}", config_addr)
+                        };
+
+                        if let Ok(mut client) = ConfigServiceClient::connect(addr_to_connect).await
+                        {
+                            let reg_req = crate::dfs::RegisterMasterRequest {
+                                address: master_addr.clone(),
+                                shard_id: shard_id.clone(),
+                            };
+                            if let Ok(resp) = client.register_master(reg_req).await {
+                                if resp.get_ref().success {
+                                    tracing::info!(
+                                        "Registered with Config Server at {}",
+                                        config_addr
+                                    );
+                                    registered = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Heartbeat to Config Server
+                let rps_per_prefix: HashMap<String, f64> = {
+                    let metrics = monitor_clone.metrics.lock().expect("Mutex poisoned");
+                    metrics.iter().map(|(p, m)| (p.clone(), m.rps)).collect()
+                };
+                for config_addr in &config_addrs {
+                    use crate::dfs::config_service_client::ConfigServiceClient;
+                    let addr_to_connect = if config_addr.starts_with("http://") {
+                        config_addr.clone()
+                    } else {
+                        format!("http://{}", config_addr)
+                    };
+                    if let Ok(mut client) = ConfigServiceClient::connect(addr_to_connect).await {
+                        let hb_req = crate::dfs::ShardHeartbeatRequest {
+                            address: master_addr.clone(),
+                            rps_per_prefix: rps_per_prefix.clone(),
+                        };
+                        let _ = client.shard_heartbeat(hb_req).await;
+                    }
+                }
+
+                // 3. Split Detection
+                let split_threshold = monitor_clone.split_threshold_rps;
+                let split_cooldown = monitor_clone.split_cooldown_secs;
+                let now = Instant::now();
+
+                let hot_prefix = {
+                    let metrics = monitor_clone.metrics.lock().expect("Mutex poisoned");
+                    let last_split = monitor_clone.last_split_time.lock().unwrap();
+
+                    if now.duration_since(*last_split).as_secs() >= split_cooldown {
+                        metrics
+                            .iter()
+                            .find(|(_, m)| m.rps > split_threshold)
+                            .map(|(p, m)| (p.clone(), m.rps))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((prefix, rps)) = hot_prefix {
+                    tracing::warn!(
+                        "Hot prefix detected: {} (RPS={:.2}). Triggering shard split...",
+                        prefix,
+                        rps
+                    );
+
+                    // Propose SplitShard command to local Raft
+                    let new_shard_id = format!(
+                        "{}-split-{}",
+                        shard_id,
+                        Uuid::new_v4().to_string().split('-').next().unwrap()
+                    );
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let split_cmd = MasterCommand::SplitShard {
+                        split_key: prefix.clone(),
+                        new_shard_id: new_shard_id.clone(),
+                        new_shard_peers: vec![], // Config Server will allocate
+                    };
+
+                    if let Err(e) = raft_tx
+                        .send(Event::ClientRequest {
+                            command: Command::Master(split_cmd),
+                            reply_tx: tx,
+                        })
+                        .await
+                    {
+                        tracing::error!("Failed to send split command to Raft: {}", e);
+                        continue;
+                    }
+
+                    match rx.await {
+                        Ok(Ok(_)) => {
+                            tracing::info!(
+                                "Successfully committed split shard {} at prefix {}",
+                                shard_id,
+                                prefix
+                            );
+
+                            // Update last split time for cooldown
+                            {
+                                let mut last_split = monitor_clone.last_split_time.lock().unwrap();
+                                *last_split = Instant::now();
+                            }
+
+                            // Identify files that just moved (lexicographical >= prefix)
+                            let files_to_move = {
+                                let state_lock = state_clone.lock().unwrap();
+                                if let AppState::Master(ref master_state) = *state_lock {
+                                    master_state
+                                        .files
+                                        .iter()
+                                        .filter(|(path, _)| path.starts_with(&prefix))
+                                        .map(|(_, meta)| meta.clone())
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    vec![]
+                                }
+                            };
+
+                            // Notify Config Server and trigger Metadata Migration
+                            // Notify Config Server and trigger Metadata Migration
+                            let config_addrs_inner = config_addrs.clone();
+                            let prefix_report = prefix.clone();
+                            let shard_id_report = shard_id.clone();
+                            let new_shard_report = new_shard_id.clone();
+                            let files_payload = files_to_move.clone();
+
+                            tokio::spawn(async move {
+                                for config_addr in config_addrs_inner {
+                                    use crate::dfs::config_service_client::ConfigServiceClient;
+                                    let addr_to_connect = if config_addr.starts_with("http://") {
+                                        config_addr.clone()
+                                    } else {
+                                        format!("http://{}", config_addr)
+                                    };
+                                    if let Ok(mut client) =
+                                        ConfigServiceClient::connect(addr_to_connect).await
+                                    {
+                                        let split_req = crate::dfs::SplitShardRequest {
+                                            shard_id: shard_id_report.clone(),
+                                            split_key: prefix_report.clone(),
+                                            new_shard_id: new_shard_report.clone(),
+                                            new_shard_peers: vec![],
+                                        };
+                                        if let Ok(resp) = client.split_shard(split_req).await {
+                                            let resp = resp.into_inner();
+                                            if resp.success {
+                                                tracing::info!(
+                                                    "Config server updated. New shard peers: {:?}",
+                                                    resp.new_shard_peers
+                                                );
+
+                                                // Metadata Push
+                                                if !files_payload.is_empty()
+                                                    && !resp.new_shard_peers.is_empty()
+                                                {
+                                                    for peer in resp.new_shard_peers {
+                                                        use crate::dfs::master_service_client::MasterServiceClient;
+                                                        let peer_addr = if peer.starts_with("http")
+                                                        {
+                                                            peer
+                                                        } else {
+                                                            format!("http://{}", peer)
+                                                        };
+                                                        if let Ok(mut master_client) =
+                                                            MasterServiceClient::connect(
+                                                                peer_addr.clone(),
+                                                            )
+                                                            .await
+                                                        {
+                                                            let ingest_req =
+                                                                crate::dfs::IngestMetadataRequest {
+                                                                    files: files_payload.clone(),
+                                                                };
+                                                            if master_client
+                                                                .ingest_metadata(ingest_req)
+                                                                .await
+                                                                .is_ok()
+                                                            {
+                                                                tracing::info!("Successfully migrated metadata to {}", peer_addr);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Err(hint)) => {
+                            tracing::warn!("Failed to split shard (not leader). Hint: {:?}", hint)
+                        }
+                        Err(_) => tracing::error!("Raft response error during split"),
+                    }
+                }
+
+                // 4. Merge Detection
+                let total_rps: f64 = {
+                    let metrics = monitor_clone.metrics.lock().expect("Mutex poisoned");
+                    metrics.values().map(|m| m.rps).sum()
+                };
+
+                let merge_threshold = monitor_clone.merge_threshold_rps;
+                // Skip merge if threshold is negative (disabled for testing)
+                if merge_threshold >= 0.0 && total_rps < merge_threshold {
+                    // Try to merge with a neighbor
+                    let neighbors = {
+                        let map = shard_map_clone.lock().unwrap();
+                        map.get_neighbors(&shard_id)
+                    };
+
+                    // Heuristic: Prefer merging with predecessor if it exists
+                    if let Some(neighbor_id) = neighbors.0.or(neighbors.1) {
+                        tracing::warn!(
+                            "Shard {} is underutilized (total RPS={:.2} < {:.2}). Proposing merge with {}...",
+                            shard_id,
+                            total_rps,
+                            merge_threshold,
+                            neighbor_id
+                        );
+
+                        let config_addrs_inner = config_addrs.clone();
+                        let victim = neighbor_id.clone();
+                        let retained = shard_id.clone();
+                        let shard_map_merge_inner = shard_map_clone.clone();
+                        let state_merge_inner = state_clone.clone();
+
+                        tokio::spawn(async move {
+                            for config_addr in config_addrs_inner {
+                                use crate::dfs::config_service_client::ConfigServiceClient;
+                                let addr_to_connect = if config_addr.starts_with("http://") {
+                                    config_addr.clone()
+                                } else {
+                                    format!("http://{}", config_addr)
+                                };
+                                if let Ok(mut client) =
+                                    ConfigServiceClient::connect(addr_to_connect).await
+                                {
+                                    let merge_req = crate::dfs::MergeShardRequest {
+                                        victim_shard_id: victim.clone(),
+                                        retained_shard_id: retained.clone(),
+                                    };
+                                    if let Ok(resp) = client.merge_shard(merge_req).await {
+                                        let resp_inner = resp.into_inner();
+                                        if resp_inner.success {
+                                            tracing::info!(
+                                                "Successfully initiated merge of {} into {}",
+                                                victim,
+                                                retained
+                                            );
+
+                                            // Metadata Migration for Merge
+                                            let all_files = {
+                                                let state_lock = state_merge_inner.lock().unwrap();
+                                                if let AppState::Master(ref master_state) =
+                                                    *state_lock
+                                                {
+                                                    master_state.files.values().cloned().collect()
+                                                } else {
+                                                    vec![]
+                                                }
+                                            };
+
+                                            let shard_map_for_peers = shard_map_merge_inner.clone();
+                                            let target_shard = retained.clone();
+
+                                            tokio::spawn(async move {
+                                                let peers = {
+                                                    let map = shard_map_for_peers.lock().unwrap();
+                                                    map.get_shard_peers(&target_shard)
+                                                };
+
+                                                if let Some(peer_list) = peers {
+                                                    for peer in peer_list {
+                                                        use crate::dfs::master_service_client::MasterServiceClient;
+                                                        let peer_addr = if peer.starts_with("http")
+                                                        {
+                                                            peer
+                                                        } else {
+                                                            format!("http://{}", peer)
+                                                        };
+                                                        if let Ok(mut master_client) =
+                                                            MasterServiceClient::connect(
+                                                                peer_addr.clone(),
+                                                            )
+                                                            .await
+                                                        {
+                                                            let ingest_req =
+                                                                crate::dfs::IngestMetadataRequest {
+                                                                    files: all_files.clone(),
+                                                                };
+                                                            if master_client
+                                                                .ingest_metadata(ingest_req)
+                                                                .await
+                                                                .is_ok()
+                                                            {
+                                                                tracing::info!("Successfully migrated all metadata to {} during merge", peer_addr);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            });
+
+                                            break;
+                                        } else {
+                                            tracing::error!(
+                                                "Merge request failed: {}",
+                                                resp_inner.error_message
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
         MyMaster {
             state,
             raft_tx,
             shard_map,
-            shard_id,
+            shard_id: config.shard_id,
+            monitor,
+            _master_address: config.master_address,
+            _config_server_addrs: config.config_server_addrs,
         }
     }
 
@@ -604,6 +1225,7 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
 
+            self.monitor.record_request(&req.path, 0); // Read request, 0 bytes for metadata
             self.check_shard_ownership(&req.path)?;
             self.ensure_linearizable_read().await?;
 
@@ -635,6 +1257,7 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "create_file");
         async move {
             let req = request.into_inner();
+            self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
@@ -690,6 +1313,7 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "delete_file");
         async move {
             let req = request.into_inner();
+            self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
@@ -749,6 +1373,7 @@ impl MasterService for MyMaster {
             // Replication factor (default: 3)
             const REPLICATION_FACTOR: usize = 3;
 
+            self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
@@ -840,8 +1465,41 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
             self.check_shard_ownership(&req.path)?;
-            // No-op for now, but good to have the RPC
-            Ok(Response::new(CompleteFileResponse { success: true }))
+
+            // In our simple implementation, the size of blocks might still be 0 if the
+            // ChunkServers haven't reported back yet.
+            // Ideally we'd wait for reports or have metadata update from client.
+            // For the test, we'll assume the client knows or we just finalize whatever we have.
+            // Actually, WriteBlock doesn't report size back to Master immediately.
+            // Let's assume the test file size is what we want.
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::CompleteFile {
+                        path: req.path,
+                        size: req.size,
+                    }),
+                    reply_tx: tx,
+                })
+                .await
+                .is_err()
+            {
+                return Err(Status::internal("Raft channel closed"));
+            }
+
+            match rx.await {
+                Ok(Ok(())) => Ok(Response::new(CompleteFileResponse { success: true })),
+                Ok(Err(leader_opt)) => {
+                    tracing::warn!(
+                        "Failed to complete file: Not Leader. Hint: {:?}",
+                        leader_opt
+                    );
+                    Ok(Response::new(CompleteFileResponse { success: false }))
+                }
+                Err(_) => Err(Status::internal("Raft response error")),
+            }
         }
         .instrument(span)
         .await
@@ -965,6 +1623,11 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "get_block_locations");
         async move {
             let req = request.into_inner();
+            // Search for the block in all files
+            // (Note: This is expensive, but for now we do it)
+            // No path provided in GetBlockLocationsRequest, so we can't easily record_request per prefix
+            // unless we find the file first.
+            // For now, let's skip recording for GetBlockLocations or use "/" prefix.
             self.ensure_linearizable_read().await?;
             let state_lock = self.state.lock().expect("Mutex poisoned");
             if let AppState::Master(ref state) = *state_lock {
@@ -1004,6 +1667,7 @@ impl MasterService for MyMaster {
             let source_path = req.source_path;
             let dest_path = req.dest_path;
 
+            self.monitor.record_request(&source_path, 0);
             // Check source shard ownership
             self.check_shard_ownership(&source_path)?;
             self.check_safe_mode()?;
@@ -1675,6 +2339,109 @@ impl MasterService for MyMaster {
                     }))
                 }
                 Err(_) => Err(Status::internal("Failed to get cluster info")),
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn ingest_metadata(
+        &self,
+        request: Request<IngestMetadataRequest>,
+    ) -> Result<Response<IngestMetadataResponse>, Status> {
+        let span = dfs_common::telemetry::create_server_span(&request, "ingest_metadata");
+        async move {
+            let req = request.into_inner();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            // Determine prefix before moving files into Raft command
+            let shuffle_prefix = req.files.first().and_then(|f| {
+                let path = &f.path;
+                path.rfind('/').map(|pos| path[..pos + 1].to_string())
+            });
+
+            let cmd = MasterCommand::IngestBatch { files: req.files };
+
+            if self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(cmd),
+                    reply_tx: tx,
+                })
+                .await
+                .is_err()
+            {
+                return Err(Status::internal("Raft channel closed"));
+            }
+
+            match rx.await {
+                Ok(Ok(_)) => {
+                    if let Some(prefix) = shuffle_prefix {
+                        let (tx_sh, _rx_sh) = tokio::sync::oneshot::channel();
+                        let _ = self
+                            .raft_tx
+                            .send(Event::ClientRequest {
+                                command: Command::Master(MasterCommand::TriggerShuffle { prefix }),
+                                reply_tx: tx_sh,
+                            })
+                            .await;
+                    }
+
+                    Ok(Response::new(IngestMetadataResponse {
+                        success: true,
+                        error_message: "".to_string(),
+                        leader_hint: "".to_string(),
+                    }))
+                }
+                Ok(Err(hint)) => Ok(Response::new(IngestMetadataResponse {
+                    success: false,
+                    error_message: "Not Leader".to_string(),
+                    leader_hint: hint.unwrap_or_default(),
+                })),
+                Err(_) => Err(Status::internal("Internal error")),
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn initiate_shuffle(
+        &self,
+        request: Request<InitiateShuffleRequest>,
+    ) -> Result<Response<InitiateShuffleResponse>, Status> {
+        let span = dfs_common::telemetry::create_server_span(&request, "initiate_shuffle");
+        async move {
+            let req = request.into_inner();
+            self.check_shard_ownership(&req.prefix)?;
+            self.check_safe_mode()?;
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = MasterCommand::TriggerShuffle { prefix: req.prefix };
+
+            if self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(cmd),
+                    reply_tx: tx,
+                })
+                .await
+                .is_err()
+            {
+                return Err(Status::internal("Raft channel closed"));
+            }
+
+            match rx.await {
+                Ok(Ok(_)) => Ok(Response::new(InitiateShuffleResponse {
+                    success: true,
+                    error_message: "".to_string(),
+                    leader_hint: "".to_string(),
+                })),
+                Ok(Err(hint)) => Ok(Response::new(InitiateShuffleResponse {
+                    success: false,
+                    error_message: "Not Leader".to_string(),
+                    leader_hint: hint.unwrap_or_default(),
+                })),
+                Err(_) => Err(Status::internal("Internal error")),
             }
         }
         .instrument(span)

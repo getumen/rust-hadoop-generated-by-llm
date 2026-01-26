@@ -33,7 +33,7 @@ Master HAは、以下の2層構造で実現されています：
           │ ShardMap Fetch               │
           ▼                              ▼
 ┌─────────────────────────┐      ┌─────────────────────────┐
-│   Shard-1 (Hash 0-X)    │      │   Shard-2 (Hash X-Y)    │
+│ Shard-1 (Range:""-"/m") │      │ Shard-2 (Range:"/m"-"") │
 │  ┌───────────────────┐  │      │  ┌───────────────────┐  │
 │  │ Master-1 (Leader) │  │      │  │ Master-1 (Leader) │  │
 │  └┬─────────▲───────▲┘  │      │  └┬─────────▲───────▲┘  │
@@ -41,9 +41,10 @@ Master HAは、以下の2層構造で実現されています：
 │ ┌─▼──────┐┌─▼──────┐│   │      │ ┌─▼──────┐┌─▼──────┐│   │
 │ │Master-2││Master-3││   │      │ │Master-2││Master-3││   │
 │ └────────┘└────────┘│   │      │ └────────┘└────────┘│   │
+│ (高負荷時は自動Split) │      │ (Throughput監視中)  │
 └─────────────────────────┘      └─────────────────────────┘
           │                              │
-          │ Metadata for keys 0-X        │ Metadata for keys X-Y
+          │ Metadata for paths < "/m"    │ Metadata for paths >= "/m"
           │                              │
      ┌────┴────┬─────────┬─────────┬─────┴────┐
      │         │         │         │          │
@@ -54,11 +55,57 @@ Master HAは、以下の2層構造で実現されています：
 
 ## 実装の詳細
 
-### 1. シャーディング (Sharding)
+### 1. ダイナミックシャーディング (Dynamic Sharding)
 
-- **Consistent Hashing**: ファイルパスのハッシュ値に基づいて、どのShardが担当するかを決定します。
-- **Virtual Nodes**: 各Shardに複数の仮想ノードを割り当て、負荷を均等に分散します。
-- **Redirect**: クライアントが誤ったShardにアクセスした場合、Masterは`REDIRECT`エラーと共に正しいShard（またはLeader）へのヒントを返します。
+本システムは**Range-based Dynamic Sharding**を採用しており、S3やGoogle Colossusと同様のアプローチを取っています。
+
+#### Range-based Partitioning
+
+- **辞書順範囲分割**: ファイルパスの辞書順範囲に基づいてShardを割り当てます
+  - 例: Shard-1は`""`（空文字列）から`"/m"`まで、Shard-2は`"/m"`から`""`（無限大）まで
+- **プレフィックス局所性**: 同じディレクトリやプレフィックスのファイルは同じShardに配置されるため、`ListFiles`などのディレクトリ操作が効率的
+- **決定的ルーティング**: ハッシュと異なり、パスから直接どのShardか判定可能（クライアント側でキャッシュ可能）
+
+#### 負荷監視とスループット計測
+
+各Masterは`ThroughputMonitor`を使用してリアルタイムでスループットを計測します：
+
+```rust
+pub struct ThroughputMonitor {
+    read_rps: AtomicU64,   // 読み取りリクエスト/秒
+    write_rps: AtomicU64,  // 書き込みリクエスト/秒
+    read_bps: AtomicU64,   // 読み取りバイト/秒
+    write_bps: AtomicU64,  // 書き込みバイト/秒
+}
+```
+
+- リクエストごとに`record_request(path, size)`を呼び出し、スライディングウィンドウで集計
+- 定期的に閾値（`split_threshold_rps`）と比較し、超過時はSplitを検討
+
+#### 自動シャード分割（Split）のフロー
+
+1. **負荷検出**: LeaderがThroughputMonitorで閾値超過を検出
+2. **分割点決定**: 現在のファイル一覧の中央値パスを分割点として選択
+3. **Raft合意**: `SplitShard`コマンドをRaftログに書き込み、全ノードで合意
+   ```rust
+   Command::SplitShard {
+       new_shard_id: String,
+       split_key: String,
+       new_shard_leader: String,
+   }
+   ```
+4. **Config Server更新**: `AddShard` RPCで新Shardの情報（ID、Range、Leader）を登録
+5. **データ移行（Shuffle）**:
+   - 旧Shardから新Shardへ`InitiateShuffle` RPCを送信
+   - 新Shardの範囲に該当するファイルメタデータを転送
+   - 旧Shardから該当ファイルを削除
+6. **完了**: クライアントは次回のShardMap更新で新しい構成を認識
+
+#### Redirect機能
+
+- **誤ったShard判定**: クライアントが古いShardMapで誤ったShardにアクセス
+- **REDIRECT応答**: Masterは`OutOfRange`エラーと共に正しいShardのLeaderアドレスを返す
+- **ShardMap更新**: クライアントはConfig Serverから最新のShardMapを取得し、リトライ
 
 ### 2. クロスシャード操作 (Cross-Shard Operations) - Transaction Record方式
 
@@ -173,13 +220,17 @@ services:
 
 # 障害復旧
 ./fault_recovery_test.sh
+
+# ダイナミックシャーディング（自動分割）
+./auto_scaling_test.sh
 ```
 
 ## 今後の改善予定
 
-- [x] **シャーディング**: 複数のMaster Shardによる水平スケーリング
+- [x] **Range-basedシャーディング**: 複数のMaster Shardによる水平スケーリング（辞書順範囲分割）
 - [x] **Configuration Group**: ShardMapの集中管理
 - [x] **クロスシャード操作**: Transaction RecordによるAtomic操作
+- [x] **ダイナミックシャード分割・統合**: 負荷に応じた自動Split/Merge、データ移行（Shuffle）
+- [x] **クライアント側ShardMapキャッシング**: リダイレクトの削減
+- [x] **ReadIndex**: Followerからの読み取り（負荷分散）
 - [ ] **動的なメンバーシップ変更**: 稼働中のクラスタへのノード追加・削除
-- [ ] **ReadIndex**: Followerからの読み取り（負荷分散）
-- [ ] **クライアント側ShardMapキャッシング**: リダイレクトの削減
