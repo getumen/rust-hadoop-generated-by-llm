@@ -342,7 +342,6 @@ pub fn load_shard_map_from_config(path: Option<&str>, virtual_nodes: usize) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_add_get_shard() {

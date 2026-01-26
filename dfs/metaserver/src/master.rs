@@ -1370,7 +1370,8 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
 
-            // Replication factor (default: 2 for test)
+            // Replication factor (default: 3)
+            const REPLICATION_FACTOR: usize = 3;
 
             self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
@@ -1406,7 +1407,6 @@ impl MasterService for MyMaster {
             };
 
             // Select chunk servers
-            const REPLICATION_FACTOR: usize = 2;
             let num_replicas = std::cmp::min(REPLICATION_FACTOR, chunk_servers.len());
             let selected_servers: Vec<String> =
                 chunk_servers.iter().take(num_replicas).cloned().collect();
@@ -2409,38 +2409,43 @@ impl MasterService for MyMaster {
         &self,
         request: Request<InitiateShuffleRequest>,
     ) -> Result<Response<InitiateShuffleResponse>, Status> {
-        let req = request.into_inner();
-        self.check_shard_ownership(&req.prefix)?;
-        self.check_safe_mode()?;
+        let span = dfs_common::telemetry::create_server_span(&request, "initiate_shuffle");
+        async move {
+            let req = request.into_inner();
+            self.check_shard_ownership(&req.prefix)?;
+            self.check_safe_mode()?;
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = MasterCommand::TriggerShuffle { prefix: req.prefix };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = MasterCommand::TriggerShuffle { prefix: req.prefix };
 
-        if self
-            .raft_tx
-            .send(Event::ClientRequest {
-                command: Command::Master(cmd),
-                reply_tx: tx,
-            })
-            .await
-            .is_err()
-        {
-            return Err(Status::internal("Raft channel closed"));
+            if self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(cmd),
+                    reply_tx: tx,
+                })
+                .await
+                .is_err()
+            {
+                return Err(Status::internal("Raft channel closed"));
+            }
+
+            match rx.await {
+                Ok(Ok(_)) => Ok(Response::new(InitiateShuffleResponse {
+                    success: true,
+                    error_message: "".to_string(),
+                    leader_hint: "".to_string(),
+                })),
+                Ok(Err(hint)) => Ok(Response::new(InitiateShuffleResponse {
+                    success: false,
+                    error_message: "Not Leader".to_string(),
+                    leader_hint: hint.unwrap_or_default(),
+                })),
+                Err(_) => Err(Status::internal("Internal error")),
+            }
         }
-
-        match rx.await {
-            Ok(Ok(_)) => Ok(Response::new(InitiateShuffleResponse {
-                success: true,
-                error_message: "".to_string(),
-                leader_hint: "".to_string(),
-            })),
-            Ok(Err(hint)) => Ok(Response::new(InitiateShuffleResponse {
-                success: false,
-                error_message: "Not Leader".to_string(),
-                leader_hint: hint.unwrap_or_default(),
-            })),
-            Err(_) => Err(Status::internal("Internal error")),
-        }
+        .instrument(span)
+        .await
     }
 }
 
