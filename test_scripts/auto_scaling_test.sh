@@ -18,6 +18,9 @@ echo "=========================="
 
 # Cleanup
 echo "🚀 Cleaning up..."
+# Kill any local processes that might be using ports 8080-8083
+pkill -f "target/release/master" || true
+sleep 2
 docker compose -f docker-compose.auto-scaling.yml down -v || true
 
 # Start cluster

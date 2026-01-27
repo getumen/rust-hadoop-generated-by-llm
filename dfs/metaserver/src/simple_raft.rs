@@ -70,18 +70,185 @@ pub enum Command {
 /// Commands for Raft cluster membership changes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MembershipCommand {
-    /// Add a new server to the Raft cluster
+    /// Add a new server to the Raft cluster (legacy single-phase)
     AddServer {
         /// Server ID (typically the node index)
         server_id: usize,
         /// Server address (HTTP endpoint for Raft RPC)
         server_address: String,
     },
-    /// Remove a server from the Raft cluster
+    /// Remove a server from the Raft cluster (legacy single-phase)
     RemoveServer {
         /// Server ID to remove
         server_id: usize,
     },
+    /// Add multiple servers to the cluster (new multi-server support)
+    AddServers {
+        /// Servers to add (server_id -> address)
+        servers: HashMap<usize, String>,
+    },
+    /// Remove multiple servers from the cluster (new multi-server support)
+    RemoveServers {
+        /// Server IDs to remove
+        server_ids: Vec<usize>,
+    },
+    /// Internal: Transition from C-old to C-old,new (joint consensus)
+    BeginJointConsensus {
+        old_members: HashMap<usize, String>,
+        new_members: HashMap<usize, String>,
+        version: u64,
+    },
+    /// Internal: Transition from C-old,new to C-new (finalize)
+    FinalizeConfiguration {
+        new_members: HashMap<usize, String>,
+        version: u64,
+    },
+}
+
+/// Represents the state of a cluster configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ClusterConfiguration {
+    /// Simple configuration with a single member list
+    Simple {
+        /// All voting members (server_id -> address)
+        members: HashMap<usize, String>,
+        /// Configuration version (monotonically increasing)
+        version: u64,
+    },
+    /// Joint configuration during membership transition
+    Joint {
+        /// Old configuration members
+        old_members: HashMap<usize, String>,
+        /// New configuration members
+        new_members: HashMap<usize, String>,
+        /// Configuration version
+        version: u64,
+    },
+}
+
+impl ClusterConfiguration {
+    /// Get all voting members (union of old and new in joint config)
+    pub fn all_members(&self) -> HashMap<usize, String> {
+        match self {
+            ClusterConfiguration::Simple { members, .. } => members.clone(),
+            ClusterConfiguration::Joint {
+                old_members,
+                new_members,
+                ..
+            } => {
+                let mut all = old_members.clone();
+                all.extend(new_members.clone());
+                all
+            }
+        }
+    }
+
+    /// Check if a majority is achieved in both configurations (for joint consensus)
+    pub fn has_joint_majority(&self, acks: &HashSet<usize>) -> bool {
+        match self {
+            ClusterConfiguration::Simple { members, .. } => {
+                let member_count = members.len();
+                let ack_count = acks.iter().filter(|id| members.contains_key(id)).count();
+                ack_count > member_count / 2
+            }
+            ClusterConfiguration::Joint {
+                old_members,
+                new_members,
+                ..
+            } => {
+                let old_count = old_members.len();
+                let new_count = new_members.len();
+                let old_acks = acks
+                    .iter()
+                    .filter(|id| old_members.contains_key(id))
+                    .count();
+                let new_acks = acks
+                    .iter()
+                    .filter(|id| new_members.contains_key(id))
+                    .count();
+                old_acks > old_count / 2 && new_acks > new_count / 2
+            }
+        }
+    }
+
+    /// Get configuration version
+    pub fn version(&self) -> u64 {
+        match self {
+            ClusterConfiguration::Simple { version, .. } => *version,
+            ClusterConfiguration::Joint { version, .. } => *version,
+        }
+    }
+}
+
+/// Server role in the cluster
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerRole {
+    /// Voting member (participates in elections and quorum)
+    Voting,
+    /// Non-voting member (receives log replication but doesn't vote)
+    NonVoting,
+}
+
+/// Tracks the state of an ongoing configuration change
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConfigChangeState {
+    /// No configuration change in progress
+    None,
+    /// Adding new servers (in catch-up phase)
+    AddingServers {
+        /// Servers being added (server_id -> (address, catch_up_progress))
+        servers: HashMap<usize, (String, CatchUpProgress)>,
+        /// When the change started
+        started_at: u64,
+    },
+    /// In joint consensus (C-old,new)
+    InJointConsensus {
+        /// The joint configuration log index
+        joint_config_index: usize,
+        /// Target configuration after joint phase
+        target_config: HashMap<usize, String>,
+    },
+    /// Waiting for leader transfer before removal
+    TransferringLeadership {
+        /// Target server to transfer to
+        target_server: usize,
+        /// Servers to remove after transfer
+        servers_to_remove: Vec<usize>,
+    },
+}
+
+/// Tracks catch-up progress for a non-voting member
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatchUpProgress {
+    /// Match index for this server
+    pub match_index: usize,
+    /// Number of successful replication rounds
+    pub rounds_caught_up: usize,
+    /// When this server was added
+    pub added_at: u64,
+}
+
+impl CatchUpProgress {
+    pub fn new(current_time: u64) -> Self {
+        Self {
+            match_index: 0,
+            rounds_caught_up: 0,
+            added_at: current_time,
+        }
+    }
+
+    /// Check if server is caught up (needs 10 rounds of successful replication)
+    pub fn is_caught_up(&self, leader_commit_index: usize) -> bool {
+        self.match_index >= leader_commit_index && self.rounds_caught_up >= 10
+    }
+
+    /// Update progress after successful replication
+    pub fn update(&mut self, new_match_index: usize) {
+        if new_match_index > self.match_index {
+            self.match_index = new_match_index;
+            self.rounds_caught_up += 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +381,19 @@ pub struct Snapshot {
     pub data: Vec<u8>, // Serialized MasterState
 }
 
+/// RPC to trigger immediate leader transfer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutNowArgs {
+    pub term: u64,
+    pub sender_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutNowReply {
+    pub term: u64,
+    pub success: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcMessage {
     RequestVote(RequestVoteArgs),
@@ -222,6 +402,8 @@ pub enum RpcMessage {
     AppendEntriesResponse(AppendEntriesReply),
     InstallSnapshot(InstallSnapshotArgs),
     InstallSnapshotResponse(InstallSnapshotReply),
+    TimeoutNow(TimeoutNowArgs),
+    TimeoutNowResponse(TimeoutNowReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +418,7 @@ pub struct RequestVoteArgs {
 pub struct RequestVoteReply {
     pub term: u64,
     pub vote_granted: bool,
+    pub peer_id: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +497,8 @@ pub struct ClusterInfo {
     pub last_applied: usize,
     pub log_len: usize,
     pub votes_received: usize,
+    pub cluster_config: ClusterConfiguration,
+    pub config_change_state: ConfigChangeState,
 }
 
 /// A single Raft consensus node.
@@ -383,6 +568,8 @@ pub struct RaftNode {
     pub app_state: Arc<Mutex<AppState>>,
     /// Number of votes received in the current election (candidate only).
     pub votes_received: usize,
+    /// IDs of servers that voted for us in current election (for joint consensus).
+    pub voters: HashSet<usize>,
 
     /// RocksDB instance for persistent storage.
     pub db: Arc<DB>,
@@ -395,6 +582,22 @@ pub struct RaftNode {
     pub last_heartbeat_time: Instant,
     /// Timestamp of the last majority acknowledgment received.
     pub last_majority_ack_time: Instant,
+
+    // Dynamic membership change fields
+    /// Current cluster configuration (Simple or Joint consensus).
+    pub cluster_config: ClusterConfiguration,
+    /// Server roles (voting vs non-voting).
+    pub server_roles: HashMap<usize, ServerRole>,
+    /// Current configuration change state.
+    pub config_change_state: ConfigChangeState,
+    /// Non-voting members being added (for catch-up).
+    pub non_voting_members: HashMap<usize, String>,
+    /// Catch-up progress tracking for non-voting members.
+    pub catch_up_progress: HashMap<usize, CatchUpProgress>,
+    /// Last committed configuration index (to prevent concurrent changes).
+    pub last_committed_config_index: usize,
+    /// Monotonic time counter (for tracking timeouts and progress).
+    pub monotonic_time: u64,
 }
 
 impl RaftNode {
@@ -421,6 +624,31 @@ impl RaftNode {
             .build()
             .expect("Failed to build HTTP client");
 
+        // Initialize cluster configuration from peers
+        let mut initial_members = HashMap::new();
+        for (idx, peer) in peers.iter().enumerate() {
+            initial_members.insert(idx, peer.clone());
+        }
+        initial_members.insert(id, client_address.clone());
+
+        // Load or create cluster configuration
+        let (loaded_config, config_change_state) = Self::load_config(&db);
+        let cluster_config = match &loaded_config {
+            ClusterConfiguration::Simple { members, .. } if members.is_empty() => {
+                // First time initialization
+                ClusterConfiguration::Simple {
+                    members: initial_members.clone(),
+                    version: 0,
+                }
+            }
+            _ => loaded_config,
+        };
+
+        let mut server_roles = HashMap::new();
+        for member_id in cluster_config.all_members().keys() {
+            server_roles.insert(*member_id, ServerRole::Voting);
+        }
+
         RaftNode {
             id,
             peers,
@@ -443,11 +671,19 @@ impl RaftNode {
             self_tx,
             app_state,
             votes_received: 0,
+            voters: HashSet::new(),
             db,
             http_client,
             pending_read_indices: vec![],
             last_heartbeat_time: Instant::now(),
             last_majority_ack_time: Instant::now(),
+            cluster_config,
+            server_roles,
+            config_change_state,
+            non_voting_members: HashMap::new(),
+            catch_up_progress: HashMap::new(),
+            last_committed_config_index: 0,
+            monotonic_time: 0,
         }
     }
 
@@ -577,6 +813,45 @@ impl RaftNode {
             .put(key.as_bytes(), val)
             .context("Failed to save log entry to DB")?;
         Ok(())
+    }
+
+    fn save_config(&self) -> Result<()> {
+        let serialized =
+            serde_json::to_vec(&self.cluster_config).context("Failed to serialize config")?;
+        self.db
+            .put(b"cluster_config", serialized)
+            .context("Failed to save cluster config")?;
+
+        let state_serialized = serde_json::to_vec(&self.config_change_state)
+            .context("Failed to serialize config change state")?;
+        self.db
+            .put(b"config_change_state", state_serialized)
+            .context("Failed to save config change state")?;
+
+        Ok(())
+    }
+
+    fn load_config(db: &DB) -> (ClusterConfiguration, ConfigChangeState) {
+        let config = match db.get(b"cluster_config") {
+            Ok(Some(val)) => serde_json::from_slice(&val).unwrap_or_else(|e| {
+                tracing::warn!("Failed to deserialize cluster config: {}", e);
+                ClusterConfiguration::Simple {
+                    members: HashMap::new(),
+                    version: 0,
+                }
+            }),
+            _ => ClusterConfiguration::Simple {
+                members: HashMap::new(),
+                version: 0,
+            },
+        };
+
+        let state = match db.get(b"config_change_state") {
+            Ok(Some(val)) => serde_json::from_slice(&val).unwrap_or(ConfigChangeState::None),
+            _ => ConfigChangeState::None,
+        };
+
+        (config, state)
     }
 
     fn check_read_indices(&mut self) {
@@ -770,6 +1045,9 @@ impl RaftNode {
     }
 
     async fn tick(&mut self) -> Result<()> {
+        // Increment monotonic time counter
+        self.monotonic_time += 1;
+
         match self.role {
             Role::Follower | Role::Candidate => {
                 if self.last_election_time.elapsed() > self.election_timeout {
@@ -778,6 +1056,10 @@ impl RaftNode {
             }
             Role::Leader => {
                 self.send_heartbeats().await?;
+
+                // Check membership change progress
+                self.check_promote_non_voting_members()?;
+                self.check_finalize_joint_consensus()?;
             }
         }
         self.apply_logs();
@@ -799,6 +1081,8 @@ impl RaftNode {
         self.save_vote()?; // Persist vote
 
         self.votes_received = 1;
+        self.voters = HashSet::new();
+        self.voters.insert(self.id); // Vote for self
         self.last_election_time = Instant::now();
         self.election_timeout = Duration::from_millis(rand::rng().random_range(1500..3000));
 
@@ -818,8 +1102,9 @@ impl RaftNode {
             last_log_term,
         };
 
-        let total_nodes = self.peers.len() + 1;
-        if total_nodes == 1 {
+        // Check if this is a single-node cluster
+        let all_members = self.cluster_config.all_members();
+        if all_members.len() == 1 {
             self.become_leader();
             return Ok(());
         }
@@ -913,7 +1198,43 @@ impl RaftNode {
     }
 
     async fn send_heartbeats(&mut self) -> Result<()> {
-        for (i, peer) in self.peers.iter().enumerate() {
+        // Combine voting members (peers) and non-voting members for replication
+        let all_members = self.cluster_config.all_members();
+        let mut combined_peers: Vec<(usize, String, bool)> = vec![];
+
+        // Add voting members
+        for (server_id, addr) in all_members.iter() {
+            if *server_id != self.id {
+                combined_peers.push((*server_id, addr.clone(), true)); // true = voting
+            }
+        }
+
+        // Add non-voting members
+        for (server_id, addr) in self.non_voting_members.iter() {
+            combined_peers.push((*server_id, addr.clone(), false)); // false = non-voting
+        }
+
+        for (peer_idx, (_server_id, peer, is_voting)) in combined_peers.iter().enumerate() {
+            // For non-voting members, use a separate index tracking
+            let i = if *is_voting {
+                // Find index in self.peers
+                self.peers
+                    .iter()
+                    .position(|p| p == peer)
+                    .unwrap_or(peer_idx)
+            } else {
+                // For non-voting, we'll extend next_index/match_index temporarily
+                // or use default values
+                if peer_idx < self.next_index.len() {
+                    peer_idx
+                } else {
+                    continue; // Skip if we don't have tracking arrays set up yet
+                }
+            };
+
+            if i >= self.next_index.len() {
+                continue; // Safety check
+            }
             // Check if follower needs a snapshot
             if self.next_index[i] <= self.last_included_index {
                 // Send snapshot instead of AppendEntries
@@ -1125,6 +1446,8 @@ impl RaftNode {
                     last_applied: self.last_applied,
                     log_len: self.log.len() + self.last_included_index,
                     votes_received: self.votes_received,
+                    cluster_config: self.cluster_config.clone(),
+                    config_change_state: self.config_change_state.clone(),
                 };
                 let _ = reply_tx.send(info);
             }
@@ -1142,8 +1465,7 @@ impl RaftNode {
                 let mut acks = HashSet::new();
                 acks.insert(self.id); // Acknowledge self
 
-                let total_nodes = self.peers.len() + 1;
-                let majority_confirmed = acks.len() > total_nodes / 2;
+                let majority_confirmed = self.cluster_config.has_joint_majority(&acks);
 
                 self.pending_read_indices.push(ReadIndexRequest {
                     read_index: self.commit_index,
@@ -1238,6 +1560,7 @@ impl RaftNode {
                 Ok(RpcMessage::RequestVoteResponse(RequestVoteReply {
                     term: self.current_term,
                     vote_granted,
+                    peer_id: self.id,
                 }))
             }
             RpcMessage::RequestVoteResponse(reply) => {
@@ -1245,10 +1568,10 @@ impl RaftNode {
                     && self.current_term == reply.term
                     && reply.vote_granted
                 {
-                    tracing::info!("Node {} received vote", self.id);
+                    tracing::info!("Node {} received vote from {}", self.id, reply.peer_id);
                     self.votes_received += 1;
-                    let total_nodes = self.peers.len() + 1;
-                    if self.votes_received > total_nodes / 2 {
+                    self.voters.insert(reply.peer_id);
+                    if self.cluster_config.has_joint_majority(&self.voters) {
                         self.become_leader();
                     }
                 } else if reply.term > self.current_term {
@@ -1437,12 +1760,22 @@ impl RaftNode {
                             self.next_index[peer_idx] = reply.match_index + 1;
                             self.match_index[peer_idx] = reply.match_index;
 
+                            // Update catch-up progress for non-voting members
+                            if let Some(progress) = self.catch_up_progress.get_mut(&reply.peer_id) {
+                                progress.update(reply.match_index);
+                                tracing::debug!(
+                                    "Non-voting member {} catch-up progress: match_index={}, rounds={}",
+                                    reply.peer_id,
+                                    progress.match_index,
+                                    progress.rounds_caught_up
+                                );
+                            }
+
                             // Update ReadIndex acks
-                            let total_nodes = self.peers.len() + 1;
                             for req in self.pending_read_indices.iter_mut() {
                                 if req.term == self.current_term {
                                     req.acks.insert(reply.peer_id);
-                                    if req.acks.len() > total_nodes / 2 {
+                                    if self.cluster_config.has_joint_majority(&req.acks) {
                                         req.majority_confirmed = true;
                                     }
                                 }
@@ -1476,15 +1809,42 @@ impl RaftNode {
                         }
                     }
 
-                    // Check for commit_index advancement
-                    // Include leader's own match index (which is absolute_index)
-                    let mut all_match_indices = self.match_index.clone();
+                    // Check for commit_index advancement using joint consensus
+                    // Build a map of server_id -> match_index
+                    let mut server_match_indices = HashMap::new();
                     let absolute_index = self.log.len() - 1 + self.last_included_index;
-                    all_match_indices.push(absolute_index);
-                    all_match_indices.sort_unstable();
+                    server_match_indices.insert(self.id, absolute_index);
 
-                    let total_nodes = self.peers.len() + 1;
-                    let majority_match_index = all_match_indices[total_nodes / 2];
+                    let all_members = self.cluster_config.all_members();
+                    for (peer_idx, (server_id, _)) in all_members
+                        .iter()
+                        .filter(|(id, _)| **id != self.id)
+                        .enumerate()
+                    {
+                        if peer_idx < self.match_index.len() {
+                            server_match_indices.insert(*server_id, self.match_index[peer_idx]);
+                        }
+                    }
+
+                    // Find the highest index that has a joint majority
+                    let mut candidate_indices: Vec<usize> =
+                        server_match_indices.values().copied().collect();
+                    candidate_indices.sort_unstable();
+                    candidate_indices.reverse();
+
+                    let mut majority_match_index = self.commit_index;
+                    for &candidate_index in &candidate_indices {
+                        let mut acks = HashSet::new();
+                        for (server_id, match_idx) in &server_match_indices {
+                            if *match_idx >= candidate_index {
+                                acks.insert(*server_id);
+                            }
+                        }
+                        if self.cluster_config.has_joint_majority(&acks) {
+                            majority_match_index = candidate_index;
+                            break;
+                        }
+                    }
 
                     if majority_match_index > self.commit_index {
                         // Only commit if the entry is from the current term
@@ -1582,11 +1942,10 @@ impl RaftNode {
                             self.match_index[peer_idx] = reply.last_included_index;
 
                             // Update ReadIndex acks
-                            let total_nodes = self.peers.len() + 1;
                             for req in self.pending_read_indices.iter_mut() {
                                 if req.term == self.current_term {
                                     req.acks.insert(reply.peer_id);
-                                    if req.acks.len() > total_nodes / 2 {
+                                    if self.cluster_config.has_joint_majority(&req.acks) {
                                         req.majority_confirmed = true;
                                     }
                                 }
@@ -1615,6 +1974,55 @@ impl RaftNode {
                     self.current_leader_address = None;
                 }
                 Ok(RpcMessage::InstallSnapshotResponse(reply))
+            }
+            RpcMessage::TimeoutNow(args) => {
+                tracing::info!(
+                    "Node {} received TimeoutNow from {} in term {}",
+                    self.id,
+                    args.sender_id,
+                    args.term
+                );
+
+                if args.term < self.current_term {
+                    return Ok(RpcMessage::TimeoutNowResponse(TimeoutNowReply {
+                        term: self.current_term,
+                        success: false,
+                    }));
+                }
+
+                if args.term > self.current_term {
+                    self.current_term = args.term;
+                    self.save_term()?;
+                    self.voted_for = None;
+                    self.save_vote()?;
+                    self.role = Role::Follower;
+                }
+
+                // Immediately start election
+                tracing::info!("Starting immediate election due to TimeoutNow");
+                self.role = Role::Candidate;
+                self.current_term += 1;
+                self.save_term()?;
+                self.voted_for = Some(self.id);
+                self.save_vote()?;
+                self.votes_received = 1;
+                self.voters = HashSet::new();
+                self.voters.insert(self.id);
+                self.last_election_time = Instant::now();
+
+                Ok(RpcMessage::TimeoutNowResponse(TimeoutNowReply {
+                    term: self.current_term,
+                    success: true,
+                }))
+            }
+            RpcMessage::TimeoutNowResponse(reply) => {
+                // Fire-and-forget response, just log it
+                tracing::debug!(
+                    "Received TimeoutNowResponse: term={}, success={}",
+                    reply.term,
+                    reply.success
+                );
+                Ok(RpcMessage::TimeoutNowResponse(reply))
             }
         }
     }
@@ -1645,10 +2053,70 @@ impl RaftNode {
 
     fn apply_membership_command(&mut self, cmd: MembershipCommand) {
         match cmd {
+            MembershipCommand::BeginJointConsensus {
+                old_members,
+                new_members,
+                version,
+            } => {
+                tracing::info!(
+                    "Applying joint consensus configuration (version {}): old={:?}, new={:?}",
+                    version,
+                    old_members,
+                    new_members
+                );
+
+                self.cluster_config = ClusterConfiguration::Joint {
+                    old_members,
+                    new_members: new_members.clone(),
+                    version,
+                };
+
+                // Update peers list and tracking arrays
+                self.update_peer_tracking();
+
+                // Save configuration to disk
+                if let Err(e) = self.save_config() {
+                    tracing::error!("Failed to save config after BeginJointConsensus: {}", e);
+                }
+            }
+
+            MembershipCommand::FinalizeConfiguration {
+                new_members,
+                version,
+            } => {
+                tracing::info!(
+                    "Finalizing configuration (version {}): members={:?}",
+                    version,
+                    new_members
+                );
+
+                self.cluster_config = ClusterConfiguration::Simple {
+                    members: new_members,
+                    version,
+                };
+
+                // Update peers list and tracking arrays
+                self.update_peer_tracking();
+
+                // Clear config change state
+                self.config_change_state = ConfigChangeState::None;
+
+                // Save configuration to disk
+                if let Err(e) = self.save_config() {
+                    tracing::error!("Failed to save config after FinalizeConfiguration: {}", e);
+                }
+            }
+
             MembershipCommand::AddServer {
                 server_id,
                 server_address,
             } => {
+                tracing::warn!(
+                    "AddServer command (legacy single-phase) for server {} ({}): deprecated, use joint consensus",
+                    server_id,
+                    server_address
+                );
+                // For backward compatibility, still apply it but log a warning
                 // Check if server already exists
                 if self.peers.iter().any(|p| p == &server_address) {
                     tracing::info!("Server {} already in cluster, skipping", server_address);
@@ -1656,7 +2124,7 @@ impl RaftNode {
                 }
 
                 tracing::info!(
-                    "Adding server {} ({}) to cluster",
+                    "Adding server {} ({}) to cluster (legacy mode)",
                     server_id,
                     server_address
                 );
@@ -1664,8 +2132,8 @@ impl RaftNode {
 
                 // Reinitialize next_index and match_index for the new peer
                 self.next_index
-                    .push(self.log.len() + self.last_included_index); // next_index for new peer should be leader's last log index + 1
-                self.match_index.push(self.last_included_index); // match_index for new peer should be 0 (or last_included_index)
+                    .push(self.log.len() + self.last_included_index);
+                self.match_index.push(self.last_included_index);
 
                 tracing::info!(
                     "Cluster now has {} peers: {:?}",
@@ -1673,14 +2141,19 @@ impl RaftNode {
                     self.peers
                 );
             }
+
             MembershipCommand::RemoveServer { server_id } => {
-                // Find and remove the server
+                tracing::warn!(
+                    "RemoveServer command (legacy single-phase) for server {}: deprecated, use joint consensus",
+                    server_id
+                );
+                // For backward compatibility, still apply it but log a warning
                 if server_id < self.peers.len() {
                     let removed = self.peers.remove(server_id);
                     self.next_index.remove(server_id);
                     self.match_index.remove(server_id);
                     tracing::info!(
-                        "Removed server {} from cluster. Remaining peers: {:?}",
+                        "Removed server {} from cluster (legacy mode). Remaining peers: {:?}",
                         removed,
                         self.peers
                     );
@@ -1692,7 +2165,427 @@ impl RaftNode {
                     );
                 }
             }
+
+            MembershipCommand::AddServers { servers } => {
+                tracing::warn!(
+                    "AddServers command for {:?}: should not be applied directly, use joint consensus workflow",
+                    servers
+                );
+            }
+
+            MembershipCommand::RemoveServers { server_ids } => {
+                tracing::warn!(
+                    "RemoveServers command for {:?}: should not be applied directly, use joint consensus workflow",
+                    server_ids
+                );
+            }
         }
+    }
+
+    /// Update peer tracking after configuration change
+    fn update_peer_tracking(&mut self) {
+        let all_members = self.cluster_config.all_members();
+
+        // Rebuild peers list (excluding self)
+        self.peers = all_members
+            .iter()
+            .filter(|(id, _)| **id != self.id)
+            .map(|(_, addr)| addr.clone())
+            .collect();
+
+        // Resize next_index and match_index
+        let new_size = self.peers.len();
+        let default_next = self.log.len() + self.last_included_index;
+        self.next_index.resize(new_size, default_next);
+        self.match_index.resize(new_size, self.last_included_index);
+
+        tracing::info!(
+            "Updated peer tracking: {} peers, config version {}",
+            new_size,
+            self.cluster_config.version()
+        );
+    }
+
+    /// Periodic check: promote non-voting members when caught up
+    fn check_promote_non_voting_members(&mut self) -> Result<()> {
+        if let ConfigChangeState::AddingServers { servers, .. } = &self.config_change_state {
+            let mut all_caught_up = true;
+
+            for (server_id, (_, progress)) in servers {
+                if !progress.is_caught_up(self.commit_index) {
+                    all_caught_up = false;
+                    tracing::debug!(
+                        "Server {} not yet caught up: match_index={}, commit_index={}, rounds={}",
+                        server_id,
+                        progress.match_index,
+                        self.commit_index,
+                        progress.rounds_caught_up
+                    );
+                }
+            }
+
+            if all_caught_up {
+                tracing::info!("All new servers caught up, beginning joint consensus");
+                self.promote_non_voting_members()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Promote non-voting members to voting by starting joint consensus
+    fn promote_non_voting_members(&mut self) -> Result<()> {
+        let servers_to_promote: HashMap<usize, String> = match &self.config_change_state {
+            ConfigChangeState::AddingServers { servers, .. } => servers
+                .iter()
+                .map(|(id, (addr, _))| (*id, addr.clone()))
+                .collect(),
+            _ => return Ok(()),
+        };
+
+        let old_members = match &self.cluster_config {
+            ClusterConfiguration::Simple { members, .. } => members.clone(),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Cannot promote: already in joint consensus"
+                ))
+            }
+        };
+
+        let mut new_members = old_members.clone();
+        for (id, addr) in servers_to_promote {
+            new_members.insert(id, addr);
+        }
+
+        let version = self.cluster_config.version() + 1;
+
+        // Append C-old,new
+        let cmd = Command::Membership(MembershipCommand::BeginJointConsensus {
+            old_members: old_members.clone(),
+            new_members: new_members.clone(),
+            version,
+        });
+
+        let entry = LogEntry {
+            term: self.current_term,
+            command: cmd,
+        };
+
+        self.log.push(entry);
+        let absolute_index = self.log.len() - 1 + self.last_included_index;
+        self.save_log_entry(absolute_index, &self.log[self.log.len() - 1])?;
+
+        let joint_index = absolute_index;
+
+        self.config_change_state = ConfigChangeState::InJointConsensus {
+            joint_config_index: joint_index,
+            target_config: new_members,
+        };
+
+        // Clear non-voting members (they're now in joint config)
+        self.non_voting_members.clear();
+        self.catch_up_progress.clear();
+
+        tracing::info!(
+            "Promoted non-voting members, entered joint consensus at index {}",
+            joint_index
+        );
+
+        Ok(())
+    }
+
+    /// Check if joint consensus is committed and finalize
+    fn check_finalize_joint_consensus(&mut self) -> Result<()> {
+        if let ConfigChangeState::InJointConsensus {
+            joint_config_index,
+            target_config,
+        } = &self.config_change_state
+        {
+            if self.commit_index >= *joint_config_index {
+                tracing::info!(
+                    "C-old,new committed at index {}, finalizing to C-new",
+                    joint_config_index
+                );
+
+                let version = self.cluster_config.version() + 1;
+                let target = target_config.clone();
+
+                // Append C-new
+                let cmd = Command::Membership(MembershipCommand::FinalizeConfiguration {
+                    new_members: target,
+                    version,
+                });
+
+                let entry = LogEntry {
+                    term: self.current_term,
+                    command: cmd,
+                };
+
+                self.log.push(entry);
+                let absolute_index = self.log.len() - 1 + self.last_included_index;
+                self.save_log_entry(absolute_index, &self.log[self.log.len() - 1])?;
+
+                tracing::info!("Appended C-new at index {}", absolute_index);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Initiate leader transfer to target server
+    async fn initiate_leader_transfer(&mut self, target_id: usize) -> Result<(), String> {
+        tracing::info!("Initiating leader transfer to server {}", target_id);
+
+        // Find target in all members
+        let all_members = self.cluster_config.all_members();
+        let target_addr = all_members
+            .get(&target_id)
+            .ok_or_else(|| format!("Target server {} not found in cluster", target_id))?
+            .clone();
+
+        // Find target peer index
+        let target_peer_idx = self
+            .peers
+            .iter()
+            .position(|p| p == &target_addr)
+            .ok_or_else(|| format!("Target server {} not in peers list", target_id))?;
+
+        // Wait until target is caught up
+        tracing::info!("Waiting for target server {} to catch up", target_id);
+        let mut attempts = 0;
+        let max_attempts = 50;
+
+        while self.match_index[target_peer_idx] < self.log.len() - 1 + self.last_included_index {
+            if attempts >= max_attempts {
+                return Err(format!(
+                    "Timeout waiting for target server {} to catch up (match_index={}, log_len={})",
+                    target_id,
+                    self.match_index[target_peer_idx],
+                    self.log.len() - 1 + self.last_included_index
+                ));
+            }
+
+            self.send_heartbeats()
+                .await
+                .map_err(|e| format!("Failed to replicate: {}", e))?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            attempts += 1;
+        }
+
+        tracing::info!(
+            "Target server {} is caught up (match_index={}), sending TimeoutNow",
+            target_id,
+            self.match_index[target_peer_idx]
+        );
+
+        // Send TimeoutNow RPC
+        let args = TimeoutNowArgs {
+            term: self.current_term,
+            sender_id: self.id,
+        };
+
+        let url = format!("{}/raft/timeout_now", target_addr);
+        let client = self.http_client.clone();
+
+        // Send TimeoutNow (fire-and-forget)
+        tokio::spawn(async move {
+            match client.post(&url).json(&args).send().await {
+                Ok(resp) => match resp.json::<TimeoutNowReply>().await {
+                    Ok(reply) => {
+                        tracing::info!(
+                            "TimeoutNow sent successfully, reply: term={}, success={}",
+                            reply.term,
+                            reply.success
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse TimeoutNowReply: {}", e);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to send TimeoutNow to {}: {}", url, e);
+                }
+            }
+        });
+
+        // Step down immediately
+        tracing::info!(
+            "Leader stepping down after initiating transfer to {}",
+            target_id
+        );
+        self.role = Role::Follower;
+        self.current_leader = None;
+        self.current_leader_address = None;
+
+        Ok(())
+    }
+
+    /// Handle a client request to add servers (public API)
+    /// This implements the safe multi-phase protocol
+    pub async fn handle_add_servers_request(
+        &mut self,
+        servers: HashMap<usize, String>,
+    ) -> Result<(), String> {
+        // Safety checks
+        if self.role != Role::Leader {
+            return Err("Not the leader".to_string());
+        }
+
+        if !matches!(self.config_change_state, ConfigChangeState::None) {
+            return Err("Configuration change already in progress".to_string());
+        }
+
+        if servers.is_empty() {
+            return Err("No servers to add".to_string());
+        }
+
+        // Verify servers don't already exist
+        let current_members = self.cluster_config.all_members();
+        for server_id in servers.keys() {
+            if current_members.contains_key(server_id) {
+                return Err(format!("Server {} already exists", server_id));
+            }
+        }
+
+        tracing::info!("Starting add servers: {:?}", servers);
+
+        // Phase 1: Add as non-voting members for catch-up
+        self.config_change_state = ConfigChangeState::AddingServers {
+            servers: servers
+                .iter()
+                .map(|(id, addr)| {
+                    (
+                        *id,
+                        (addr.clone(), CatchUpProgress::new(self.monotonic_time)),
+                    )
+                })
+                .collect(),
+            started_at: self.monotonic_time,
+        };
+
+        self.non_voting_members.extend(servers.clone());
+        for server_id in servers.keys() {
+            self.server_roles.insert(*server_id, ServerRole::NonVoting);
+            self.catch_up_progress
+                .insert(*server_id, CatchUpProgress::new(self.monotonic_time));
+        }
+
+        // Extend tracking arrays for non-voting members
+        for _ in 0..servers.len() {
+            self.next_index
+                .push(self.log.len() + self.last_included_index);
+            self.match_index.push(self.last_included_index);
+        }
+
+        tracing::info!("Servers added as non-voting members, waiting for catch-up");
+        Ok(())
+    }
+
+    /// Handle a client request to remove servers (public API)
+    pub async fn handle_remove_servers_request(
+        &mut self,
+        server_ids: Vec<usize>,
+    ) -> Result<(), String> {
+        // Safety checks
+        if self.role != Role::Leader {
+            return Err("Not the leader".to_string());
+        }
+
+        if !matches!(self.config_change_state, ConfigChangeState::None) {
+            return Err("Configuration change already in progress".to_string());
+        }
+
+        if server_ids.is_empty() {
+            return Err("No servers to remove".to_string());
+        }
+
+        // Verify we're not removing too many servers
+        let current_members = match &self.cluster_config {
+            ClusterConfiguration::Simple { members, .. } => members,
+            ClusterConfiguration::Joint { .. } => {
+                return Err("Cannot remove servers during joint consensus".to_string());
+            }
+        };
+
+        let remaining = current_members.len() - server_ids.len();
+        if remaining < 1 {
+            return Err("Cannot remove all servers".to_string());
+        }
+
+        // Check if we need to transfer leadership
+        if server_ids.contains(&self.id) {
+            tracing::info!("Leader is being removed, initiating leader transfer");
+
+            // Find a suitable target (not being removed)
+            let target = current_members
+                .keys()
+                .find(|id| !server_ids.contains(id) && **id != self.id)
+                .copied();
+
+            if let Some(target_id) = target {
+                self.config_change_state = ConfigChangeState::TransferringLeadership {
+                    target_server: target_id,
+                    servers_to_remove: server_ids.clone(),
+                };
+                self.initiate_leader_transfer(target_id).await?;
+                return Ok(());
+            } else {
+                return Err("No suitable target for leader transfer".to_string());
+            }
+        }
+
+        // Proceed with removal via joint consensus
+        self.begin_remove_servers_joint_consensus(server_ids).await
+    }
+
+    /// Begin joint consensus phase for removing servers
+    async fn begin_remove_servers_joint_consensus(
+        &mut self,
+        server_ids: Vec<usize>,
+    ) -> Result<(), String> {
+        let old_members = match &self.cluster_config {
+            ClusterConfiguration::Simple { members, .. } => members.clone(),
+            _ => return Err("Invalid state".to_string()),
+        };
+
+        let mut new_members = old_members.clone();
+        for server_id in &server_ids {
+            new_members.remove(server_id);
+        }
+
+        let version = self.cluster_config.version() + 1;
+
+        // Append C-old,new to log
+        let cmd = Command::Membership(MembershipCommand::BeginJointConsensus {
+            old_members: old_members.clone(),
+            new_members: new_members.clone(),
+            version,
+        });
+
+        let entry = LogEntry {
+            term: self.current_term,
+            command: cmd,
+        };
+
+        self.log.push(entry);
+        let absolute_index = self.log.len() - 1 + self.last_included_index;
+        self.save_log_entry(absolute_index, &self.log[self.log.len() - 1])
+            .map_err(|e| format!("Failed to save log entry: {}", e))?;
+
+        let joint_index = absolute_index;
+
+        self.config_change_state = ConfigChangeState::InJointConsensus {
+            joint_config_index: joint_index,
+            target_config: new_members,
+        };
+
+        tracing::info!(
+            "Appended C-old,new at index {}, version {}",
+            joint_index,
+            version
+        );
+
+        Ok(())
     }
 
     fn apply_command(&self, command: &Command) {

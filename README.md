@@ -8,6 +8,7 @@ Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Ra
 - ✅ **分散ストレージ**: 複数のChunkServerにデータを分散保存
 - ✅ **レプリケーション**: デフォルトで3つのレプリカを作成（冗長性確保）
 - ✅ **高可用性 (HA)**: RaftコンセンサスアルゴリズムによるMasterの冗長化
+- ✅ **Dynamic Membership Changes**: Raftクラスタの稼働中ノード追加・削除（Joint Consensus、Leader Transfer、Catch-up Protocol）
 - ✅ **ダイナミックシャーディング**: Range-basedシャーディングによる複数のMasterグループでのメタデータ水平分割、負荷に応じた自動シャード分割（Split/Merge）、S3/Colossusスタイルのプレフィックス局所性
 - ✅ **トランザクション**: クロスシャード操作（Rename等）をAtomicに実行するTransaction Recordの実装
 - ✅ **データ整合性**: Raftログレプリケーションによるメタデータの一貫性保証
@@ -190,11 +191,17 @@ MIT
 
 ## 参考資料
 
+### プロジェクトドキュメント
+
 - [MASTER_HA.md](MASTER_HA.md) - Master HAとシャーディングの詳細
 - [DYNAMIC_SHARDING.md](DYNAMIC_SHARDING.md) - ダイナミックシャーディングの実装詳細
 - [REPLICATION.md](REPLICATION.md) - レプリケーション機能の詳細
 - [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) - S3互換APIとSpark統合の詳細
 - [CHAOS_TEST.md](CHAOS_TEST.md) - カオステストガイド
+- [test_scripts/DYNAMIC_MEMBERSHIP_TESTS.md](test_scripts/DYNAMIC_MEMBERSHIP_TESTS.md) - Dynamic Membership Changesのテストガイド
+
+### 外部リソース
+
 - [Google File System](https://research.google.com/archive/gfs.html)
 - [Spanner: Google's Globally-Distributed Database](https://research.google.com/archive/spanner.html)
 - [Google Colossus](https://cloud.google.com/blog/products/storage-data-transfer/a-peek-behind-colossus-googles-file-system)

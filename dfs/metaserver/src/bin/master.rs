@@ -10,7 +10,7 @@ use dfs_metaserver::dfs::master_service_server::MasterServiceServer;
 use dfs_metaserver::master::{MasterState, MyMaster};
 use dfs_metaserver::simple_raft::{
     AppendEntriesArgs, ClusterInfo, Event, InstallSnapshotArgs, RaftNode, RequestVoteArgs,
-    RpcMessage,
+    RpcMessage, TimeoutNowArgs,
 };
 use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 use std::sync::{Arc, Mutex};
@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/raft/vote", post(handle_vote))
         .route("/raft/append", post(handle_append))
         .route("/raft/snapshot", post(handle_snapshot))
+        .route("/raft/timeout_now", post(handle_timeout_now))
         .with_state(app_state);
 
     // Start HTTP Server for Raft RPC
@@ -338,6 +339,31 @@ async fn handle_snapshot(
 
     match reply_rx.await {
         Ok(RpcMessage::InstallSnapshotResponse(reply)) => {
+            Ok(Json(serde_json::to_value(&reply).unwrap()))
+        }
+        _ => Err(InternalError),
+    }
+}
+
+async fn handle_timeout_now(
+    State(app_state): State<AppState>,
+    Json(args): Json<TimeoutNowArgs>,
+) -> Result<Json<serde_json::Value>, InternalError> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if app_state
+        .raft_tx
+        .send(Event::Rpc {
+            msg: RpcMessage::TimeoutNow(args),
+            reply_tx: Some(reply_tx),
+        })
+        .await
+        .is_err()
+    {
+        return Err(InternalError);
+    }
+
+    match reply_rx.await {
+        Ok(RpcMessage::TimeoutNowResponse(reply)) => {
             Ok(Json(serde_json::to_value(&reply).unwrap()))
         }
         _ => Err(InternalError),
