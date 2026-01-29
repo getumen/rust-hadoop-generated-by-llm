@@ -16,9 +16,10 @@
 
 **Tasks**:
 - [x] Add unit tests for Raft logic (16 tests covering leader election, log replication, commit, term management, ReadIndex)
-- [ ] Add integration tests for network partitions
-  - [ ] Multi-node scenarios
-  - [ ] Network partition simulation (`tc netem` / `toxiproxy`)
+- [x] Add integration tests for network partitions (11 tests with mock network layer)
+  - [x] Multi-node scenarios (split-brain prevention, leader election, partition healing)
+  - [x] Partition simulation (2-way, 3-way, symmetric, cascading)
+  - [ ] Real network partition testing with `tc netem` / `toxiproxy`
   - [ ] Clock skew simulation
 - [ ] Add property-based tests (using proptest)
 - [ ] Implement Jepsen-style consistency tests
