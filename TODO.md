@@ -44,14 +44,26 @@
 - Implement ReadIndex optimization
 - Allow Followers to serve reads with bounded staleness
 - Add read-only mode configuration
+- Partial block reads with offset/length parameters
+- Concurrent block fetching for improved throughput
+- LRU block cache on ChunkServer
+- Optimized S3 range requests
 
 **Tasks**:
 - [x] Implement ReadIndex protocol
+- [x] **Partial Read Support**: Added offset/length parameters to ReadBlockRequest/Response
+- [x] **ChunkServer Optimization**: Implemented partial block reads with seek-based I/O
+- [x] **Block Caching**: Added LRU cache (configurable via BLOCK_CACHE_SIZE env var, default: 100 blocks)
+- [x] **Concurrent Downloads**: Implemented `get_file_concurrent()` for parallel block fetching
+- [x] **Range Read API**: Added `read_file_range()` method to Client library
+- [x] **S3 Gateway**: Optimized Range requests to use partial reads instead of full downloads
 - [ ] Add lease-based read optimization
 - [ ] Add configuration for read consistency level
 - [ ] Implement stale read detection
 - [ ] Allow Follower reads
 - [ ] Add metrics for read latency by consistency level
+- [ ] Implement streaming block response support (gRPC streaming)
+- [ ] Add read-ahead strategy for sequential workloads
 
 ### 13. ChunkServer Improvements
 **Status**: Working

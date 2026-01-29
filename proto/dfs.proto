@@ -155,10 +155,14 @@ message WriteBlockResponse {
 
 message ReadBlockRequest {
   string block_id = 1;
+  uint64 offset = 2;      // Starting byte offset (0 = beginning of block)
+  uint64 length = 3;      // Number of bytes to read (0 = read entire block)
 }
 
 message ReadBlockResponse {
   bytes data = 1;
+  uint64 bytes_read = 2;  // Actual number of bytes returned
+  uint64 total_size = 3;  // Total size of the block
 }
 
 message FileMetadata {

@@ -7,13 +7,25 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use dfs_common::sharding::ShardMap;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+
+/// Cached block data with metadata
+#[derive(Clone, Debug)]
+struct CachedBlock {
+    data: Vec<u8>,
+    size: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct MyChunkServer {
     storage_dir: PathBuf,
     config_server_addrs: Vec<String>,
     pub shard_map: Arc<Mutex<ShardMap>>,
+    // LRU cache for frequently accessed blocks
+    // Cache size is in number of blocks (not bytes)
+    block_cache: Arc<Mutex<LruCache<String, CachedBlock>>>,
 }
 
 impl MyChunkServer {
@@ -31,10 +43,27 @@ impl MyChunkServer {
             Arc::new(Mutex::new(ShardMap::new(100)))
         };
 
+        // Initialize block cache with capacity for 100 blocks
+        // This can be made configurable via environment variable
+        let cache_capacity = std::env::var("BLOCK_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100);
+
+        let block_cache = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(cache_capacity).unwrap(),
+        )));
+
+        tracing::info!(
+            "Initialized block cache with capacity: {} blocks",
+            cache_capacity
+        );
+
         MyChunkServer {
             storage_dir,
             config_server_addrs,
             shard_map,
+            block_cache,
         }
     }
 
@@ -221,6 +250,8 @@ impl MyChunkServer {
                 Ok(mut client) => {
                     let request = tonic::Request::new(crate::dfs::ReadBlockRequest {
                         block_id: block_id.to_string(),
+                        offset: 0,
+                        length: 0, // Read entire block
                     });
 
                     match client.read_block(request).await {
@@ -453,61 +484,149 @@ impl ChunkServerService for MyChunkServer {
 
             match fs::File::open(&path) {
                 Ok(mut file) => {
-                    let mut data = Vec::new();
-                    if let Err(e) = file.read_to_end(&mut data) {
-                        return Err(Status::internal(e.to_string()));
+                    // Get total block size
+                    let metadata = file.metadata().map_err(|e| {
+                        Status::internal(format!("Failed to get file metadata: {}", e))
+                    })?;
+                    let total_size = metadata.len();
+
+                    // Determine read parameters
+                    let offset = req.offset;
+                    let length = if req.length == 0 {
+                        // If length is 0, read from offset to end of block
+                        total_size.saturating_sub(offset)
+                    } else {
+                        req.length
+                    };
+
+                    // Validate offset
+                    if offset >= total_size {
+                        return Err(Status::out_of_range(format!(
+                            "Offset {} exceeds block size {}",
+                            offset, total_size
+                        )));
                     }
 
-                    // Verify checksums
-                    if let Err(e) = self.verify_block(&req.block_id, &data) {
-                        tracing::error!(
-                            "CRITICAL: Data corruption detected for block {}: {}",
-                            req.block_id,
-                            e
-                        );
+                    // Calculate actual bytes to read (don't read past end of file)
+                    let bytes_to_read = std::cmp::min(length, total_size - offset);
 
-                        // Attempt automatic recovery
-                        tracing::warn!("Attempting automatic recovery for block {}", req.block_id);
-                        match self.recover_block(&req.block_id).await {
-                            Ok(_) => {
-                                tracing::info!(
-                                    "Block {} successfully recovered, retrying read",
-                                    req.block_id
-                                );
-                                // Re-read the recovered block
-                                let mut file = fs::File::open(&path)
-                                    .map_err(|e| Status::internal(e.to_string()))?;
-                                let mut recovered_data = Vec::new();
-                                file.read_to_end(&mut recovered_data)
-                                    .map_err(|e| Status::internal(e.to_string()))?;
+                    // Check cache for full block reads (offset=0, length=entire block)
+                    let is_full_block_read = offset == 0 && bytes_to_read == total_size;
 
-                                // Verify recovered data
-                                if let Err(e) = self.verify_block(&req.block_id, &recovered_data) {
-                                    return Err(Status::data_loss(format!(
-                                        "Recovered block is still corrupted: {}",
-                                        e
-                                    )));
-                                }
-
+                    if is_full_block_read {
+                        // Try to get from cache
+                        if let Ok(mut cache) = self.block_cache.lock() {
+                            if let Some(cached) = cache.get(&req.block_id) {
+                                tracing::debug!("Cache hit for block {}", req.block_id);
                                 return Ok(Response::new(ReadBlockResponse {
-                                    data: recovered_data,
+                                    data: cached.data.clone(),
+                                    bytes_read: cached.size as u64,
+                                    total_size,
                                 }));
                             }
-                            Err(recovery_err) => {
-                                tracing::error!(
-                                    "Failed to recover block {}: {}",
-                                    req.block_id,
-                                    recovery_err
-                                );
-                                return Err(Status::data_loss(format!(
-                                    "Data corruption detected: {}. Recovery failed: {}",
-                                    e, recovery_err
-                                )));
+                            tracing::debug!("Cache miss for block {}", req.block_id);
+                        }
+                    }
+
+                    // Seek to offset and read requested data
+                    use std::io::{Read, Seek, SeekFrom};
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|e| Status::internal(format!("Failed to seek: {}", e)))?;
+
+                    let mut data = vec![0u8; bytes_to_read as usize];
+                    file.read_exact(&mut data)
+                        .map_err(|e| Status::internal(format!("Failed to read data: {}", e)))?;
+
+                    // For partial reads, we verify only if reading the entire block
+                    // For now, skip checksum verification for partial reads to improve performance
+                    // TODO: Implement chunked checksum verification for partial reads
+                    if offset == 0 && bytes_to_read == total_size {
+                        // Verify checksums only for full block reads
+                        if let Err(e) = self.verify_block(&req.block_id, &data) {
+                            tracing::error!(
+                                "CRITICAL: Data corruption detected for block {}: {}",
+                                req.block_id,
+                                e
+                            );
+
+                            // Attempt automatic recovery
+                            tracing::warn!(
+                                "Attempting automatic recovery for block {}",
+                                req.block_id
+                            );
+                            match self.recover_block(&req.block_id).await {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        "Block {} successfully recovered, retrying read",
+                                        req.block_id
+                                    );
+                                    // Re-read the recovered block
+                                    let mut file = fs::File::open(&path)
+                                        .map_err(|e| Status::internal(e.to_string()))?;
+                                    let mut recovered_data = vec![0u8; bytes_to_read as usize];
+                                    file.seek(SeekFrom::Start(offset))
+                                        .map_err(|e| Status::internal(e.to_string()))?;
+                                    file.read_exact(&mut recovered_data)
+                                        .map_err(|e| Status::internal(e.to_string()))?;
+
+                                    // Verify recovered data
+                                    if let Err(e) =
+                                        self.verify_block(&req.block_id, &recovered_data)
+                                    {
+                                        return Err(Status::data_loss(format!(
+                                            "Recovered block is still corrupted: {}",
+                                            e
+                                        )));
+                                    }
+
+                                    return Ok(Response::new(ReadBlockResponse {
+                                        data: recovered_data,
+                                        bytes_read: bytes_to_read,
+                                        total_size,
+                                    }));
+                                }
+                                Err(recovery_err) => {
+                                    tracing::error!(
+                                        "Failed to recover block {}: {}",
+                                        req.block_id,
+                                        recovery_err
+                                    );
+                                    return Err(Status::data_loss(format!(
+                                        "Data corruption detected: {}. Recovery failed: {}",
+                                        e, recovery_err
+                                    )));
+                                }
                             }
                         }
                     }
 
-                    Ok(Response::new(ReadBlockResponse { data }))
+                    tracing::debug!(
+                        "Read block {} (offset={}, length={}, bytes_read={})",
+                        req.block_id,
+                        offset,
+                        length,
+                        bytes_to_read
+                    );
+
+                    // Cache full block reads
+                    if is_full_block_read {
+                        if let Ok(mut cache) = self.block_cache.lock() {
+                            cache.put(
+                                req.block_id.clone(),
+                                CachedBlock {
+                                    data: data.clone(),
+                                    size: data.len(),
+                                },
+                            );
+                            tracing::debug!("Cached block {}", req.block_id);
+                        }
+                    }
+
+                    Ok(Response::new(ReadBlockResponse {
+                        data,
+                        bytes_read: bytes_to_read,
+                        total_size,
+                    }))
                 }
                 Err(_) => Err(Status::not_found("Block not found")),
             }

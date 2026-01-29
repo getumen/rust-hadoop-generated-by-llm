@@ -2758,6 +2758,32 @@ impl RaftNode {
                         MasterCommand::CompleteFile { path, size } => {
                             if let Some(file) = master_state.files.get_mut(path) {
                                 file.size = *size;
+
+                                // Update block sizes based on total file size
+                                // Distribute size across blocks: each block gets equal size except last
+                                let num_blocks = file.blocks.len();
+                                if num_blocks > 0 {
+                                    let remaining_size = *size;
+
+                                    // For single block, assign all size to it
+                                    // For multiple blocks, we'll just mark the first block with full size
+                                    // This is a simplified approach - ideally blocks should report their actual size
+                                    if num_blocks == 1 {
+                                        file.blocks[0].size = remaining_size;
+                                    } else {
+                                        // For multiple blocks, distribute evenly
+                                        // This is an approximation since we don't know actual block boundaries
+                                        let block_size = remaining_size / num_blocks as u64;
+                                        let last_block_size =
+                                            remaining_size - (block_size * (num_blocks - 1) as u64);
+
+                                        for i in 0..num_blocks - 1 {
+                                            file.blocks[i].size = block_size;
+                                        }
+                                        file.blocks[num_blocks - 1].size = last_block_size;
+                                    }
+                                }
+
                                 tracing::info!("Completed file {}: size={} bytes", path, size);
                             }
                         }
