@@ -53,6 +53,39 @@ Sparkで使用する場合、以下の設定（`spark-submit` 時に指定）を
 Spark (S3A) はデフォルトで S3 Chunked Encoding を使用し、リクエストボディの前に署名を付与します。
 現在のS3サーバーの実装では、デコード後のボディではなく受信した生のボディに対してMD5を計算するため、`fs.s3a.payload.signing.enabled=false` を設定しないとクライアント側で計算したMD5（ETag）と不一致が発生します。
 
+## パフォーマンス最適化
+
+### Range Request の最適化
+
+S3サーバーはHTTP Range Request（`Range: bytes=start-end`）を効率的に処理します。
+
+**動作**:
+1. Rangeヘッダーを検出
+2. DFSクライアントの `read_file_range()` APIを使用して必要な範囲のみを取得
+3. HTTP 206 Partial Content レスポンスを返却
+4. `Content-Range` ヘッダーでバイト範囲と総サイズを通知
+
+**利点**:
+- **帯域幅削減**: 大容量ファイルの一部のみが必要な場合、全体をダウンロードしない
+- **低レイテンシ**: 必要なデータのみをChunkServerから取得
+- **Spark最適化**: Parquet/ORC形式での列指向アクセスを効率化
+
+**例**:
+```bash
+# AWS CLIでのRange Request
+aws --endpoint-url http://localhost:9000 s3api get-object \
+  --bucket my-bucket \
+  --key large-file.dat \
+  --range bytes=1000-2000 \
+  output.dat
+
+# curlでのRange Request
+curl -H "Range: bytes=0-1023" \
+  http://localhost:9000/my-bucket/large-file.dat
+```
+
+内部的には、DFSの部分読み取り機能（Partial Block Reads）とLRUキャッシュを活用し、最小限のディスクI/Oで応答します。
+
 ## 実装されている主要なAPI
 
 - **Bucket**: `CreateBucket`, `DeleteBucket`, `ListBuckets`, `HeadBucket`
@@ -60,8 +93,10 @@ Spark (S3A) はデフォルトで S3 Chunked Encoding を使用し、リクエ�
 - **Multipart**: `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`
 - **Batch**: `DeleteObjects` (Multi-Object Delete)
 - **Pagination**: `ListObjectsV2` 対応
+- **Range Requests**: HTTP Range ヘッダーによる部分取得（HTTP 206 Partial Content）
 
-## 制限事項
+## 制限事項と今後の改善
 
-- 認証は現在、アクセスキー/シークレットキーの検証を行わない「ダミー認証」となっています。任意の資格情報でアクセス可能です。
-- `CopyObject` は現在、サーバー側で一度ファイルを一時的に読み込み、再書き込みするナイーブな実装となっています。
+- **認証**: 現在、アクセスキー/シークレットキーの検証を行わない「ダミー認証」となっています。任意の資格情報でアクセス可能です。
+- **CopyObject**: 現在、サーバー側で一度ファイルを一時的に読み込み、再書き込みするナイーブな実装となっています。将来的にはメタデータ操作のみで完結する最適化を予定しています。
+- **Presigned URLs**: 現在未実装です。Phase 5で実装予定です。

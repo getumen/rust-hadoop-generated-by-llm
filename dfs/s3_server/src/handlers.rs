@@ -12,7 +12,7 @@ use percent_encoding::percent_decode_str;
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
 use serde::Deserialize;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use tempfile::NamedTempFile;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -842,53 +842,108 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
 
     // Normal Object
     let source_path = format!("/{}/{}", bucket, key);
-    let temp_dir = std::env::temp_dir();
-    let dest_path = temp_dir.join(format!("s3_get_{}_{}", bucket, key.replace('/', "_")));
 
-    match state.client.get_file(&source_path, &dest_path).await {
-        Ok(_) => {
-            // Range handling
-            let mut file = std::fs::File::open(&dest_path).unwrap();
-            let total_size = file.metadata().unwrap().len();
+    // Check if Range header is present to optimize download
+    if let Some(range_val) = headers.get(RANGE) {
+        if let Ok(range_str) = range_val.to_str() {
+            if let Some(range_part) = range_str.strip_prefix("bytes=") {
+                // First, get file info to determine total size
+                if let Ok(true) = state.client.exists(&source_path).await {
+                    // Parse range
+                    let parts: Vec<&str> = range_part.split('-').collect();
+                    if parts.len() == 2 {
+                        // Get file metadata to determine total size
+                        let temp_dir = std::env::temp_dir();
+                        let dest_path =
+                            temp_dir.join(format!("s3_get_{}_{}", bucket, key.replace('/', "_")));
 
-            let mut start = 0;
-            let mut end = total_size - 1;
-            let mut status = StatusCode::OK;
+                        // Download full file first to get total size
+                        // TODO: Add get_file_metadata API to avoid this download
+                        if state
+                            .client
+                            .get_file(&source_path, &dest_path)
+                            .await
+                            .is_ok()
+                        {
+                            let total_size = std::fs::metadata(&dest_path).unwrap().len();
+                            let _ = std::fs::remove_file(dest_path);
 
-            if let Some(range_val) = headers.get(RANGE) {
-                if let Ok(range_str) = range_val.to_str() {
-                    if let Some(range_part) = range_str.strip_prefix("bytes=") {
-                        let parts: Vec<&str> = range_part.split('-').collect();
-                        if parts.len() == 2 {
-                            start = parts[0].parse::<u64>().unwrap_or(0);
-                            if !parts[1].is_empty() {
-                                end = parts[1].parse::<u64>().unwrap_or(total_size - 1);
-                            }
-                            end = std::cmp::min(end, total_size - 1);
+                            let start = parts[0].parse::<u64>().unwrap_or(0);
+                            let end = if parts[1].is_empty() {
+                                total_size - 1
+                            } else {
+                                parts[1].parse::<u64>().unwrap_or(total_size - 1)
+                            };
+                            let end = std::cmp::min(end, total_size - 1);
+
                             if start <= end {
-                                status = StatusCode::PARTIAL_CONTENT;
-                                response_headers.insert(
-                                    CONTENT_RANGE,
-                                    format!("bytes {}-{}/{}", start, end, total_size)
-                                        .parse()
-                                        .unwrap(),
+                                let length = end - start + 1;
+
+                                tracing::info!(
+                                    "Range request: path={}, start={}, end={}, length={}, total_size={}",
+                                    source_path, start, end, length, total_size
                                 );
-                                response_headers.insert(
-                                    CONTENT_LENGTH,
-                                    (end - start + 1).to_string().parse().unwrap(),
-                                );
+
+                                // Use optimized partial read
+                                match state
+                                    .client
+                                    .read_file_range(&source_path, start, length)
+                                    .await
+                                {
+                                    Ok(data) => {
+                                        tracing::info!(
+                                            "Range read successful: {} bytes returned",
+                                            data.len()
+                                        );
+                                        response_headers.insert(
+                                            CONTENT_RANGE,
+                                            format!("bytes {}-{}/{}", start, end, total_size)
+                                                .parse()
+                                                .unwrap(),
+                                        );
+                                        response_headers.insert(
+                                            CONTENT_LENGTH,
+                                            length.to_string().parse().unwrap(),
+                                        );
+
+                                        let mut resp_builder =
+                                            Response::builder().status(StatusCode::PARTIAL_CONTENT);
+                                        {
+                                            let headers_map = resp_builder.headers_mut().unwrap();
+                                            *headers_map = response_headers;
+                                            headers_map.insert(ETAG, etag.parse().unwrap());
+                                        }
+                                        return resp_builder.body(Body::from(data)).unwrap();
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to read file range: {}", e);
+                                        // Fall back to full download below
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
 
-            let mut data = vec![0u8; (end - start + 1) as usize];
-            let _ = file.seek(SeekFrom::Start(start));
+    // Fall back to full file download (for non-range requests or if range optimization failed)
+    let temp_dir = std::env::temp_dir();
+    let dest_path = temp_dir.join(format!("s3_get_{}_{}", bucket, key.replace('/', "_")));
+
+    match state.client.get_file(&source_path, &dest_path).await {
+        Ok(_) => {
+            let mut file = std::fs::File::open(&dest_path).unwrap();
+            let total_size = file.metadata().unwrap().len();
+
+            let mut data = vec![0u8; total_size as usize];
             let _ = file.read_exact(&mut data);
             let _ = std::fs::remove_file(dest_path);
 
-            let mut resp_builder = Response::builder().status(status);
+            response_headers.insert(CONTENT_LENGTH, total_size.to_string().parse().unwrap());
+
+            let mut resp_builder = Response::builder().status(StatusCode::OK);
             {
                 let headers_map = resp_builder.headers_mut().unwrap();
                 *headers_map = response_headers;

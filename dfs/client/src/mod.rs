@@ -352,6 +352,8 @@ impl Client {
                             .max_decoding_message_size(100 * 1024 * 1024);
                             let request = tonic::Request::new(ReadBlockRequest {
                                 block_id: block.block_id.clone(),
+                                offset: 0,
+                                length: 0, // 0 means read entire block
                             });
                             match client.read_block(request).await {
                                 Ok(response) => {
@@ -377,6 +379,300 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Read a specific range of bytes from a file
+    /// Returns the data as Vec<u8>
+    pub async fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        // 1. Get file info from Master
+        let (info_resp, _) = self
+            .execute_rpc(Some(path), |mut client| {
+                let path = path.to_string();
+                async move {
+                    let info_req = tonic::Request::new(GetFileInfoRequest { path });
+                    client.get_file_info(info_req).await
+                }
+            })
+            .await?;
+        let info_resp = info_resp.into_inner();
+
+        if !info_resp.found {
+            bail!("File not found");
+        }
+
+        let metadata = info_resp.metadata.ok_or_else(|| anyhow!("No metadata"))?;
+
+        // Validate range
+        if offset >= metadata.size {
+            bail!("Offset {} exceeds file size {}", offset, metadata.size);
+        }
+
+        let bytes_to_read = std::cmp::min(length, metadata.size - offset);
+        let mut result = Vec::with_capacity(bytes_to_read as usize);
+        let end_offset = offset + bytes_to_read;
+
+        tracing::info!(
+            "read_file_range: path={}, offset={}, length={}, bytes_to_read={}, file_size={}, blocks={}",
+            path, offset, length, bytes_to_read, metadata.size, metadata.blocks.len()
+        );
+
+        // Track cumulative file position
+        let mut file_position = 0u64;
+
+        // 2. Read blocks from ChunkServers
+        tracing::info!(
+            "Starting block iteration: {} blocks to process",
+            metadata.blocks.len()
+        );
+        for block in metadata.blocks {
+            tracing::debug!(
+                "Processing block: id={}, size={}, locations={:?}",
+                block.block_id,
+                block.size,
+                block.locations
+            );
+
+            if block.locations.is_empty() {
+                tracing::warn!("Block {} has no locations", block.block_id);
+                continue;
+            }
+
+            // Calculate this block's position in the file
+            let block_start = file_position;
+            let block_end = file_position + block.size;
+
+            // Move to next block
+            file_position += block.size;
+
+            // Skip blocks completely before our range
+            if block_end <= offset {
+                tracing::debug!("Skipping block {} (before range)", block.block_id);
+                continue;
+            }
+
+            // Stop if we've read past our range
+            if block_start >= end_offset {
+                tracing::debug!("Stopping at block {} (past range)", block.block_id);
+                break;
+            }
+
+            // Calculate offset and length within this block
+            let block_offset = offset.saturating_sub(block_start);
+
+            let block_read_end = std::cmp::min(block.size, end_offset - block_start);
+            let block_length = block_read_end - block_offset;
+
+            tracing::info!(
+                "Reading from block {}: block_start={}, block_end={}, offset={}, length={}",
+                block.block_id,
+                block_start,
+                block_end,
+                block_offset,
+                block_length
+            );
+
+            let mut success = false;
+            for location in &block.locations {
+                let chunk_server_addr = format!("http://{}", location);
+                let resolved_addr = self.resolve_url(&chunk_server_addr);
+                let channel_res = tonic::transport::Endpoint::from_shared(resolved_addr.clone());
+                match channel_res {
+                    Ok(endpoint) => match endpoint.connect().await {
+                        Ok(channel) => {
+                            let mut client = ChunkServerServiceClient::with_interceptor(
+                                channel,
+                                dfs_common::telemetry::tracing_interceptor
+                                    as fn(
+                                        tonic::Request<()>,
+                                    )
+                                        -> Result<tonic::Request<()>, tonic::Status>,
+                            )
+                            .max_decoding_message_size(100 * 1024 * 1024);
+                            let request = tonic::Request::new(ReadBlockRequest {
+                                block_id: block.block_id.clone(),
+                                offset: block_offset,
+                                length: block_length,
+                            });
+                            match client.read_block(request).await {
+                                Ok(response) => {
+                                    let resp = response.into_inner();
+                                    tracing::debug!(
+                                        "Read {} bytes from block {} (offset={}, length={})",
+                                        resp.bytes_read,
+                                        block.block_id,
+                                        block_offset,
+                                        block_length
+                                    );
+                                    result.extend_from_slice(&resp.data);
+                                    success = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to read block from {}: {}", location, e)
+                                }
+                            }
+                        }
+                        Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
+                    },
+                    Err(e) => tracing::error!("Invalid URL {}: {}", resolved_addr, e),
+                }
+            }
+
+            if !success {
+                tracing::error!(
+                    "Failed to read block {} from any location (tried {} locations)",
+                    block.block_id,
+                    block.locations.len()
+                );
+                bail!("Failed to read block {} from any location", block.block_id);
+            }
+        }
+
+        tracing::info!(
+            "read_file_range completed: returned {} bytes (expected {})",
+            result.len(),
+            bytes_to_read
+        );
+
+        Ok(result)
+    }
+
+    /// Download file with concurrent block fetching for better performance
+    /// This method fetches multiple blocks in parallel
+    pub async fn get_file_concurrent(&self, source: &str, dest: &Path) -> anyhow::Result<()> {
+        // 1. Get file info from Master
+        let (info_resp, _) = self
+            .execute_rpc(Some(source), |mut client| {
+                let source = source.to_string();
+                async move {
+                    let info_req = tonic::Request::new(GetFileInfoRequest { path: source });
+                    client.get_file_info(info_req).await
+                }
+            })
+            .await?;
+        let info_resp = info_resp.into_inner();
+
+        if !info_resp.found {
+            bail!("File not found");
+        }
+
+        let metadata = info_resp.metadata.ok_or_else(|| anyhow!("No metadata"))?;
+        let blocks = metadata.blocks;
+
+        if blocks.is_empty() {
+            // Create empty file
+            File::create(dest)?;
+            return Ok(());
+        }
+
+        // 2. Fetch all blocks concurrently
+        let mut fetch_tasks = Vec::new();
+
+        for (idx, block) in blocks.iter().enumerate() {
+            let block_clone = block.clone();
+            let self_clone = self.clone();
+
+            let task = tokio::spawn(async move {
+                Self::fetch_single_block(&self_clone, &block_clone)
+                    .await
+                    .map(|data| (idx, data))
+            });
+
+            fetch_tasks.push(task);
+        }
+
+        // 3. Wait for all blocks and collect results
+        let mut block_data: Vec<(usize, Vec<u8>)> = Vec::new();
+
+        for task in fetch_tasks {
+            match task.await {
+                Ok(Ok(data)) => block_data.push(data),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => bail!("Task join error: {}", e),
+            }
+        }
+
+        // 4. Sort by block index and write to file
+        block_data.sort_by_key(|(idx, _)| *idx);
+
+        let mut file = File::create(dest)?;
+        for (_, data) in block_data {
+            file.write_all(&data)?;
+        }
+
+        Ok(())
+    }
+
+    /// Helper function to fetch a single block from any available location
+    async fn fetch_single_block(&self, block: &dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
+        if block.locations.is_empty() {
+            bail!("Block {} has no locations", block.block_id);
+        }
+
+        for location in &block.locations {
+            let chunk_server_addr = format!("http://{}", location);
+            let resolved_addr = self.resolve_url(&chunk_server_addr);
+
+            let channel_res = tonic::transport::Endpoint::from_shared(resolved_addr.clone());
+            match channel_res {
+                Ok(endpoint) => match endpoint.connect().await {
+                    Ok(channel) => {
+                        let mut client = ChunkServerServiceClient::with_interceptor(
+                            channel,
+                            dfs_common::telemetry::tracing_interceptor
+                                as fn(
+                                    tonic::Request<()>,
+                                )
+                                    -> Result<tonic::Request<()>, tonic::Status>,
+                        )
+                        .max_decoding_message_size(100 * 1024 * 1024);
+
+                        let request = tonic::Request::new(ReadBlockRequest {
+                            block_id: block.block_id.clone(),
+                            offset: 0,
+                            length: 0, // Read entire block
+                        });
+
+                        match client.read_block(request).await {
+                            Ok(response) => {
+                                let data = response.into_inner().data;
+                                tracing::debug!(
+                                    "Successfully fetched block {} from {}",
+                                    block.block_id,
+                                    location
+                                );
+                                return Ok(data);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to read block {} from {}: {}",
+                                    block.block_id,
+                                    location,
+                                    e
+                                );
+                                // Try next location
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to {}: {}", location, e);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Invalid URL {}: {}", resolved_addr, e);
+                    continue;
+                }
+            }
+        }
+
+        bail!("Failed to read block {} from any location", block.block_id)
     }
 
     pub async fn exists(
