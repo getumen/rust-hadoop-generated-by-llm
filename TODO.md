@@ -19,7 +19,7 @@
 - [x] Add integration tests for network partitions (11 tests with mock network layer)
   - [x] Multi-node scenarios (split-brain prevention, leader election, partition healing)
   - [x] Partition simulation (2-way, 3-way, symmetric, cascading)
-  - [ ] Real network partition testing with `tc netem` / `toxiproxy`
+  - [x] Real network partition testing with `toxiproxy` (5 test scenarios: partition, latency, packet loss, bandwidth limit, cascading failures)
   - [ ] Clock skew simulation
 - [x] Add property-based tests (15 tests using proptest - log invariants, quorum intersection, state machine determinism)
 - [x] Implement Jepsen-style consistency tests (12 tests - history recording, linearizability checker, bank account invariant, concurrent operations, fault injection)
