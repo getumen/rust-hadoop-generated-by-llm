@@ -15,7 +15,7 @@
 **Rationale**: 本番運用前にネットワーク分断・障害シナリオのテストは必須。Jepsen風テストで信頼性を担保。
 
 **Tasks**:
-- [ ] Add unit tests for Raft logic
+- [x] Add unit tests for Raft logic (16 tests covering leader election, log replication, commit, term management, ReadIndex)
 - [ ] Add integration tests for network partitions
   - [ ] Multi-node scenarios
   - [ ] Network partition simulation (`tc netem` / `toxiproxy`)
