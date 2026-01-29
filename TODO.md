@@ -21,7 +21,7 @@
   - [x] Partition simulation (2-way, 3-way, symmetric, cascading)
   - [ ] Real network partition testing with `tc netem` / `toxiproxy`
   - [ ] Clock skew simulation
-- [ ] Add property-based tests (using proptest)
+- [x] Add property-based tests (15 tests using proptest - log invariants, quorum intersection, state machine determinism)
 - [ ] Implement Jepsen-style consistency tests
 - [ ] Add performance benchmarks
 - [ ] Add stress tests for high write throughput
