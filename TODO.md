@@ -57,7 +57,7 @@
 **Rationale**: CI/CD、ローリングアップデート、K8s対応がないと運用コストが高い。
 
 **Tasks**:
-- [ ] Add CI/CD pipeline (GitHub Actions / GitLab CI)
+- [ ] Add CI/CD pipeline (GitHub Actions)
 - [ ] Optimize Docker image size (multi-stage build)
 - [ ] Kubernetes manifests
 - [ ] Add Helm chart
@@ -81,7 +81,27 @@
 
 ---
 
-### 5. Raft Performance Optimizations
+### 5. ReadIndex-based Follower Read
+**Status**: Not Started
+**Priority**: 🟡 High
+**Effort**: Medium
+**Rationale**: Leaderへの読み取り負荷を分散し、読み取りスケーラビリティを向上。Linearizable整合性を維持。
+
+**Background**:
+現在、すべてのRead操作はRaft Leaderのみが処理。FollowerがLeaderにReadIndexを問い合わせ、自身のState Machineから読み取ることで負荷分散を実現。
+
+**Tasks**:
+- [ ] Add `GetReadIndex` RPC to proto for Follower→Leader communication
+- [ ] Add `WaitForApply` event to Raft layer (wait until `last_applied >= read_index`)
+- [ ] Modify `ensure_linearizable_read` to support Follower path
+- [ ] Implement Follower→Leader ReadIndex forwarding via gRPC
+- [ ] Add `allow_follower_read` option to read RPCs (client選択可能)
+- [ ] Create `follower_read_test.sh` integration test
+- [ ] Add unit tests for ReadIndex forwarding logic
+
+---
+
+### 6. Raft Performance Optimizations
 **Status**: Not Started
 **Priority**: 🟡 High
 **Effort**: Large
@@ -97,7 +117,7 @@
 
 ---
 
-### 6. Refactor RPC Responses
+### 7. Refactor RPC Responses
 **Status**: Not Started
 **Priority**: 🟡 High
 **Effort**: Small
@@ -109,7 +129,7 @@
 
 ---
 
-### 7. Code Quality & Technical Debt
+### 8. Code Quality & Technical Debt
 **Status**: Mostly Completed
 **Priority**: 🟡 Medium
 **Effort**: Small
@@ -132,7 +152,7 @@
 
 ## 🟢 Tier 3: スケール・セキュリティ
 
-### 8. Security Enhancements
+### 9. Security Enhancements
 **Status**: Not Started
 **Priority**: 🟢 Medium (本番では必須だが後回し可)
 **Effort**: Large
@@ -149,7 +169,7 @@
 
 ---
 
-### 9. Rack Awareness
+### 10. Rack Awareness
 **Status**: Not Started
 **Priority**: 🟢 Medium
 **Effort**: Medium
@@ -167,11 +187,11 @@
 
 ---
 
-### 10. Storage Efficiency (Erasure Coding)
+### 11. Storage Efficiency (Erasure Coding)
 **Status**: Not Started
 **Priority**: 🟢 Low
 **Effort**: Large
-**Rationale**: ストレージ効率向上（冷データ向け、後回しでOK）。
+**Rationale**: ストレージ効率向上（冷データ向け、後回しでOK）。RS(6,3)でストレージコスト約75%削減可能。
 
 **Tasks**:
 - [ ] Research Rust Erasure Coding libraries (e.g., `reed-solomon-erasure`)
@@ -179,6 +199,79 @@
 - [ ] Update Master to handle EC block placement
 - [ ] Implement background encoding for cold files
 - [ ] Add reconstruction logic for failed EC blocks
+
+---
+
+### 12. Storage Tiering (Hot/Warm/Cold)
+**Status**: Not Started
+**Priority**: 🟢 Medium
+**Effort**: Large
+**Rationale**: アクセス頻度に基づいてデータを階層化し、ストレージコストを大幅削減。
+
+**Tiers**:
+- **Hot (SSD)**: 頻繁アクセス、3x replication
+- **Warm (HDD)**: 1週間未アクセス、2x replication
+- **Cold (External/S3)**: 30日未アクセス、Erasure Coding
+
+**Tasks**:
+- [ ] Add `last_access_time` metadata to files
+- [ ] Implement background tier migration daemon
+- [ ] Add promotion logic (Cold→Hot on read)
+- [ ] Create lifecycle policy configuration (YAML)
+- [ ] Add CLI for manual tier migration
+
+---
+
+## 🟡 Tier 2: パフォーマンス最適化（追加項目）
+
+### 13. Data Compression
+**Status**: Not Started
+**Priority**: 🟡 High
+**Effort**: Small
+**Rationale**: ネットワーク帯域とストレージ使用量を削減。即効性が高くコスト対効果良好。
+
+**Compression Options**:
+- **LZ4**: 高速、Hot Tier向け
+- **Zstd**: バランス良好、Warm Tier向け
+- **Zstd -19**: 高圧縮率、Cold/Archive向け
+
+**Tasks**:
+- [ ] Add block-level compression (64KB - 1MB chunks)
+- [ ] Store compression algorithm in block metadata
+- [ ] Implement transparent decompression on read
+- [ ] Add compression ratio metrics
+- [ ] Make compression configurable per-file or per-directory
+
+---
+
+### 14. Connection Pooling & Network Optimization
+**Status**: Not Started
+**Priority**: 🟡 High
+**Effort**: Small
+**Rationale**: gRPC接続のreuse、レイテンシー削減。即効性が高い。
+
+**Tasks**:
+- [ ] Implement gRPC connection pooling for Master→ChunkServer
+- [ ] Add Client-side connection caching for multiple Masters
+- [ ] Implement gRPC keep-alive configuration
+- [ ] Add network transfer compression (LZ4 for RPC payloads)
+- [ ] Locality-aware routing (prefer same-rack ChunkServer)
+
+---
+
+## 🟢 Tier 3: コスト最適化（長期）
+
+### 15. Block-level Deduplication
+**Status**: Not Started
+**Priority**: 🟢 Low
+**Effort**: Medium
+**Rationale**: バックアップやログファイルで50-90%のストレージ削減可能。
+
+**Tasks**:
+- [ ] Implement content-addressable block storage (hash-based)
+- [ ] Add reference counting for shared blocks
+- [ ] Implement garbage collection for unreferenced blocks
+- [ ] Add deduplication ratio metrics
 
 ---
 
