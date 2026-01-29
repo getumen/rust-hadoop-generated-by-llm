@@ -22,7 +22,7 @@
   - [ ] Real network partition testing with `tc netem` / `toxiproxy`
   - [ ] Clock skew simulation
 - [x] Add property-based tests (15 tests using proptest - log invariants, quorum intersection, state machine determinism)
-- [ ] Implement Jepsen-style consistency tests
+- [x] Implement Jepsen-style consistency tests (12 tests - history recording, linearizability checker, bank account invariant, concurrent operations, fault injection)
 - [ ] Add performance benchmarks
 - [ ] Add stress tests for high write throughput
 
