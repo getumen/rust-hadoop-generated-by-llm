@@ -109,11 +109,13 @@
 
 **Optimizations**:
 - [ ] Batch log entries
+- [ ] Batch metadata updates (multiple files in single Raft commit)
 - [ ] Pipeline AppendEntries
 - [ ] Implement pre-vote to reduce unnecessary elections
 - [ ] Add leadership transfer for graceful shutdown
 - [ ] Optimize heartbeat frequency based on cluster size
 - [ ] Implement log entry compression
+- [ ] Group commit (batch multiple client writes)
 
 ---
 
@@ -299,6 +301,22 @@
 - [ ] Add metrics for read latency by consistency level
 - [ ] Implement streaming block response support (gRPC streaming)
 - [ ] Add read-ahead strategy for sequential workloads
+- [ ] Predictive prefetch for sequential access patterns
+- [ ] Client-side block cache (complement to ChunkServer LRU cache)
+
+---
+
+### Write Path Optimization
+**Status**: Not Started
+**Priority**: 🟡 Medium
+**Effort**: Medium
+**Rationale**: 書き込みレイテンシー削減、スループット向上。
+
+**Tasks**:
+- [ ] Async Replication (1レプリカ確認でACK、残りは非同期)
+- [ ] Write-back buffer on ChunkServer
+- [ ] Parallel block upload from Client
+- [ ] Zero-copy I/O (`sendfile`/`splice` for reduced memory copies)
 
 ---
 
