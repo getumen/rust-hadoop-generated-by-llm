@@ -7,6 +7,7 @@ Google File System (GFS) やHadoop HDFSのアーキテクチャを参考に、Ra
 
 - ✅ **分散ストレージ**: 複数のChunkServerにデータを分散保存
 - ✅ **レプリケーション**: デフォルトで3つのレプリカを作成（冗長性確保）
+- ✅ **読み取り最適化**: 部分読み取り、並行フェッチ、LRUキャッシュ、S3レンジリクエスト最適化（HTTP 206 Partial Content）
 - ✅ **高可用性 (HA)**: RaftコンセンサスアルゴリズムによるMasterの冗長化
 - ✅ **Dynamic Membership Changes**: Raftクラスタの稼働中ノード追加・削除（Joint Consensus、Leader Transfer、Catch-up Protocol）
 - ✅ **ダイナミックシャーディング**: Range-basedシャーディングによる複数のMasterグループでのメタデータ水平分割、負荷に応じた自動シャード分割（Split/Merge）、S3/Colossusスタイルのプレフィックス局所性
@@ -166,7 +167,10 @@ rust-hadoop/
 
 ### ChunkServer RPC
 
+- `WriteBlock`: ブロック書き込み（パイプラインレプリケーション対応）
+- `ReadBlock`: ブロック読み取り（部分読み取り対応: offset/length パラメータ）
 - `ReplicateBlock`: レプリケーション受信
+- `UpdateBlockSize`: ブロックサイズ更新（ファイル完了時）
 
 ### S3 API (REST)
 

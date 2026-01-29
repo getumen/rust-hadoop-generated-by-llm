@@ -36,20 +36,20 @@
 - [x] Fix deprecated `rand` usage in `simple_raft.rs`
 
 ### 7. Read Optimization
-**Status**: **Completed**
+**Status**: **Completed** ✅ (Phase 1)
 **Priority**: High
 **Effort**: Medium
 
-**Solution**:
-- Implement ReadIndex optimization
-- Allow Followers to serve reads with bounded staleness
-- Add read-only mode configuration
-- Partial block reads with offset/length parameters
-- Concurrent block fetching for improved throughput
-- LRU block cache on ChunkServer
-- Optimized S3 range requests
+**Completed Features**:
+- ✅ ReadIndex optimization for Leader reads
+- ✅ Partial block reads with offset/length parameters
+- ✅ Concurrent block fetching for improved throughput
+- ✅ LRU block cache on ChunkServer (configurable via BLOCK_CACHE_SIZE, default: 100 blocks)
+- ✅ Optimized S3 range requests (HTTP 206 Partial Content)
+- ✅ Block size adjustment based on total file size upon completion
+- ✅ Seek-based I/O for efficient partial block reads
 
-**Tasks**:
+**Completed Tasks**:
 - [x] Implement ReadIndex protocol
 - [x] **Partial Read Support**: Added offset/length parameters to ReadBlockRequest/Response
 - [x] **ChunkServer Optimization**: Implemented partial block reads with seek-based I/O
@@ -57,10 +57,14 @@
 - [x] **Concurrent Downloads**: Implemented `get_file_concurrent()` for parallel block fetching
 - [x] **Range Read API**: Added `read_file_range()` method to Client library
 - [x] **S3 Gateway**: Optimized Range requests to use partial reads instead of full downloads
+- [x] **Block Size Adjustment**: ChunkServer updates block size on file completion
+- [x] **Code Quality**: Fixed clippy warnings (saturating_sub, single_match patterns)
+
+**Future Enhancements** (Phase 2):
 - [ ] Add lease-based read optimization
 - [ ] Add configuration for read consistency level
 - [ ] Implement stale read detection
-- [ ] Allow Follower reads
+- [ ] Allow Follower reads with bounded staleness
 - [ ] Add metrics for read latency by consistency level
 - [ ] Implement streaming block response support (gRPC streaming)
 - [ ] Add read-ahead strategy for sequential workloads
@@ -285,5 +289,5 @@ Raft標準のJoint Consensus、Leader Transfer、Catch-upプロトコルを完�
 - 🟢 Storage Efficiency (Erasure Coding)
 - 🟢 Rack Awareness
 
-**Last Updated**: 2026-01-27
+**Last Updated**: 2026-01-29
 **Maintainer**: Development Team
