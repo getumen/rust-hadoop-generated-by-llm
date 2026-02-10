@@ -130,18 +130,18 @@ curl -s http://localhost:50053/raft/state | jq
 toxiproxy-cli toxic add master1_proxy -t latency -a latency=500 -a jitter=50
 ```
 
-### Test 3: Packet Loss
+### Test 3: Connection Instability (Slow Close)
 
-**Scenario**: Introduce 30% packet loss to one node
+**Scenario**: Simulate unstable connection by closing it after a delay
+**Description**: Uses `slow_close` toxic to allow connection establishment but close it after 1s, checking system resilience to unstable peers.
 
 **Expected Behavior**:
-- Cluster tolerates moderate packet loss
 - Raft retries ensure eventual consistency
 - Node may temporarily lag but catches up
 
 **Toxiproxy Command**:
 ```bash
-toxiproxy-cli toxic add master2_proxy -t slow_close -a delay=1000
+toxiproxy-cli toxic add --name slow_close_downstream master2_proxy -t slow_close -a delay=1000
 ```
 
 ### Test 4: Bandwidth Limitation

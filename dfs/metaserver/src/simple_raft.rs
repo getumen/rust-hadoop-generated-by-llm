@@ -665,7 +665,7 @@ impl RaftNode {
             current_leader_address: None,
             last_included_index,
             last_included_term,
-            election_timeout: Duration::from_millis(rand::rng().random_range(1500..3000)),
+            election_timeout: Duration::from_millis(rand::thread_rng().gen_range(1500..3000)),
             last_election_time: Instant::now(),
             inbox,
             self_tx,
@@ -1084,7 +1084,7 @@ impl RaftNode {
         self.voters = HashSet::new();
         self.voters.insert(self.id); // Vote for self
         self.last_election_time = Instant::now();
-        self.election_timeout = Duration::from_millis(rand::rng().random_range(1500..3000));
+        self.election_timeout = Duration::from_millis(rand::thread_rng().gen_range(1500..3000));
 
         tracing::info!(
             "Node {} starting election for term {}",

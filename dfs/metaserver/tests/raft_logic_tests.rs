@@ -484,7 +484,7 @@ fn test_election_timeout_randomization() {
 
     let mut timeouts = Vec::new();
     for _ in 0..10 {
-        let timeout_ms = rand::rng().random_range(1500..3000);
+        let timeout_ms = rand::thread_rng().gen_range(1500..3000);
         timeouts.push(timeout_ms);
     }
 

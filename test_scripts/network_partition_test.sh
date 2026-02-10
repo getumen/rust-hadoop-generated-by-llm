@@ -136,13 +136,29 @@ check_docker_containers() {
     done
 
     if [ "$missing" = "1" ]; then
-        log_warn "Cluster is not running. Starting it now..."
-        docker compose up -d
+        log_warn "Cluster is not running. Starting it now with Toxiproxy..."
+        # Use the toxiproxy-sharded compose file
+        docker compose -f docker-compose.toxiproxy-sharded.yml up -d
 
         log_info "Waiting for cluster readiness (20s)..."
         sleep 20
     else
         log_info "All required Docker containers are running"
+    fi
+
+    # Determine upstream host based on Toxiproxy deployment
+    if docker ps --format '{{.Names}}' | grep -q "^toxiproxy$"; then
+        log_info "Detected Toxiproxy container. Using Docker DNS for upstreams."
+        UPSTREAM_MASTER1_SHARD1="dfs-master1-shard1"
+        UPSTREAM_MASTER1_SHARD2="dfs-master1-shard2"
+        UPSTREAM_CS1_SHARD1="dfs-chunkserver1-shard1"
+        UPSTREAM_CONFIG="dfs-config-server"
+    else
+        log_info "Using localhost for upstreams (Host-based Toxiproxy)."
+        UPSTREAM_MASTER1_SHARD1="localhost"
+        UPSTREAM_MASTER1_SHARD2="localhost"
+        UPSTREAM_CS1_SHARD1="localhost"
+        UPSTREAM_CONFIG="localhost"
     fi
 }
 
@@ -182,24 +198,32 @@ setup_proxies() {
     done
 
     # Create proxies (toxiproxy-cli v2.12+ syntax: name goes last)
-    run_toxiproxy create --listen "localhost:${MASTER1_SHARD1_LISTEN}" --upstream "localhost:${MASTER1_SHARD1_PORT}" "${MASTER1_SHARD1_PROXY}"
-    run_toxiproxy create --listen "localhost:${MASTER1_SHARD2_LISTEN}" --upstream "localhost:${MASTER1_SHARD2_PORT}" "${MASTER1_SHARD2_PROXY}"
-    run_toxiproxy create --listen "localhost:${CS1_SHARD1_LISTEN}" --upstream "localhost:${CS1_SHARD1_PORT}" "${CS1_SHARD1_PROXY}"
-    run_toxiproxy create --listen "localhost:${CONFIG_SERVER_LISTEN}" --upstream "localhost:${CONFIG_SERVER_PORT}" "${CONFIG_SERVER_PROXY}"
+    run_toxiproxy create --listen "0.0.0.0:${MASTER1_SHARD1_LISTEN}" --upstream "${UPSTREAM_MASTER1_SHARD1}:${MASTER1_SHARD1_PORT}" "${MASTER1_SHARD1_PROXY}"
+    run_toxiproxy create --listen "0.0.0.0:${MASTER1_SHARD2_LISTEN}" --upstream "${UPSTREAM_MASTER1_SHARD2}:${MASTER1_SHARD2_PORT}" "${MASTER1_SHARD2_PROXY}"
+    run_toxiproxy create --listen "0.0.0.0:${CS1_SHARD1_LISTEN}" --upstream "${UPSTREAM_CS1_SHARD1}:${CS1_SHARD1_PORT}" "${CS1_SHARD1_PROXY}"
+    run_toxiproxy create --listen "0.0.0.0:${CONFIG_SERVER_LISTEN}" --upstream "${UPSTREAM_CONFIG}:${CONFIG_SERVER_PORT}" "${CONFIG_SERVER_PROXY}"
 
     log_info "Proxies created:"
-    log_info "  master1-shard1: localhost:${MASTER1_SHARD1_LISTEN} -> localhost:${MASTER1_SHARD1_PORT}"
-    log_info "  master1-shard2: localhost:${MASTER1_SHARD2_LISTEN} -> localhost:${MASTER1_SHARD2_PORT}"
-    log_info "  cs1-shard1:     localhost:${CS1_SHARD1_LISTEN} -> localhost:${CS1_SHARD1_PORT}"
-    log_info "  config-server:  localhost:${CONFIG_SERVER_LISTEN} -> localhost:${CONFIG_SERVER_PORT}"
+    log_info "Proxies created:"
+    log_info "  master1-shard1: localhost:${MASTER1_SHARD1_LISTEN} -> ${UPSTREAM_MASTER1_SHARD1}:${MASTER1_SHARD1_PORT}"
+    log_info "  master1-shard2: localhost:${MASTER1_SHARD2_LISTEN} -> ${UPSTREAM_MASTER1_SHARD2}:${MASTER1_SHARD2_PORT}"
+    log_info "  cs1-shard1:     localhost:${CS1_SHARD1_LISTEN} -> ${UPSTREAM_CS1_SHARD1}:${CS1_SHARD1_PORT}"
+    log_info "  config-server:  localhost:${CONFIG_SERVER_LISTEN} -> ${UPSTREAM_CONFIG}:${CONFIG_SERVER_PORT}"
 }
 
-# Cleanup proxies
+# Cleanup proxies and containers
 cleanup_proxies() {
     log_info "Cleaning up Toxiproxy proxies..."
     for proxy in "${MASTER1_SHARD1_PROXY}" "${MASTER1_SHARD2_PROXY}" "${CS1_SHARD1_PROXY}" "${CONFIG_SERVER_PROXY}"; do
         run_toxiproxy delete "${proxy}" 2>/dev/null || true
     done
+
+    # Stop containers if they were started by this script
+    # We check if we are using the toxiproxy-sharded compose file
+    if [ -f "docker-compose.toxiproxy-sharded.yml" ]; then
+        log_info "Stopping cluster..."
+        docker compose -f docker-compose.toxiproxy-sharded.yml down -v >/dev/null 2>&1 || true
+    fi
 }
 
 # ============================================================================
@@ -221,7 +245,8 @@ test_shard_isolation() {
     log_info "  Shard2: $(check_raft_state shard2 ${MASTER1_SHARD2_HTTP})"
 
     # Isolate shard1 master
-    run_toxiproxy toxic add --type timeout --attribute timeout=0 "${MASTER1_SHARD1_PROXY}"
+    # Isolate shard1 master
+    run_toxiproxy toxic add --toxicName timeout_downstream --type timeout --attribute timeout=0 "${MASTER1_SHARD1_PROXY}"
 
     log_info "master1-shard1 is now isolated"
     sleep 3
@@ -240,8 +265,8 @@ test_shard_isolation() {
     fi
 
     # Heal
-    run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" timeout_downstream 2>/dev/null || \
-        run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" timeout 2>/dev/null || true
+    run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" --toxicName timeout_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" -n timeout_downstream 2>/dev/null || true
     sleep 3
 
     log_info "Partition healed"
@@ -258,7 +283,8 @@ test_high_latency() {
     log_info "Expected: Operations slow down but cluster remains functional"
 
     # Add latency
-    run_toxiproxy toxic add --type latency --attribute latency=500 --attribute jitter=50 "${MASTER1_SHARD1_PROXY}"
+    # Add latency
+    run_toxiproxy toxic add --toxicName latency_downstream --type latency --attribute latency=500 --attribute jitter=50 "${MASTER1_SHARD1_PROXY}"
 
     log_info "master1-shard1 now has 500ms±50ms latency"
     sleep 5
@@ -283,8 +309,8 @@ test_high_latency() {
     fi
 
     # Remove latency
-    run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" latency_downstream 2>/dev/null || \
-        run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" latency 2>/dev/null || true
+    run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" --toxicName latency_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" -n latency_downstream 2>/dev/null || true
     sleep 3
 }
 
@@ -301,7 +327,8 @@ test_config_server_isolation() {
     log_info "Config server baseline: $(check_master_health config ${CONFIG_SERVER_HTTP})"
 
     # Isolate config server
-    run_toxiproxy toxic add --type timeout --attribute timeout=0 "${CONFIG_SERVER_PROXY}"
+    # Isolate config server
+    run_toxiproxy toxic add --toxicName timeout_downstream --type timeout --attribute timeout=0 "${CONFIG_SERVER_PROXY}"
 
     log_info "Config server is now isolated"
     sleep 5
@@ -333,8 +360,8 @@ test_config_server_isolation() {
     fi
 
     # Heal
-    run_toxiproxy toxic remove "${CONFIG_SERVER_PROXY}" timeout_downstream 2>/dev/null || \
-        run_toxiproxy toxic remove "${CONFIG_SERVER_PROXY}" timeout 2>/dev/null || true
+    run_toxiproxy toxic remove "${CONFIG_SERVER_PROXY}" --toxicName timeout_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${CONFIG_SERVER_PROXY}" -n timeout_downstream 2>/dev/null || true
     sleep 3
 }
 
@@ -348,7 +375,8 @@ test_chunkserver_disconnection() {
     log_info "Expected: Master detects dead chunkserver after heartbeat timeout (15s)"
 
     # Disconnect chunkserver
-    run_toxiproxy toxic add --type timeout --attribute timeout=0 "${CS1_SHARD1_PROXY}"
+    # Disconnect chunkserver
+    run_toxiproxy toxic add --toxicName timeout_downstream --type timeout --attribute timeout=0 "${CS1_SHARD1_PROXY}"
 
     log_info "chunkserver1-shard1 is now disconnected"
     log_info "Waiting for heartbeat timeout (15s)..."
@@ -368,8 +396,8 @@ test_chunkserver_disconnection() {
     fi
 
     # Heal
-    run_toxiproxy toxic remove "${CS1_SHARD1_PROXY}" timeout_downstream 2>/dev/null || \
-        run_toxiproxy toxic remove "${CS1_SHARD1_PROXY}" timeout 2>/dev/null || true
+    run_toxiproxy toxic remove "${CS1_SHARD1_PROXY}" --toxicName timeout_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${CS1_SHARD1_PROXY}" -n timeout_downstream 2>/dev/null || true
     sleep 3
 }
 
@@ -383,7 +411,8 @@ test_bandwidth_limit() {
     log_info "Expected: Slow replication but master remains functional"
 
     # Add bandwidth limit
-    run_toxiproxy toxic add --type bandwidth --attribute rate=1024 "${MASTER1_SHARD2_PROXY}"
+    # Add bandwidth limit
+    run_toxiproxy toxic add --toxicName bandwidth_downstream --type bandwidth --attribute rate=1024 "${MASTER1_SHARD2_PROXY}"
 
     log_info "master1-shard2 bandwidth limited to 1KB/s"
     sleep 5
@@ -406,8 +435,8 @@ test_bandwidth_limit() {
     fi
 
     # Remove bandwidth limit
-    run_toxiproxy toxic remove "${MASTER1_SHARD2_PROXY}" bandwidth_downstream 2>/dev/null || \
-        run_toxiproxy toxic remove "${MASTER1_SHARD2_PROXY}" bandwidth 2>/dev/null || true
+    run_toxiproxy toxic remove "${MASTER1_SHARD2_PROXY}" --toxicName bandwidth_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${MASTER1_SHARD2_PROXY}" -n bandwidth_downstream 2>/dev/null || true
     sleep 3
 }
 
@@ -420,8 +449,8 @@ main() {
     log_info ""
 
     check_toxiproxy
-    check_toxiproxy_server
     check_docker_containers
+    check_toxiproxy_server
 
     # Trap cleanup on exit
     trap cleanup_proxies EXIT
