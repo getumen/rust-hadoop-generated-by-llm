@@ -9,7 +9,7 @@
 ## 🔴 Tier 1: 運用に必須（最優先）
 
 ### 1. Testing Infrastructure
-**Status**: Basic
+**Status**: Comprehensive (Jepsen-style & Toxiproxy Tests Integrated)
 **Priority**: 🔴 Critical
 **Effort**: Large
 **Rationale**: 本番運用前にネットワーク分断・障害シナリオのテストは必須。Jepsen風テストで信頼性を担保。
@@ -412,5 +412,5 @@ Week 7+:   Raft Performance / Security
 
 ---
 
-**Last Updated**: 2026-01-29
+**Last Updated**: 2026-02-10
 **Maintainer**: Development Team
