@@ -162,6 +162,17 @@ impl Client {
     }
 
     pub async fn create_file(&self, source: &Path, dest: &str) -> anyhow::Result<()> {
+        // 1. Read local file
+        let mut file = File::open(source)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        self.create_file_from_buffer(buffer, dest).await
+    }
+
+    pub async fn create_file_from_buffer(&self, buffer: Vec<u8>, dest: &str) -> anyhow::Result<()> {
+        let buffer_len = buffer.len() as u64;
+
         // 1. Create file on Master
         let (create_resp, success_addr) = self
             .execute_rpc(Some(dest), |mut client| {
@@ -186,14 +197,8 @@ impl Client {
             bail!("Failed to create file: {}", create_resp.error_message);
         }
 
-        // 2. Read local file
-        let mut file = File::open(source)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-
         // 3. Allocate block
         // Use the master that handled create_file successfully to ensure read-your-writes consistency
-        let buffer_len = buffer.len() as u64;
         let alloc_masters = {
             let mut m = vec![success_addr];
             for addr in &self.master_addrs {
@@ -545,6 +550,14 @@ impl Client {
     /// Download file with concurrent block fetching for better performance
     /// This method fetches multiple blocks in parallel
     pub async fn get_file_concurrent(&self, source: &str, dest: &Path) -> anyhow::Result<()> {
+        let data = self.get_file_content(source).await?;
+        let mut file = File::create(dest)?;
+        file.write_all(&data)?;
+        Ok(())
+    }
+
+    /// Fetch file content in memory
+    pub async fn get_file_content(&self, source: &str) -> anyhow::Result<Vec<u8>> {
         // 1. Get file info from Master
         let (info_resp, _) = self
             .execute_rpc(Some(source), |mut client| {
@@ -565,9 +578,7 @@ impl Client {
         let blocks = metadata.blocks;
 
         if blocks.is_empty() {
-            // Create empty file
-            File::create(dest)?;
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // 2. Fetch all blocks concurrently
@@ -578,7 +589,8 @@ impl Client {
             let self_clone = self.clone();
 
             let task = tokio::spawn(async move {
-                Self::fetch_single_block(&self_clone, &block_clone)
+                self_clone
+                    .fetch_single_block(&block_clone)
                     .await
                     .map(|data| (idx, data))
             });
@@ -597,19 +609,19 @@ impl Client {
             }
         }
 
-        // 4. Sort by block index and write to file
+        // 4. Sort by block index and join
         block_data.sort_by_key(|(idx, _)| *idx);
 
-        let mut file = File::create(dest)?;
+        let mut result = Vec::with_capacity(metadata.size as usize);
         for (_, data) in block_data {
-            file.write_all(&data)?;
+            result.extend_from_slice(&data);
         }
 
-        Ok(())
+        Ok(result)
     }
 
     /// Helper function to fetch a single block from any available location
-    async fn fetch_single_block(&self, block: &dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
+    pub async fn fetch_single_block(&self, block: &dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
         if block.locations.is_empty() {
             bail!("Block {} has no locations", block.block_id);
         }

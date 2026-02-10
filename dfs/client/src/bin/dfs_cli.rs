@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use dfs_client::Client;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
@@ -22,6 +23,12 @@ struct Cli {
 
     #[arg(long, default_value_t = 500)]
     initial_backoff_ms: u64,
+
+    #[arg(
+        long,
+        help = "Map internal hostnames to local addresses (e.g. master1:50051=localhost:50051)"
+    )]
+    host_alias: Vec<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -61,6 +68,54 @@ enum Commands {
     },
     /// Trigger background data shuffling for a prefix
     Shuffle {
+        prefix: String,
+    },
+    /// Run performance benchmarks
+    Benchmark {
+        #[command(subcommand)]
+        action: BenchmarkAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BenchmarkAction {
+    /// Benchmark write throughput
+    Write {
+        /// Number of files to create
+        #[arg(short, long, default_value_t = 100)]
+        count: usize,
+        /// Size of each file in bytes
+        #[arg(short, long, default_value_t = 1048576)]
+        size: usize,
+        /// Number of concurrent tasks
+        #[arg(short = 'n', long, default_value_t = 10)]
+        concurrency: usize,
+        /// Prefix for benchmark files
+        #[arg(short, long, default_value = "bench_write")]
+        prefix: String,
+    },
+    /// Benchmark read throughput
+    Read {
+        /// Prefix of files to read
+        #[arg(short, long, default_value = "bench_write")]
+        prefix: String,
+        /// Number of concurrent tasks
+        #[arg(short = 'n', long, default_value_t = 10)]
+        concurrency: usize,
+    },
+    /// Benchmark sustained write throughput (stress test)
+    StressWrite {
+        /// Duration of the test in seconds
+        #[arg(short, long, default_value_t = 30)]
+        duration: u64,
+        /// Size of each file in bytes
+        #[arg(short, long, default_value_t = 1048576)]
+        size: usize,
+        /// Number of concurrent tasks
+        #[arg(short = 'n', long, default_value_t = 10)]
+        concurrency: usize,
+        /// Prefix for benchmark files
+        #[arg(short, long, default_value = "bench_stress")]
         prefix: String,
     },
 }
@@ -113,6 +168,12 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::new(master_addrs, cli.config_servers)
         .with_retry_config(cli.max_retries, cli.initial_backoff_ms);
+
+    for alias_pair in cli.host_alias {
+        if let Some((alias, real)) = alias_pair.split_once('=') {
+            client.add_host_alias(alias.trim(), real.trim());
+        }
+    }
 
     match cli.command {
         Commands::Ls => {
@@ -285,7 +346,276 @@ async fn main() -> anyhow::Result<()> {
             client.initiate_shuffle(&prefix).await?;
             println!("Triggered background shuffling for prefix: {}", prefix);
         }
+        Commands::Benchmark { action } => {
+            match action {
+                BenchmarkAction::Write {
+                    count,
+                    size,
+                    concurrency,
+                    prefix,
+                } => {
+                    println!(
+                        "🚀 Starting Write Benchmark: {} files, {} bytes each, concurrency={}",
+                        count, size, concurrency
+                    );
+
+                    let start = std::time::Instant::now();
+                    let mut latencies = Vec::with_capacity(count);
+                    let mut join_set = tokio::task::JoinSet::new();
+                    let client = Arc::new(client);
+                    let run_id = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+
+                    // Distribute work
+                    for i in 0..count {
+                        let client = Arc::clone(&client);
+                        let prefix = prefix.clone();
+                        join_set.spawn(async move {
+                            let filename = format!("{}/{}/bench_{:010}", prefix, run_id, i);
+                            let data = vec![0u8; size]; // Zero data for speed
+                            let op_start = std::time::Instant::now();
+                            let res = client.create_file_from_buffer(data, &filename).await;
+                            (res, op_start.elapsed())
+                        });
+
+                        // Limit concurrency
+                        if join_set.len() >= concurrency {
+                            if let Some(res) = join_set.join_next().await {
+                                let (res, lat) = res?;
+                                res?;
+                                latencies.push(lat);
+                            }
+                        }
+                    }
+
+                    // Wait for remaining
+                    while let Some(res) = join_set.join_next().await {
+                        let (res, lat) = res?;
+                        res?;
+                        latencies.push(lat);
+                    }
+
+                    let total_duration = start.elapsed();
+                    print_stats("Write", count, size, total_duration, latencies);
+                }
+                BenchmarkAction::Read {
+                    prefix,
+                    concurrency,
+                } => {
+                    println!(
+                        "🚀 Starting Read Benchmark: prefix={}, concurrency={}",
+                        prefix, concurrency
+                    );
+
+                    // 1. List files
+                    let all_files = client.list_all_files().await?;
+                    let target_files: Vec<String> = all_files
+                        .into_iter()
+                        .filter(|f| f.starts_with(&prefix))
+                        .collect();
+
+                    if target_files.is_empty() {
+                        println!("No files found matching prefix: {}", prefix);
+                        return Ok(());
+                    }
+
+                    println!("Found {} files to read", target_files.len());
+
+                    let start = std::time::Instant::now();
+                    let mut latencies = Vec::with_capacity(target_files.len());
+                    let mut total_bytes = 0;
+                    let mut join_set = tokio::task::JoinSet::new();
+                    let client = Arc::new(client);
+
+                    for filename in target_files {
+                        let client = Arc::clone(&client);
+                        join_set.spawn(async move {
+                            let op_start = std::time::Instant::now();
+                            let res = client.get_file_content(&filename).await;
+                            (res, op_start.elapsed())
+                        });
+
+                        if join_set.len() >= concurrency {
+                            if let Some(res) = join_set.join_next().await {
+                                let (res, lat) = res?;
+                                let data = res?;
+                                total_bytes += data.len();
+                                latencies.push(lat);
+                            }
+                        }
+                    }
+
+                    while let Some(res) = join_set.join_next().await {
+                        let (res, lat) = res?;
+                        let data = res?;
+                        total_bytes += data.len();
+                        latencies.push(lat);
+                    }
+
+                    let total_duration = start.elapsed();
+                    print_stats(
+                        "Read",
+                        latencies.len(),
+                        total_bytes / latencies.len().max(1),
+                        total_duration,
+                        latencies,
+                    );
+                }
+                BenchmarkAction::StressWrite {
+                    duration,
+                    size,
+                    concurrency,
+                    prefix,
+                } => {
+                    println!(
+                        "🔥 Starting Write Stress Test: duration={}s, size={} bytes, concurrency={}",
+                        duration, size, concurrency
+                    );
+
+                    let start = std::time::Instant::now();
+                    let end_time = start + std::time::Duration::from_secs(duration);
+                    let mut latencies = Vec::new();
+                    let mut join_set = tokio::task::JoinSet::new();
+                    let client = Arc::new(client);
+                    let run_id = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+
+                    let mut total_ops = 0;
+                    let mut success_count = 0;
+                    let mut error_count = 0;
+
+                    let mut last_report = std::time::Instant::now();
+
+                    loop {
+                        let now = std::time::Instant::now();
+                        if now >= end_time && join_set.is_empty() {
+                            break;
+                        }
+
+                        // Report progress every 5 seconds
+                        if now.duration_since(last_report).as_secs() >= 5 {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            let current_throughput =
+                                (success_count as f64 * size as f64) / (1024.0 * 1024.0) / elapsed;
+                            println!(
+                                "⏱️  Progress: {}s/{}s, Success: {}, Errors: {}, Current Throughput: {:.2} MB/s",
+                                elapsed.round(),
+                                duration,
+                                success_count,
+                                error_count,
+                                current_throughput
+                            );
+                            last_report = now;
+                        }
+
+                        // Spawn new tasks if under concurrency limit and time remains
+                        while join_set.len() < concurrency && std::time::Instant::now() < end_time {
+                            let client = Arc::clone(&client);
+                            let filename =
+                                format!("{}/{}/stress_{:010}", prefix, run_id, total_ops);
+                            let data = vec![0u8; size];
+                            join_set.spawn(async move {
+                                let op_start = std::time::Instant::now();
+                                let res = client.create_file_from_buffer(data, &filename).await;
+                                (res, op_start.elapsed())
+                            });
+                            total_ops += 1;
+                        }
+
+                        // Collect results
+                        tokio::select! {
+                            res = join_set.join_next(), if !join_set.is_empty() => {
+                                if let Some(res) = res {
+                                    match res {
+                                        Ok((Ok(_), lat)) => {
+                                            success_count += 1;
+                                            latencies.push(lat);
+                                        }
+                                        Ok((Err(e), _)) => {
+                                            error_count += 1;
+                                            tracing::error!("Stress test operation failed: {}", e);
+                                        }
+                                        Err(e) => {
+                                            error_count += 1;
+                                            tracing::error!("Task Join Error: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(10)), if join_set.is_empty() && std::time::Instant::now() < end_time => {
+                                // Just wait a bit to avoid busy loop if throttled
+                            }
+                            else => {
+                                if std::time::Instant::now() >= end_time && join_set.is_empty() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let total_duration = start.elapsed();
+                    println!("\n🚨 Stress Test Completed!");
+                    println!("Total Success: {}", success_count);
+                    println!("Total Errors:  {}", error_count);
+                    print_stats(
+                        "Stress Write",
+                        success_count,
+                        size,
+                        total_duration,
+                        latencies,
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_stats(
+    name: &str,
+    count: usize,
+    avg_size: usize,
+    total_duration: std::time::Duration,
+    mut latencies: Vec<std::time::Duration>,
+) {
+    let total_size_mb = (count as f64 * avg_size as f64) / (1024.0 * 1024.0);
+    let throughput = total_size_mb / total_duration.as_secs_f64();
+    let ops_per_sec = count as f64 / total_duration.as_secs_f64();
+
+    latencies.sort();
+    let min = latencies.first().cloned().unwrap_or_default();
+    let max = latencies.last().cloned().unwrap_or_default();
+    let avg = if latencies.is_empty() {
+        std::time::Duration::default()
+    } else {
+        latencies.iter().sum::<std::time::Duration>() / latencies.len() as u32
+    };
+    let p95 = latencies
+        .get(latencies.len() * 95 / 100)
+        .cloned()
+        .unwrap_or_default();
+    let p99 = latencies
+        .get(latencies.len() * 99 / 100)
+        .cloned()
+        .unwrap_or_default();
+
+    println!("\n📊 {} Benchmark Results:", name);
+    println!("----------------------------------------");
+    println!("Total Operations:  {}", count);
+    println!("Total Time:        {:.2?}", total_duration);
+    println!("Throughput:        {:.2} MB/s", throughput);
+    println!("Throughput (OPS):  {:.2} ops/s", ops_per_sec);
+    println!();
+    println!("Latency Statistics:");
+    println!("  Min:  {:.2?}", min);
+    println!("  Avg:  {:.2?}", avg);
+    println!("  P95:  {:.2?}", p95);
+    println!("  P99:  {:.2?}", p99);
+    println!("  Max:  {:.2?}", max);
+    println!("----------------------------------------");
 }
