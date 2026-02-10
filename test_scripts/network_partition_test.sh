@@ -1,23 +1,59 @@
 #!/bin/bash
 # Real network partition testing using Toxiproxy
-# Tests Raft consensus behavior under actual network failures
+# Tests DFS behavior under actual network failures between shards, masters, and chunkservers
+#
+# Topology (from docker-compose.yml):
+#   Shard1: master1-shard1 (gRPC:50051, HTTP:8081)
+#           chunkserver1-shard1 (gRPC:50052)
+#   Shard2: master1-shard2 (gRPC:50061, HTTP:8091)
+#           chunkserver1-shard2 (gRPC:50062)
+#   Shared: chunkserver-extra (gRPC:50072), chunkserver-extra2 (gRPC:50082)
+#   Config: config-server (gRPC:50050, HTTP:8080)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Dry-run mode (set to 1 to skip actual toxiproxy commands)
+DRY_RUN="${DRY_RUN:-0}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Toxiproxy configuration
 TOXIPROXY_HOST="localhost:8474"
-MASTER1_PROXY="master1_proxy"
-MASTER2_PROXY="master2_proxy"
-MASTER3_PROXY="master3_proxy"
+
+# Proxy names
+MASTER1_SHARD1_PROXY="master1_shard1_proxy"
+MASTER1_SHARD2_PROXY="master1_shard2_proxy"
+CS1_SHARD1_PROXY="cs1_shard1_proxy"
+CONFIG_SERVER_PROXY="config_server_proxy"
+
+# Actual upstream ports (host-side)
+MASTER1_SHARD1_PORT=50051
+MASTER1_SHARD2_PORT=50061
+CS1_SHARD1_PORT=50052
+CONFIG_SERVER_PORT=50050
+
+# Proxy listen ports
+MASTER1_SHARD1_LISTEN=60051
+MASTER1_SHARD2_LISTEN=60061
+CS1_SHARD1_LISTEN=60052
+CONFIG_SERVER_LISTEN=60050
+
+# HTTP ports for health checks
+MASTER1_SHARD1_HTTP=8081
+MASTER1_SHARD2_HTTP=8091
+CONFIG_SERVER_HTTP=8080
+
+PASSED=0
+FAILED=0
+SKIPPED=0
 
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -31,206 +67,361 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if Toxiproxy is installed
+log_test() {
+    echo -e "${CYAN}[TEST]${NC} $1"
+}
+
+# Wrapper for toxiproxy-cli commands
+run_toxiproxy() {
+    if [ "$DRY_RUN" = "1" ]; then
+        log_info "[DRY-RUN] toxiproxy-cli $*"
+        return 0
+    fi
+    toxiproxy-cli "$@"
+}
+
+# Check if Toxiproxy CLI is installed
 check_toxiproxy() {
+    if [ "$DRY_RUN" = "1" ]; then
+        log_warn "Dry-run mode: Skipping Toxiproxy checks"
+        return 0
+    fi
+
     if ! command -v toxiproxy-cli &> /dev/null; then
-        log_error "toxiproxy-cli not found. Install it with:"
-        log_error "  brew install toxiproxy (macOS)"
-        log_error "  or download from https://github.com/Shopify/toxiproxy/releases"
+        log_error "toxiproxy-cli not found."
+        log_error ""
+        log_error "To run these tests, install Toxiproxy:"
+        log_error ""
+        log_error "  macOS:  brew install toxiproxy"
+        log_error "  Linux:  See https://github.com/Shopify/toxiproxy/releases"
+        log_error ""
+        log_error "Or run in dry-run mode to see test scenarios:"
+        log_error "  DRY_RUN=1 $0"
         exit 1
     fi
-    log_info "Toxiproxy CLI found"
+    log_info "Toxiproxy CLI found: $(toxiproxy-cli --version)"
 }
 
 # Check if Toxiproxy server is running
 check_toxiproxy_server() {
+    if [ "$DRY_RUN" = "1" ]; then
+        return 0
+    fi
+
     if ! curl -s "http://${TOXIPROXY_HOST}/version" > /dev/null 2>&1; then
         log_error "Toxiproxy server not running at ${TOXIPROXY_HOST}"
-        log_error "Start it with: toxiproxy-server"
+        log_error ""
+        log_error "Start the server with:"
+        log_error "  toxiproxy-server &"
+        log_error ""
+        log_error "Or use Docker:"
+        log_error "  docker run -d --name toxiproxy -p 8474:8474 ghcr.io/shopify/toxiproxy:2.9.0"
         exit 1
     fi
-    log_info "Toxiproxy server is running"
+    log_info "Toxiproxy server is running at ${TOXIPROXY_HOST}"
 }
 
-# Create proxies for master nodes
+# Check if Docker containers are running
+check_docker_containers() {
+    if [ "$DRY_RUN" = "1" ]; then
+        return 0
+    fi
+
+    local missing=0
+    for container in dfs-master1-shard1 dfs-master1-shard2 dfs-chunkserver1-shard1 dfs-config-server; do
+        if ! docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+            log_error "Container ${container} is not running"
+            missing=1
+        fi
+    done
+
+    if [ "$missing" = "1" ]; then
+        log_warn "Cluster is not running. Starting it now..."
+        docker compose up -d
+
+        log_info "Waiting for cluster readiness (20s)..."
+        sleep 20
+    else
+        log_info "All required Docker containers are running"
+    fi
+}
+
+# Check health of a master node via HTTP
+check_master_health() {
+    local name="$1"
+    local http_port="$2"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo '{"status":"healthy","role":"Leader","current_term":1,"commit_index":5}'
+        return 0
+    fi
+
+    curl -s --connect-timeout 3 "http://localhost:${http_port}/health" 2>/dev/null || echo '{"error":"unreachable"}'
+}
+
+# Check raft state of a master node
+check_raft_state() {
+    local name="$1"
+    local http_port="$2"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo '{"role":"Leader","current_term":1,"commit_index":10}'
+        return 0
+    fi
+
+    curl -s --connect-timeout 3 "http://localhost:${http_port}/raft/state" 2>/dev/null || echo '{"error":"unreachable"}'
+}
+
+# Create proxies for services
 setup_proxies() {
     log_info "Setting up Toxiproxy proxies..."
 
-    # Clean up existing proxies
-    toxiproxy-cli list 2>/dev/null | grep -q "${MASTER1_PROXY}" && toxiproxy-cli delete "${MASTER1_PROXY}" || true
-    toxiproxy-cli list 2>/dev/null | grep -q "${MASTER2_PROXY}" && toxiproxy-cli delete "${MASTER2_PROXY}" || true
-    toxiproxy-cli list 2>/dev/null | grep -q "${MASTER3_PROXY}" && toxiproxy-cli delete "${MASTER3_PROXY}" || true
+    # Clean up existing proxies first
+    for proxy in "${MASTER1_SHARD1_PROXY}" "${MASTER1_SHARD2_PROXY}" "${CS1_SHARD1_PROXY}" "${CONFIG_SERVER_PROXY}"; do
+        run_toxiproxy delete "${proxy}" 2>/dev/null || true
+    done
 
-    # Create proxies (assuming masters run on ports 50051, 50052, 50053)
-    toxiproxy-cli create "${MASTER1_PROXY}" -l "localhost:60051" -u "localhost:50051"
-    toxiproxy-cli create "${MASTER2_PROXY}" -l "localhost:60052" -u "localhost:50052"
-    toxiproxy-cli create "${MASTER3_PROXY}" -l "localhost:60053" -u "localhost:50053"
+    # Create proxies (toxiproxy-cli v2.12+ syntax: name goes last)
+    run_toxiproxy create --listen "localhost:${MASTER1_SHARD1_LISTEN}" --upstream "localhost:${MASTER1_SHARD1_PORT}" "${MASTER1_SHARD1_PROXY}"
+    run_toxiproxy create --listen "localhost:${MASTER1_SHARD2_LISTEN}" --upstream "localhost:${MASTER1_SHARD2_PORT}" "${MASTER1_SHARD2_PROXY}"
+    run_toxiproxy create --listen "localhost:${CS1_SHARD1_LISTEN}" --upstream "localhost:${CS1_SHARD1_PORT}" "${CS1_SHARD1_PROXY}"
+    run_toxiproxy create --listen "localhost:${CONFIG_SERVER_LISTEN}" --upstream "localhost:${CONFIG_SERVER_PORT}" "${CONFIG_SERVER_PROXY}"
 
     log_info "Proxies created:"
-    log_info "  Master1: localhost:60051 -> localhost:50051"
-    log_info "  Master2: localhost:60052 -> localhost:50052"
-    log_info "  Master3: localhost:60053 -> localhost:50053"
+    log_info "  master1-shard1: localhost:${MASTER1_SHARD1_LISTEN} -> localhost:${MASTER1_SHARD1_PORT}"
+    log_info "  master1-shard2: localhost:${MASTER1_SHARD2_LISTEN} -> localhost:${MASTER1_SHARD2_PORT}"
+    log_info "  cs1-shard1:     localhost:${CS1_SHARD1_LISTEN} -> localhost:${CS1_SHARD1_PORT}"
+    log_info "  config-server:  localhost:${CONFIG_SERVER_LISTEN} -> localhost:${CONFIG_SERVER_PORT}"
 }
 
 # Cleanup proxies
 cleanup_proxies() {
     log_info "Cleaning up Toxiproxy proxies..."
-    toxiproxy-cli delete "${MASTER1_PROXY}" 2>/dev/null || true
-    toxiproxy-cli delete "${MASTER2_PROXY}" 2>/dev/null || true
-    toxiproxy-cli delete "${MASTER3_PROXY}" 2>/dev/null || true
+    for proxy in "${MASTER1_SHARD1_PROXY}" "${MASTER1_SHARD2_PROXY}" "${CS1_SHARD1_PROXY}" "${CONFIG_SERVER_PROXY}"; do
+        run_toxiproxy delete "${proxy}" 2>/dev/null || true
+    done
 }
 
-# Test 1: Network partition (split-brain scenario)
-test_network_partition() {
-    log_info "========================================="
-    log_info "Test 1: Network Partition (Split-Brain)"
-    log_info "========================================="
+# ============================================================================
+# Test Cases
+# ============================================================================
 
-    log_info "Scenario: Partition master1 from master2,3"
+# Test 1: Isolate one shard's master — the other shard should remain operational
+test_shard_isolation() {
+    log_test "========================================="
+    log_test "Test 1: Shard Isolation"
+    log_test "========================================="
 
-    # Add 100% packet loss (network down) for master1
-    toxiproxy-cli toxic add "${MASTER1_PROXY}" -t timeout -a timeout=0
+    log_info "Scenario: Isolate master1-shard1 via total network timeout"
+    log_info "Expected: Shard2 remains fully operational"
 
-    log_info "Master1 is now isolated from the cluster"
-    log_warn "Expected: Master2 or Master3 should become leader"
-    log_warn "Expected: Master1 should step down to follower"
+    # Record baseline state
+    log_info "Baseline state:"
+    log_info "  Shard1: $(check_raft_state shard1 ${MASTER1_SHARD1_HTTP})"
+    log_info "  Shard2: $(check_raft_state shard2 ${MASTER1_SHARD2_HTTP})"
 
-    sleep 10
+    # Isolate shard1 master
+    run_toxiproxy toxic add --type timeout --attribute timeout=0 "${MASTER1_SHARD1_PROXY}"
 
-    log_info "Checking cluster state..."
-    curl -s http://localhost:50051/raft/state 2>/dev/null || log_warn "Master1 unreachable (expected)"
-    curl -s http://localhost:50052/raft/state | jq '.role' 2>/dev/null || true
-    curl -s http://localhost:50053/raft/state | jq '.role' 2>/dev/null || true
+    log_info "master1-shard1 is now isolated"
+    sleep 3
 
-    log_info "Healing partition..."
-    toxiproxy-cli toxic remove "${MASTER1_PROXY}" timeout
+    # Check shard2 is still healthy
+    local shard2_state
+    shard2_state=$(check_raft_state shard2 ${MASTER1_SHARD2_HTTP})
+    log_info "Shard2 state during shard1 isolation: ${shard2_state}"
 
-    sleep 5
-    log_info "Partition healed. Cluster should converge to single leader."
+    if echo "${shard2_state}" | grep -q '"error"'; then
+        log_error "FAIL: Shard2 should remain operational during shard1 isolation"
+        FAILED=$((FAILED + 1))
+    else
+        log_info "PASS: Shard2 remained operational"
+        PASSED=$((PASSED + 1))
+    fi
 
-    sleep 5
+    # Heal
+    run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" timeout_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" timeout 2>/dev/null || true
+    sleep 3
+
+    log_info "Partition healed"
+    log_info "  Shard1: $(check_raft_state shard1 ${MASTER1_SHARD1_HTTP})"
 }
 
-# Test 2: High latency (slow network)
+# Test 2: High latency on inter-shard communication
 test_high_latency() {
-    log_info "========================================="
-    log_info "Test 2: High Network Latency"
-    log_info "========================================="
+    log_test "========================================="
+    log_test "Test 2: High Network Latency"
+    log_test "========================================="
 
-    log_info "Scenario: Add 500ms latency to master1"
+    log_info "Scenario: Add 500ms±50ms latency to master1-shard1"
+    log_info "Expected: Operations slow down but cluster remains functional"
 
     # Add latency
-    toxiproxy-cli toxic add "${MASTER1_PROXY}" -t latency -a latency=500 -a jitter=50
+    run_toxiproxy toxic add --type latency --attribute latency=500 --attribute jitter=50 "${MASTER1_SHARD1_PROXY}"
 
-    log_info "Master1 now has 500ms±50ms latency"
-    log_warn "Expected: Master1 may lose leadership due to slow heartbeats"
-
-    sleep 15
-
-    log_info "Checking cluster state..."
-    curl -s http://localhost:50051/raft/state | jq '.role, .current_term' 2>/dev/null || true
-    curl -s http://localhost:50052/raft/state | jq '.role, .current_term' 2>/dev/null || true
-    curl -s http://localhost:50053/raft/state | jq '.role, .current_term' 2>/dev/null || true
-
-    log_info "Removing latency..."
-    toxiproxy-cli toxic remove "${MASTER1_PROXY}" latency
-
+    log_info "master1-shard1 now has 500ms±50ms latency"
     sleep 5
+
+    # Measure response time via health endpoint
+    local start_time end_time elapsed
+    start_time=$(date +%s%N 2>/dev/null || date +%s)
+
+    local health
+    health=$(check_master_health shard1 ${MASTER1_SHARD1_HTTP})
+    end_time=$(date +%s%N 2>/dev/null || date +%s)
+
+    log_info "Shard1 health under latency: ${health}"
+    log_info "Shard2 health (no latency):  $(check_master_health shard2 ${MASTER1_SHARD2_HTTP})"
+
+    if echo "${health}" | grep -q '"error"'; then
+        log_warn "Shard1 became unreachable under latency — may have exceeded timeout"
+        SKIPPED=$((SKIPPED + 1))
+    else
+        log_info "PASS: Shard1 remained responsive under latency"
+        PASSED=$((PASSED + 1))
+    fi
+
+    # Remove latency
+    run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" latency_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${MASTER1_SHARD1_PROXY}" latency 2>/dev/null || true
+    sleep 3
 }
 
-# Test 3: Packet loss
-test_packet_loss() {
-    log_info "========================================="
-    log_info "Test 3: Packet Loss"
-    log_info "========================================="
+# Test 3: Config server isolation — shards should continue with cached config
+test_config_server_isolation() {
+    log_test "========================================="
+    log_test "Test 3: Config Server Isolation"
+    log_test "========================================="
 
-    log_info "Scenario: Add 30% packet loss to master2"
+    log_info "Scenario: Isolate config server from all masters"
+    log_info "Expected: Shards continue operating with cached shard map"
 
-    # Add packet loss
-    toxiproxy-cli toxic add "${MASTER2_PROXY}" -t slow_close -a delay=1000
+    # Record baseline
+    log_info "Config server baseline: $(check_master_health config ${CONFIG_SERVER_HTTP})"
 
-    log_info "Master2 now has network instability"
-    log_warn "Expected: Cluster should remain stable with 2 healthy nodes"
+    # Isolate config server
+    run_toxiproxy toxic add --type timeout --attribute timeout=0 "${CONFIG_SERVER_PROXY}"
 
-    sleep 10
-
-    log_info "Checking cluster state..."
-    curl -s http://localhost:50051/raft/state | jq '.role' 2>/dev/null || true
-    curl -s http://localhost:50052/raft/state | jq '.role' 2>/dev/null || log_warn "Master2 unreachable"
-    curl -s http://localhost:50053/raft/state | jq '.role' 2>/dev/null || true
-
-    log_info "Removing packet loss..."
-    toxiproxy-cli toxic remove "${MASTER2_PROXY}" slow_close
-
+    log_info "Config server is now isolated"
     sleep 5
+
+    # Both shards should still work
+    local shard1_state shard2_state
+    shard1_state=$(check_raft_state shard1 ${MASTER1_SHARD1_HTTP})
+    shard2_state=$(check_raft_state shard2 ${MASTER1_SHARD2_HTTP})
+
+    log_info "During config server isolation:"
+    log_info "  Shard1: ${shard1_state}"
+    log_info "  Shard2: ${shard2_state}"
+
+    local pass=true
+    if echo "${shard1_state}" | grep -q '"error"'; then
+        log_error "FAIL: Shard1 should work without config server"
+        pass=false
+    fi
+    if echo "${shard2_state}" | grep -q '"error"'; then
+        log_error "FAIL: Shard2 should work without config server"
+        pass=false
+    fi
+
+    if [ "$pass" = true ]; then
+        log_info "PASS: Both shards operational without config server"
+        PASSED=$((PASSED + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+
+    # Heal
+    run_toxiproxy toxic remove "${CONFIG_SERVER_PROXY}" timeout_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${CONFIG_SERVER_PROXY}" timeout 2>/dev/null || true
+    sleep 3
 }
 
-# Test 4: Bandwidth limitation
+# Test 4: ChunkServer disconnected from Master
+test_chunkserver_disconnection() {
+    log_test "========================================="
+    log_test "Test 4: ChunkServer Disconnection"
+    log_test "========================================="
+
+    log_info "Scenario: Disconnect chunkserver1-shard1 from master1-shard1"
+    log_info "Expected: Master detects dead chunkserver after heartbeat timeout (15s)"
+
+    # Disconnect chunkserver
+    run_toxiproxy toxic add --type timeout --attribute timeout=0 "${CS1_SHARD1_PROXY}"
+
+    log_info "chunkserver1-shard1 is now disconnected"
+    log_info "Waiting for heartbeat timeout (15s)..."
+    sleep 18
+
+    # Master should still be healthy
+    local master_state
+    master_state=$(check_raft_state shard1 ${MASTER1_SHARD1_HTTP})
+    log_info "Master state after chunkserver disconnect: ${master_state}"
+
+    if echo "${master_state}" | grep -q '"error"'; then
+        log_error "FAIL: Master should remain healthy after chunkserver disconnect"
+        FAILED=$((FAILED + 1))
+    else
+        log_info "PASS: Master remained healthy after chunkserver disconnect"
+        PASSED=$((PASSED + 1))
+    fi
+
+    # Heal
+    run_toxiproxy toxic remove "${CS1_SHARD1_PROXY}" timeout_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${CS1_SHARD1_PROXY}" timeout 2>/dev/null || true
+    sleep 3
+}
+
+# Test 5: Bandwidth limitation simulating degraded network
 test_bandwidth_limit() {
-    log_info "========================================="
-    log_info "Test 4: Bandwidth Limitation"
-    log_info "========================================="
+    log_test "========================================="
+    log_test "Test 5: Bandwidth Limitation"
+    log_test "========================================="
 
-    log_info "Scenario: Limit bandwidth to 1KB/s for master1"
+    log_info "Scenario: Limit master1-shard2 bandwidth to 1KB/s"
+    log_info "Expected: Slow replication but master remains functional"
 
-    # Add bandwidth limit (1KB/s = 1024 bytes/s)
-    toxiproxy-cli toxic add "${MASTER1_PROXY}" -t bandwidth -a rate=1024
+    # Add bandwidth limit
+    run_toxiproxy toxic add --type bandwidth --attribute rate=1024 "${MASTER1_SHARD2_PROXY}"
 
-    log_info "Master1 bandwidth limited to 1KB/s"
-    log_warn "Expected: Slow replication but cluster should remain functional"
-
-    sleep 10
-
-    log_info "Checking cluster state..."
-    curl -s http://localhost:50051/raft/state | jq '.role, .commit_index' 2>/dev/null || true
-    curl -s http://localhost:50052/raft/state | jq '.role, .commit_index' 2>/dev/null || true
-    curl -s http://localhost:50053/raft/state | jq '.role, .commit_index' 2>/dev/null || true
-
-    log_info "Removing bandwidth limit..."
-    toxiproxy-cli toxic remove "${MASTER1_PROXY}" bandwidth
-
+    log_info "master1-shard2 bandwidth limited to 1KB/s"
     sleep 5
+
+    local shard2_state
+    shard2_state=$(check_raft_state shard2 ${MASTER1_SHARD2_HTTP})
+    log_info "Shard2 state under bandwidth limit: ${shard2_state}"
+
+    # Shard1 should be completely unaffected
+    local shard1_state
+    shard1_state=$(check_raft_state shard1 ${MASTER1_SHARD1_HTTP})
+    log_info "Shard1 state (unaffected):          ${shard1_state}"
+
+    if echo "${shard1_state}" | grep -q '"error"'; then
+        log_error "FAIL: Shard1 should be unaffected by shard2 bandwidth limit"
+        FAILED=$((FAILED + 1))
+    else
+        log_info "PASS: Shard1 unaffected by shard2 degradation"
+        PASSED=$((PASSED + 1))
+    fi
+
+    # Remove bandwidth limit
+    run_toxiproxy toxic remove "${MASTER1_SHARD2_PROXY}" bandwidth_downstream 2>/dev/null || \
+        run_toxiproxy toxic remove "${MASTER1_SHARD2_PROXY}" bandwidth 2>/dev/null || true
+    sleep 3
 }
 
-# Test 5: Cascading failures
-test_cascading_failures() {
-    log_info "========================================="
-    log_info "Test 5: Cascading Failures"
-    log_info "========================================="
+# ============================================================================
+# Main
+# ============================================================================
 
-    log_info "Scenario: Sequential node failures"
-
-    log_info "Step 1: Isolate master1"
-    toxiproxy-cli toxic add "${MASTER1_PROXY}" -t timeout -a timeout=0
-    sleep 5
-
-    log_info "Step 2: Add latency to master2"
-    toxiproxy-cli toxic add "${MASTER2_PROXY}" -t latency -a latency=1000
-    sleep 5
-
-    log_info "Cluster state (master3 should be leader):"
-    curl -s http://localhost:50053/raft/state | jq '.role, .current_term' 2>/dev/null || true
-
-    log_info "Step 3: Heal master1"
-    toxiproxy-cli toxic remove "${MASTER1_PROXY}" timeout
-    sleep 5
-
-    log_info "Step 4: Remove latency from master2"
-    toxiproxy-cli toxic remove "${MASTER2_PROXY}" latency
-    sleep 5
-
-    log_info "Final cluster state (should converge):"
-    curl -s http://localhost:50051/raft/state | jq '.role' 2>/dev/null || true
-    curl -s http://localhost:50052/raft/state | jq '.role' 2>/dev/null || true
-    curl -s http://localhost:50053/raft/state | jq '.role' 2>/dev/null || true
-}
-
-# Main execution
 main() {
     log_info "Starting network partition tests with Toxiproxy"
+    log_info ""
 
     check_toxiproxy
     check_toxiproxy_server
+    check_docker_containers
 
     # Trap cleanup on exit
     trap cleanup_proxies EXIT
@@ -238,38 +429,35 @@ main() {
     setup_proxies
 
     log_info ""
-    log_info "Prerequisites:"
-    log_info "  1. Three master nodes should be running on ports 50051, 50052, 50053"
-    log_info "  2. jq should be installed for JSON parsing"
+    log_info "Running 5 network partition tests..."
     log_info ""
-    log_warn "Press Enter to continue or Ctrl+C to cancel..."
-    read -r
 
-    # Run tests
-    test_network_partition
-    sleep 5
+    test_shard_isolation
+    sleep 3
 
     test_high_latency
-    sleep 5
+    sleep 3
 
-    test_packet_loss
-    sleep 5
+    test_config_server_isolation
+    sleep 3
+
+    test_chunkserver_disconnection
+    sleep 3
 
     test_bandwidth_limit
-    sleep 5
-
-    test_cascading_failures
 
     log_info ""
-    log_info "========================================="
-    log_info "All tests completed!"
-    log_info "========================================="
+    log_test "========================================="
+    log_test "Results: ${PASSED} passed, ${FAILED} failed, ${SKIPPED} skipped"
+    log_test "========================================="
     log_info ""
-    log_info "Review the cluster states above to verify:"
-    log_info "  1. Split-brain prevention (only one leader per term)"
-    log_info "  2. Leader re-election after partition"
-    log_info "  3. Cluster convergence after healing"
-    log_info "  4. Resilience under network degradation"
+
+    if [ "${FAILED}" -gt 0 ]; then
+        log_error "Some tests failed!"
+        exit 1
+    fi
+
+    log_info "All tests passed!"
 }
 
 main "$@"

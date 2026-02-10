@@ -6,8 +6,8 @@ services:
     container_name: dfs-config-server-test
     command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://config-server:50050
     ports:
-      - "50050:50050"
-      - "8080:8080"
+      - "50090:50050"
+      - "8090:8080"
     networks:
       - dfs-test-network
     volumes:
@@ -18,8 +18,8 @@ services:
     container_name: dfs-master-test
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master-test:50051 --shard-id shard-1 --config-servers http://config-server:50050 --split-threshold-rps 2.0 --merge-threshold-rps 0.5 --split-cooldown-secs 10
     ports:
-      - "50051:50051"
-      - "8081:8080"
+      - "50091:50051"
+      - "8092:8080"
     networks:
       - dfs-test-network
     depends_on:
