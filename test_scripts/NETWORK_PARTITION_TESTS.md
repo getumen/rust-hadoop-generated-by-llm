@@ -76,12 +76,12 @@ cargo run --bin master -- --node-id 3 --port 50053
 
 1. **Start the cluster with Toxiproxy**:
 ```bash
-docker-compose -f docker-compose.toxiproxy.yml up -d
+docker compose -f docker-compose.toxiproxy.yml up -d
 ```
 
 2. **Verify all services are running**:
 ```bash
-docker-compose -f docker-compose.toxiproxy.yml ps
+docker compose -f docker-compose.toxiproxy.yml ps
 ```
 
 3. **Run tests**:
@@ -91,7 +91,7 @@ docker-compose -f docker-compose.toxiproxy.yml ps
 
 4. **Stop the cluster**:
 ```bash
-docker-compose -f docker-compose.toxiproxy.yml down -v
+docker compose -f docker-compose.toxiproxy.yml down -v
 ```
 
 ## Test Scenarios
@@ -259,7 +259,7 @@ curl http://localhost:50052/health
 curl http://localhost:50053/health
 
 # Check logs
-docker-compose -f docker-compose.toxiproxy.yml logs master1
+docker compose -f docker-compose.toxiproxy.yml logs master1
 ```
 
 ## Advanced Scenarios
