@@ -29,7 +29,7 @@ echo "Hello from Rust Hadoop DFS! Testing rename operation." > rename_test.txt
 
 # Start cluster
 echo "🚀 Starting cluster..."
-docker-compose up -d --build
+docker compose up -d --build
 echo "Waiting for cluster (15s)..."
 sleep 15
 
@@ -130,7 +130,7 @@ fi
 # ============================================================================
 echo ""
 echo "🧹 Cleanup..."
-docker-compose down -v
+docker compose down -v
 rm -f rename_test.txt renamed_downloaded.txt nested_downloaded.txt
 
 echo ""
