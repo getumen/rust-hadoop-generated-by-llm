@@ -109,8 +109,28 @@ cargo test -- --include-ignored
 | `transaction_abort_test.sh` | クロスシャード操作失敗時のロールバック（Abort）テスト      |
 | `fault_recovery_test.sh`    | トランザクション中のシャード障害からの復旧テスト           |
 | `auto_scaling_test.sh`      | 負荷に応じたシャード自動分割（Dynamic Sharding）のテスト   |
-| `chaos_test.sh`             | ChunkServerの障害などをシミュレートしたカオステスト        |
 | `run_spark_test.sh`         | S3互換API経由でのSpark (CSV/Parquet) 統合テスト            |
+| `run_all_tests.sh`          | 全ての統合テストとカオステストを一括実行                   |
+
+### 3. パフォーマンス & ストレステスト
+
+`dfs_cli` を使用して、実環境でのスループットとレイテンシを測定できます。
+
+```bash
+# 書き込みベンチマーク (1MB x 100ファイル, 並列度10)
+cargo run --bin dfs_cli -- [alias設定...] benchmark write --count 100 --size 1048576 --concurrency 10
+
+# 読み込みベンチマーク
+cargo run --bin dfs_cli -- [alias設定...] benchmark read --prefix bench_write --concurrency 10
+
+# 高負荷ストレステスト (60秒間、継続的に負荷をかける)
+cargo run --bin dfs_cli -- [alias設定...] benchmark stress-write --duration 60 --concurrency 10
+```
+
+> [!TIP]
+> **開発フローへの組み込み**:
+> 大規模なリファクタリングやRaftロジックの変更後は、性能劣化（Regression）が発生していないかベンチマークを実行して確認することを推奨します。
+
 
 
 ## プロジェクト構成
