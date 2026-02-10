@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  # Toxiproxy for network failure injection
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: toxiproxy
+    ports:
+      - "8474:8474" # API port
+      - "60051:60051" # Proxy for master1-shard1
+      - "60061:60061" # Proxy for master1-shard2
+      - "60050:60050" # Proxy for config-server
+      - "60052:60052" # Proxy for chunkserver1-shard1
+    networks:
+      - dfs-sharded-network
+    healthcheck:
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8474/version" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Config Server
+  config-server:
+    build: .
+    container_name: dfs-config-server
+    command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://toxiproxy:60050
+    environment:
+      - RUST_LOG=info,dfs_metaserver::simple_raft=warn
+    ports:
+      - "50050:50050"
+      - "8080:8080"
+    networks:
+      - dfs-sharded-network
+    volumes:
+      - config-server-data:/data/config-raft
+
+  # Shard 1 Master
+  master1-shard1:
+    build: .
+    container_name: dfs-master1-shard1
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60051 --shard-id shard-1 --config-servers http://toxiproxy:60050 --merge-threshold-rps=-1.0
+    environment:
+      - RUST_LOG=info,dfs_metaserver::simple_raft=warn
+    ports:
+      - "50051:50051"
+      - "8081:8080"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - config-server
+    volumes:
+      - master1-shard1-data:/data/raft
+    healthcheck:
+      test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Shard 2 Master
+  master1-shard2:
+    build: .
+    container_name: dfs-master1-shard2
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60061 --shard-id shard-2 --config-servers http://toxiproxy:60050 --merge-threshold-rps=-1.0
+    environment:
+      - RUST_LOG=info,dfs_metaserver::simple_raft=warn
+    ports:
+      - "50061:50051"
+      - "8091:8080"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - config-server
+    volumes:
+      - master1-shard2-data:/data/raft
+    healthcheck:
+      test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ChunkServer for Shard 1
+  chunkserver1-shard1:
+    build: .
+    container_name: dfs-chunkserver1-shard1
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60050 --storage-dir /data/cs1 --advertise-addr http://toxiproxy:60052
+    ports:
+      - "50052:50052"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - master1-shard1
+      - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - cs1-shard1-data:/data/cs1
+      - ./shard_config.json:/app/shard_config.json:ro
+
+  # Extra services maintained for compatibility but not primary test targets
+  chunkserver-extra:
+    build: .
+    container_name: dfs-chunkserver-extra
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60050 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
+    ports:
+      - "50072:50052"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - cs-extra-data:/data/cs-extra
+      - ./shard_config.json:/app/shard_config.json:ro
+
+  chunkserver-extra2:
+    build: .
+    container_name: dfs-chunkserver-extra2
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60050 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
+    ports:
+      - "50082:50052"
+    networks:
+      - dfs-sharded-network
+    depends_on:
+      - config-server
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    volumes:
+      - cs-extra2-data:/data/cs-extra2
+      - ./shard_config.json:/app/shard_config.json:ro
+
+volumes:
+  config-server-data:
+  master1-shard1-data:
+  master1-shard2-data:
+  cs1-shard1-data:
+  cs-extra-data:
+  cs-extra2-data:
+
+
+networks:
+  dfs-sharded-network:
+    driver: bridge

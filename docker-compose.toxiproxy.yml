@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  # Toxiproxy for network failure injection
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    ports:
+      - "8474:8474"  # API port
+      - "60051:60051"  # Proxy for master1
+      - "60052:60052"  # Proxy for master2
+      - "60053:60053"  # Proxy for master3
+    networks:
+      - dfs-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8474/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Master nodes (3-node Raft cluster)
+  master1:
+    build:
+      context: .
+      dockerfile: Dockerfile.master
+    environment:
+      - RUST_LOG=info
+      - NODE_ID=1
+      - RAFT_ADDR=master1:50051
+      - PEERS=master1:50051,master2:50052,master3:50053
+      - ROCKSDB_PATH=/data/master1
+    volumes:
+      - master1-data:/data
+    networks:
+      - dfs-network
+    ports:
+      - "50051:50051"
+      - "8081:8080"  # HTTP API
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  master2:
+    build:
+      context: .
+      dockerfile: Dockerfile.master
+    environment:
+      - RUST_LOG=info
+      - NODE_ID=2
+      - RAFT_ADDR=master2:50052
+      - PEERS=master1:50051,master2:50052,master3:50053
+      - ROCKSDB_PATH=/data/master2
+    volumes:
+      - master2-data:/data
+    networks:
+      - dfs-network
+    ports:
+      - "50052:50052"
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  master3:
+    build:
+      context: .
+      dockerfile: Dockerfile.master
+    environment:
+      - RUST_LOG=info
+      - NODE_ID=3
+      - RAFT_ADDR=master3:50053
+      - PEERS=master1:50051,master2:50052,master3:50053
+      - ROCKSDB_PATH=/data/master3
+    volumes:
+      - master3-data:/data
+    networks:
+      - dfs-network
+    ports:
+      - "50053:50053"
+      - "8083:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  master1-data:
+  master2-data:
+  master3-data:
+
+networks:
+  dfs-network:
+    driver: bridge

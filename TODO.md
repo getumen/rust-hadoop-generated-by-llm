@@ -9,19 +9,20 @@
 ## 🔴 Tier 1: 運用に必須（最優先）
 
 ### 1. Testing Infrastructure
-**Status**: Basic
+**Status**: Comprehensive (Jepsen-style & Toxiproxy Tests Integrated)
 **Priority**: 🔴 Critical
 **Effort**: Large
 **Rationale**: 本番運用前にネットワーク分断・障害シナリオのテストは必須。Jepsen風テストで信頼性を担保。
 
 **Tasks**:
-- [ ] Add unit tests for Raft logic
-- [ ] Add integration tests for network partitions
-  - [ ] Multi-node scenarios
-  - [ ] Network partition simulation (`tc netem` / `toxiproxy`)
+- [x] Add unit tests for Raft logic (16 tests covering leader election, log replication, commit, term management, ReadIndex)
+- [x] Add integration tests for network partitions (11 tests with mock network layer)
+  - [x] Multi-node scenarios (split-brain prevention, leader election, partition healing)
+  - [x] Partition simulation (2-way, 3-way, symmetric, cascading)
+  - [x] Real network partition testing with `toxiproxy` (5 test scenarios: partition, latency, packet loss, bandwidth limit, cascading failures)
   - [ ] Clock skew simulation
-- [ ] Add property-based tests (using proptest)
-- [ ] Implement Jepsen-style consistency tests
+- [x] Add property-based tests (15 tests using proptest - log invariants, quorum intersection, state machine determinism)
+- [x] Implement Jepsen-style consistency tests (12 tests - history recording, linearizability checker, bank account invariant, concurrent operations, fault injection)
 - [ ] Add performance benchmarks
 - [ ] Add stress tests for high write throughput
 
@@ -411,5 +412,5 @@ Week 7+:   Raft Performance / Security
 
 ---
 
-**Last Updated**: 2026-01-29
+**Last Updated**: 2026-02-10
 **Maintainer**: Development Team

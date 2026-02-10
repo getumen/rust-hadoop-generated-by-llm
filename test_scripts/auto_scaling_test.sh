@@ -18,7 +18,7 @@ echo "=========================="
 
 # Cleanup
 echo "🚀 Cleaning up..."
-# Kill any local processes that might be using ports 8080-8083
+# Kill any local processes that might be using ports 8090-8092
 pkill -f "target/release/master" || true
 sleep 2
 docker compose -f docker-compose.auto-scaling.yml down -v || true
@@ -33,7 +33,7 @@ sleep 20
 
 # 1. Initial State: 1 Shard
 echo "Checking initial shard count..."
-SHARD_COUNT=$(curl -s http://localhost:8080/shards | jq '.shards | length')
+SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length')
 if [ "$SHARD_COUNT" -eq 1 ]; then
     pass "Initial shard count is 1"
 else
@@ -67,7 +67,7 @@ GENERATE_LOAD 20 10
 echo "Checking for shard split..."
 # It might take a few seconds to commit and refresh
 sleep 15
-SHARD_COUNT=$(curl -s http://localhost:8080/shards | jq '.shards | length')
+SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length')
 if [ "$SHARD_COUNT" -gt 1 ]; then
     pass "Shard split triggered! New shard count: $SHARD_COUNT"
 else
@@ -82,7 +82,7 @@ echo "Waiting for merge (20s)..."
 # Merge also happens every 5s
 sleep 60
 
-SHARD_COUNT=$(curl -s http://localhost:8080/shards | jq '.shards | length')
+SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length')
 if [ "$SHARD_COUNT" -eq 1 ]; then
     pass "Shard merge triggered! Shard count returned to 1"
 else

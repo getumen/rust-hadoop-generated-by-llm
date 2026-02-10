@@ -203,6 +203,7 @@ MIT
 - [S3_COMPATIBILITY.md](S3_COMPATIBILITY.md) - S3互換APIとSpark統合の詳細
 - [CHAOS_TEST.md](CHAOS_TEST.md) - カオステストガイド
 - [test_scripts/DYNAMIC_MEMBERSHIP_TESTS.md](test_scripts/DYNAMIC_MEMBERSHIP_TESTS.md) - Dynamic Membership Changesのテストガイド
+- [test_scripts/NETWORK_PARTITION_TESTS.md](test_scripts/NETWORK_PARTITION_TESTS.md) - ネットワーク分断テストガイド（Toxiproxy使用）
 
 ### 外部リソース
 
