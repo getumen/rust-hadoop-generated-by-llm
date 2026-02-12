@@ -12,13 +12,13 @@ pip install -r test_scripts/requirements.txt
 
 # 2. Build and Start Cluster
 echo "Cleaning up old data..."
-docker-compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
+docker compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
 # Force rebuild to ensure code changes (like sharding logic) are picked up
 echo "Building Docker images (no cache)..."
-docker-compose -f test_scripts/spark-s3-test/docker-compose.yml build --no-cache
+docker compose -f test_scripts/spark-s3-test/docker-compose.yml build --no-cache
 
 echo "Starting Cluster..."
-docker-compose -f test_scripts/spark-s3-test/docker-compose.yml up -d
+docker compose -f test_scripts/spark-s3-test/docker-compose.yml up -d
 
 # 3. Wait for S3 Server
 echo "Waiting for S3 Server (port 9000)..."
@@ -35,8 +35,8 @@ done
 
 if [ $RETRIES -eq 0 ]; then
     echo "Error: S3 Server failed to start."
-    docker-compose logs s3-server
-    docker-compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
+    docker compose logs s3-server
+    docker compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
     exit 1
 fi
 
@@ -56,14 +56,14 @@ if [ $EXIT_CODE -ne 0 ]; then
     echo "--- Python Test Output ---"
     cat test_output.log
     echo "--- S3 Server Logs ---"
-    docker-compose -f test_scripts/spark-s3-test/docker-compose.yml logs s3-server
+    docker compose -f test_scripts/spark-s3-test/docker-compose.yml logs s3-server
     echo "--- Master Logs ---"
-    docker-compose -f test_scripts/spark-s3-test/docker-compose.yml logs master1-shard1
+    docker compose -f test_scripts/spark-s3-test/docker-compose.yml logs master1-shard1
 fi
 
 # 5. Cleanup
 echo "Stopping Cluster..."
-docker-compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
+docker compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
 
 # 6. Report/Exit
 if [ $EXIT_CODE -ne 0 ]; then

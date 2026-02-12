@@ -58,7 +58,7 @@
 **Rationale**: CI/CD、ローリングアップデート、K8s対応がないと運用コストが高い。
 
 **Tasks**:
-- [ ] Add CI/CD pipeline (GitHub Actions)
+- [x] Add CI/CD pipeline (GitHub Actions)
 - [ ] Optimize Docker image size (multi-stage build)
 - [ ] Kubernetes manifests
 - [ ] Add Helm chart

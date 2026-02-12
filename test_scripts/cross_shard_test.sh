@@ -26,8 +26,8 @@ echo "=========================="
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
-docker-compose -f docker-compose.yml build
-docker-compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml build
+docker compose -f docker-compose.yml up -d --build
 
 # Wait for cluster
 echo "Waiting for cluster to be ready..."
@@ -174,7 +174,7 @@ fi
 
 # Cleanup
 echo "🧹 Cleanup..."
-docker-compose -f docker-compose.yml down -v
+docker compose -f docker-compose.yml down -v
 rm -f file1.txt downloaded.txt
 
 echo ""

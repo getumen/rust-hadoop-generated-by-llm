@@ -12,7 +12,7 @@ echo "============================================="
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    docker-compose logs s3-server | tail -30
+    docker compose logs s3-server | tail -30
 }
 
 # Set trap to cleanup on exit
@@ -21,8 +21,8 @@ trap cleanup EXIT
 # Step 1: Build and start the cluster
 echo ""
 echo "Step 1: Building and starting the cluster..."
-docker-compose down -v 2>/dev/null || true
-docker-compose up -d --build
+docker compose down -v 2>/dev/null || true
+docker compose up -d --build
 
 # Step 2: Wait for services to be ready
 echo ""
@@ -43,7 +43,7 @@ done
 
 if [ $RETRIES -eq 0 ]; then
     echo "ERROR: S3 server failed to start"
-    docker-compose logs s3-server
+    docker compose logs s3-server
     exit 1
 fi
 
@@ -104,7 +104,7 @@ EOF
 # Step 4: Run Spark test with local jars (no Maven download)
 echo ""
 echo "Step 4: Running Spark S3 integration test..."
-docker-compose exec -T spark-submit /opt/spark/bin/spark-submit \
+docker compose exec -T spark-submit /opt/spark/bin/spark-submit \
     --master local[*] \
     --jars /app/deps/hadoop-aws-3.3.4.jar,/app/deps/aws-java-sdk-bundle-1.12.262.jar \
     --conf "spark.hadoop.fs.s3a.endpoint=http://s3-server:9000" \
@@ -134,7 +134,7 @@ else
     echo "============================================="
     echo ""
     echo "S3 Server logs:"
-    docker-compose logs s3-server | tail -100
+    docker compose logs s3-server | tail -100
 fi
 
 exit $EXIT_CODE

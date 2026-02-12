@@ -97,7 +97,7 @@ fi
 
 # Cleanup
 echo "🧹 Cleanup..."
-docker-compose -f docker-compose.yml down -v
+docker compose -f docker-compose.yml down -v
 rm -f test_data.bin downloaded_file.bin
 
 echo ""
