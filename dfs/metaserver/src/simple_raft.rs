@@ -626,8 +626,15 @@ impl RaftNode {
 
         // Initialize cluster configuration from peers
         let mut initial_members = HashMap::new();
-        for (idx, peer) in peers.iter().enumerate() {
-            initial_members.insert(idx, peer.clone());
+        for peer in peers.iter() {
+            // Parse node ID from peer address
+            // Expected format: http://...-configserver-N... or http://...-metaserver-N...
+            // Extract N and use (N + 1) as the node ID to match Kubernetes pod naming
+            if let Some(peer_id) = Self::extract_node_id_from_address(peer) {
+                initial_members.insert(peer_id, peer.clone());
+            } else {
+                tracing::warn!("Failed to extract node ID from peer address: {}", peer);
+            }
         }
         initial_members.insert(id, client_address.clone());
 
@@ -685,6 +692,32 @@ impl RaftNode {
             last_committed_config_index: 0,
             monotonic_time: 0,
         }
+    }
+
+    /// Extract node ID from peer address
+    ///
+    /// Expected formats:
+    /// - http://...-configserver-0...:8080 -> ID 1
+    /// - http://...-configserver-1...:8080 -> ID 2
+    /// - http://...-metaserver-0...:8080 -> ID 1
+    ///
+    /// The function extracts the pod index and adds 1 to get the node ID
+    fn extract_node_id_from_address(address: &str) -> Option<usize> {
+        // Look for patterns like "configserver-N" or "metaserver-N"
+        for pattern in &["configserver-", "metaserver-"] {
+            if let Some(pos) = address.find(pattern) {
+                let after_pattern = &address[pos + pattern.len()..];
+                // Extract digits until we hit a non-digit character
+                let pod_index_str: String = after_pattern
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(index) = pod_index_str.parse::<usize>() {
+                    return Some(index + 1); // Pod index 0 -> Node ID 1
+                }
+            }
+        }
+        None
     }
 
     fn load_state(
@@ -1172,8 +1205,6 @@ impl RaftNode {
         self.role = Role::Leader;
         self.current_leader = Some(self.id);
         self.current_leader_address = Some(self.client_address.clone());
-        self.next_index = vec![self.log.len() + self.last_included_index; self.peers.len()];
-        self.match_index = vec![self.last_included_index; self.peers.len()];
 
         // For multi-node cluster, we append a NoOp entry to commit entries from previous terms.
         // This is required for ReadIndex safety.
@@ -1186,6 +1217,17 @@ impl RaftNode {
         if let Err(e) = self.save_log_entry(absolute_index, &entry) {
             tracing::error!("Failed to save log entry in become_leader: {:?}", e);
         }
+
+        // Initialize next_index and match_index AFTER appending the NoOp entry
+        // so that next_index points to the entry after the NoOp
+        self.next_index = vec![self.log.len() + self.last_included_index; self.peers.len()];
+        self.match_index = vec![self.last_included_index; self.peers.len()];
+
+        tracing::info!(
+            "Node {} (L) initialized next_index={:?}, match_index={:?}, log.len()={}, last_included_index={}",
+            self.id, self.next_index, self.match_index, self.log.len(), self.last_included_index
+        );
+
         // For single-node clusters, immediately commit everything in the log upon becoming leader.
         if self.peers.is_empty() && absolute_index > self.commit_index {
             tracing::info!(
@@ -1233,10 +1275,20 @@ impl RaftNode {
             };
 
             if i >= self.next_index.len() {
+                tracing::warn!(
+                    "Node {} (L) skipping peer at index {} (>= next_index.len()={})",
+                    self.id,
+                    i,
+                    self.next_index.len()
+                );
                 continue; // Safety check
             }
             // Check if follower needs a snapshot
             if self.next_index[i] <= self.last_included_index {
+                tracing::debug!(
+                    "Node {} (L) sending snapshot to peer {} (next_index={} <= last_included_index={})",
+                    self.id, _server_id, self.next_index[i], self.last_included_index
+                );
                 // Send snapshot instead of AppendEntries
                 let state = match self.app_state.lock() {
                     Ok(s) => s,
@@ -1313,20 +1365,51 @@ impl RaftNode {
                 continue;
             }
 
-            let prev_log_index = self.next_index[i] - 1 - self.last_included_index;
+            // Calculate relative index into the log array
+            // The log array is indexed from 0, representing entries starting at last_included_index + 1
+            let absolute_prev_index = self.next_index[i] - 1;
+
+            // Safety check: absolute_prev_index should be >= last_included_index
+            if absolute_prev_index < self.last_included_index {
+                tracing::warn!(
+                    "Node {} (L) peer {} has next_index={} which results in absolute_prev_index={} < last_included_index={}. Sending snapshot instead.",
+                    self.id, _server_id, self.next_index[i], absolute_prev_index, self.last_included_index
+                );
+                // Reset next_index to trigger snapshot on next iteration
+                self.next_index[i] = self.last_included_index;
+                continue;
+            }
+
+            let prev_log_index = absolute_prev_index - self.last_included_index;
+
+            // Bounds check for log array access
+            if prev_log_index >= self.log.len() {
+                tracing::error!(
+                    "Node {} (L) prev_log_index={} >= log.len()={} for peer {}. This should not happen. Resetting next_index.",
+                    self.id, prev_log_index, self.log.len(), _server_id
+                );
+                self.next_index[i] = self.log.len() + self.last_included_index;
+                continue;
+            }
+
             let prev_log_term = self.log[prev_log_index].term;
 
             let next_log_index = self.next_index[i] - self.last_included_index;
-            let entries = if self.log.len() > next_log_index {
+            let entries = if next_log_index < self.log.len() {
                 self.log[next_log_index..].to_vec()
             } else {
                 vec![]
             };
 
+            tracing::debug!(
+                "Node {} (L) sending AppendEntries to peer {}: prev_log_index={}, prev_log_term={}, entries.len()={}, leader_commit={}",
+                self.id, _server_id, absolute_prev_index, prev_log_term, entries.len(), self.commit_index
+            );
+
             let args = AppendEntriesArgs {
                 term: self.current_term,
                 leader_id: self.id,
-                prev_log_index: self.next_index[i] - 1,
+                prev_log_index: absolute_prev_index,
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
@@ -1336,6 +1419,8 @@ impl RaftNode {
             let url = format!("{}/raft/append", peer);
             let tx = self.self_tx.clone();
             let client = self.http_client.clone();
+            let leader_id = self.id;
+            let entries_count = args.entries.len();
 
             tokio::spawn(async move {
                 // Heartbeats are frequent, so we might want fewer retries or shorter timeout
@@ -1346,31 +1431,50 @@ impl RaftNode {
 
                 loop {
                     match client.post(&url).json(&args).send().await {
-                        Ok(resp) => {
-                            match resp.json::<AppendEntriesReply>().await {
-                                Ok(reply) => {
-                                    let _ = tx
-                                        .send(Event::Rpc {
-                                            msg: RpcMessage::AppendEntriesResponse(reply),
-                                            reply_tx: None,
-                                        })
-                                        .await;
-                                    break;
+                        Ok(resp) => match resp.json::<AppendEntriesReply>().await {
+                            Ok(reply) => {
+                                let _ = tx
+                                    .send(Event::Rpc {
+                                        msg: RpcMessage::AppendEntriesResponse(reply),
+                                        reply_tx: None,
+                                    })
+                                    .await;
+                                if entries_count > 0 {
+                                    tracing::debug!(
+                                            "Leader {} successfully sent AppendEntries with {} entries to {}",
+                                            leader_id, entries_count, url
+                                        );
                                 }
-                                Err(_) => {
-                                    // Don't log error for heartbeats to avoid spam
-                                }
+                                break;
                             }
-                        }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Leader {} failed to parse AppendEntriesReply from {}: {}",
+                                    leader_id,
+                                    url,
+                                    e
+                                );
+                            }
+                        },
 
                         Err(e) => {
-                            // Log error for debugging
-                            tracing::warn!("AppendEntries failed to {}: {}", url, e);
+                            if entries_count > 0 || attempt == max_retries - 1 {
+                                tracing::warn!(
+                                    "Leader {} AppendEntries (entries={}) failed to {} (attempt {}/{}): {}",
+                                    leader_id, entries_count, url, attempt + 1, max_retries, e
+                                );
+                            }
                         }
                     }
 
                     attempt += 1;
                     if attempt >= max_retries {
+                        if entries_count > 0 {
+                            tracing::error!(
+                                "Leader {} failed to send AppendEntries with {} entries to {} after {} attempts",
+                                leader_id, entries_count, url, max_retries
+                            );
+                        }
                         break;
                     }
                     tokio::time::sleep(delay).await;
@@ -1571,7 +1675,15 @@ impl RaftNode {
                     tracing::info!("Node {} received vote from {}", self.id, reply.peer_id);
                     self.votes_received += 1;
                     self.voters.insert(reply.peer_id);
-                    if self.cluster_config.has_joint_majority(&self.voters) {
+
+                    let has_majority = self.cluster_config.has_joint_majority(&self.voters);
+                    tracing::info!(
+                        "Node {} vote check: votes_received={}, voters={:?}, has_majority={}, cluster_members={:?}",
+                        self.id, self.votes_received, self.voters, has_majority,
+                        self.cluster_config.all_members().keys().collect::<Vec<_>>()
+                    );
+
+                    if has_majority {
                         self.become_leader();
                     }
                 } else if reply.term > self.current_term {
@@ -1749,13 +1861,18 @@ impl RaftNode {
             RpcMessage::AppendEntriesResponse(reply) => {
                 // Leader receives this - could update next_index/match_index here
                 if self.role == Role::Leader && reply.term == self.current_term {
-                    // Find the peer index
-                    if let Some(peer_idx) = self.peers.iter().position(|p| {
-                        // This is a simplification. In a real implementation,
-                        // we'd need a better way to map addresses to IDs or
-                        // include the peer's ID in the reply.
-                        p.contains(&reply.peer_id.to_string())
-                    }) {
+                    // Find the peer_id's address in cluster config
+                    let all_members = self.cluster_config.all_members();
+                    let peer_addr = all_members.get(&reply.peer_id);
+
+                    // Find the peer index by matching the address in self.peers
+                    let peer_idx_opt = if let Some(addr) = peer_addr {
+                        self.peers.iter().position(|p| p == addr)
+                    } else {
+                        None
+                    };
+
+                    if let Some(peer_idx) = peer_idx_opt {
                         if reply.success {
                             self.next_index[peer_idx] = reply.match_index + 1;
                             self.match_index[peer_idx] = reply.match_index;
@@ -1807,6 +1924,12 @@ impl RaftNode {
                                 );
                             }
                         }
+                    } else {
+                        tracing::warn!(
+                            "Node {} (L) received AppendEntriesResponse from unknown peer {}",
+                            self.id,
+                            reply.peer_id
+                        );
                     }
 
                     // Check for commit_index advancement using joint consensus
@@ -1816,13 +1939,16 @@ impl RaftNode {
                     server_match_indices.insert(self.id, absolute_index);
 
                     let all_members = self.cluster_config.all_members();
-                    for (peer_idx, (server_id, _)) in all_members
-                        .iter()
-                        .filter(|(id, _)| **id != self.id)
-                        .enumerate()
-                    {
-                        if peer_idx < self.match_index.len() {
-                            server_match_indices.insert(*server_id, self.match_index[peer_idx]);
+                    // Build the correct mapping from server_id to match_index
+                    for (server_id, addr) in all_members.iter() {
+                        if *server_id != self.id {
+                            // Find this server's index in self.peers
+                            if let Some(peer_idx) = self.peers.iter().position(|p| p == addr) {
+                                if peer_idx < self.match_index.len() {
+                                    server_match_indices
+                                        .insert(*server_id, self.match_index[peer_idx]);
+                                }
+                            }
                         }
                     }
 

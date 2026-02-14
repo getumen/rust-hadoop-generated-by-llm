@@ -1,0 +1,119 @@
+{{- if .Values.sharding.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-metaserver-shard2-headless
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: metaserver-shard2
+spec:
+  ports:
+    - port: {{ .Values.metaserverShard2.port }}
+      name: api
+    - port: {{ .Values.metaserverShard2.httpPort }}
+      name: http
+  clusterIP: None
+  selector:
+    {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
+    component: metaserver-shard2
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-metaserver-shard2
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: metaserver-shard2
+spec:
+  serviceName: {{ include "rust-hadoop.fullname" . }}-metaserver-shard2-headless
+  replicas: {{ .Values.metaserverShard2.replicaCount }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: metaserver-shard2
+  template:
+    metadata:
+      labels:
+        {{- include "rust-hadoop.selectorLabels" . | nindent 8 }}
+        component: metaserver-shard2
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- include "rust-hadoop.selectorLabels" . | nindent 18 }}
+                  component: metaserver-shard2
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: metaserver-shard2
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ID=${HOSTNAME##*-}
+              REPLICA_COUNT={{ .Values.metaserverShard2.replicaCount }}
+              PEERS=""
+              for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+                if [ $i -ne $ID ]; then
+                  PEERS="${PEERS}http://{{ include "rust-hadoop.fullname" . }}-metaserver-shard2-$i.{{ include "rust-hadoop.fullname" . }}-metaserver-shard2-headless:{{ .Values.metaserverShard2.httpPort }},"
+                fi
+              done
+              PEERS=${PEERS%,}
+              exec /app/master \
+                --id $((ID + 1)) \
+                --addr 0.0.0.0:{{ .Values.metaserverShard2.port }} \
+                --advertise-addr http://${HOSTNAME}.{{ include "rust-hadoop.fullname" . }}-metaserver-shard2-headless:{{ .Values.metaserverShard2.port }} \
+                --peers "${PEERS}" \
+                --storage-dir /data/raft \
+                --http-port {{ .Values.metaserverShard2.httpPort }} \
+                --shard-id {{ .Values.metaserverShard2.shardId }} \
+                --config-servers http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }} \
+                --merge-threshold-rps=-1.0
+          ports:
+            - containerPort: {{ .Values.metaserverShard2.port }}
+              name: api
+            - containerPort: {{ .Values.metaserverShard2.httpPort }}
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.metaserverShard2.httpPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.metaserverShard2.httpPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.metaserverShard2.storage.mountPath }}
+          resources:
+            {{- toYaml .Values.metaserverShard2.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if .Values.metaserverShard2.storage.storageClassName }}
+        storageClassName: {{ .Values.metaserverShard2.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.metaserverShard2.storage.size }}
+{{- end }}

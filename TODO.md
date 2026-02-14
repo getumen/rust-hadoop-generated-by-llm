@@ -52,19 +52,43 @@
 ---
 
 ### 3. Build and Deployment
-**Status**: Not Started
+**Status**: Partially Completed (Basic K8s + HA improvements done)
 **Priority**: 🔴 Critical
 **Effort**: Medium
 **Rationale**: CI/CD、ローリングアップデート、K8s対応がないと運用コストが高い。
 
-**Tasks**:
+**Completed**:
 - [x] Add CI/CD pipeline (GitHub Actions)
-- [ ] Optimize Docker image size (multi-stage build)
-- [ ] Kubernetes manifests
-- [ ] Add Helm chart
-- [ ] Implement rolling update support
-- [ ] Implement blue-green deployment
-- [ ] Implement backup and restore procedures
+- [x] Kubernetes manifests
+- [x] Add Helm chart
+- [x] Pod Disruption Budget for all Raft components (maxUnavailable: 1)
+- [x] Pod Anti-Affinity rules (preferredDuringSchedulingIgnoredDuringExecution)
+- [x] Resource limits for all components (requests/limits for CPU/Memory)
+
+**Remaining Tasks - Medium Priority** (中優先):
+- [ ] **Monitoring & Metrics** (監視・メトリクス)
+  - [ ] Add Prometheus ServiceMonitor definitions for all components
+  - [ ] Create Grafana dashboard JSON for Kubernetes deployment
+  - [ ] Implement log aggregation (Loki) integration
+  - [ ] Add PersistentVolume monitoring alerts (disk space)
+- [ ] **Backup & Recovery** (バックアップ)
+  - [ ] Implement Raft log backup strategy (VolumeSnapshot)
+  - [ ] Add State Machine snapshot backup to S3/GCS
+  - [ ] Create restore procedures documentation
+  - [ ] Implement automated backup scheduling (CronJob)
+
+**Remaining Tasks - Low Priority** (低優先):
+- [ ] **Network Policy** (ネットワークセキュリティ)
+  - [ ] Add NetworkPolicy to restrict inter-pod communication
+  - [ ] Allow only necessary ports (gRPC, HTTP) between components
+  - [ ] Deny all ingress by default, whitelist by label
+- [ ] **Init Container** (初期化処理)
+  - [ ] Add init container for data directory permission setup
+  - [ ] Implement dependency wait (wait-for ConfigServer before Metaserver)
+  - [ ] Add pre-flight checks (disk space, network connectivity)
+- [ ] Optimize Docker image size (multi-stage build improvements)
+- [ ] Implement rolling update support with pre-stop hooks
+- [ ] Implement blue-green deployment strategy
 
 ---
 
