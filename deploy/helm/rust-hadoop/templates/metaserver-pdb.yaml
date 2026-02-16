@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-metaserver-pdb
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: metaserver
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: metaserver

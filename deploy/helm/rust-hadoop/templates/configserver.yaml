@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-configserver-headless
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: configserver
+spec:
+  ports:
+    - port: {{ .Values.configserver.port }}
+      name: api
+    - port: {{ .Values.configserver.httpPort }}
+      name: http
+  clusterIP: None
+  selector:
+    {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
+    component: configserver
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-configserver
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: configserver
+spec:
+  serviceName: {{ include "rust-hadoop.fullname" . }}-configserver-headless
+  replicas: {{ .Values.configserver.replicaCount }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: configserver
+  template:
+    metadata:
+      labels:
+        {{- include "rust-hadoop.selectorLabels" . | nindent 8 }}
+        component: configserver
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- include "rust-hadoop.selectorLabels" . | nindent 18 }}
+                  component: configserver
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: configserver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ID=${HOSTNAME##*-}
+              REPLICA_COUNT={{ .Values.configserver.replicaCount }}
+              PEERS=""
+              for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+                if [ $i -ne $ID ]; then
+                  PEERS="${PEERS}http://{{ include "rust-hadoop.fullname" . }}-configserver-$i.{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.httpPort }},"
+                fi
+              done
+              PEERS=${PEERS%,}
+              exec /app/config_server \
+                --id $((ID + 1)) \
+                --addr 0.0.0.0:{{ .Values.configserver.port }} \
+                --advertise-addr http://${HOSTNAME}.{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }} \
+                --peers "${PEERS}" \
+                --storage-dir /data/config-raft \
+                --http-port {{ .Values.configserver.httpPort }}
+          ports:
+            - containerPort: {{ .Values.configserver.port }}
+              name: api
+            - containerPort: {{ .Values.configserver.httpPort }}
+              name: http
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.configserver.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.configserver.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.configserver.storage.mountPath }}
+          resources:
+            {{- toYaml .Values.configserver.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if .Values.configserver.storage.storageClassName }}
+        storageClassName: {{ .Values.configserver.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.configserver.storage.size }}

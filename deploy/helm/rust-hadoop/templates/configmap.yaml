@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-config
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+spec:
+  # Add common configurations here if needed
+  # For example, shard topology or log levels
+  shard_config.json: |
+    {
+      "shards": [
+        {
+          "id": "shard-1",
+          "master_addr": "{{ include "rust-hadoop.fullname" . }}-metaserver-0.{{ include "rust-hadoop.fullname" . }}-metaserver-headless:{{ .Values.metaserver.port }}"
+        }
+      ]
+    }

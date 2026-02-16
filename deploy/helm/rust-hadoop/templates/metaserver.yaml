@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-metaserver-headless
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: metaserver
+spec:
+  ports:
+    - port: {{ .Values.metaserver.port }}
+      name: api
+    - port: {{ .Values.metaserver.httpPort }}
+      name: http
+  clusterIP: None
+  selector:
+    {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
+    component: metaserver
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-metaserver
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: metaserver
+spec:
+  serviceName: {{ include "rust-hadoop.fullname" . }}-metaserver-headless
+  replicas: {{ .Values.metaserver.replicaCount }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: metaserver
+  template:
+    metadata:
+      labels:
+        {{- include "rust-hadoop.selectorLabels" . | nindent 8 }}
+        component: metaserver
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- include "rust-hadoop.selectorLabels" . | nindent 18 }}
+                  component: metaserver
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: metaserver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ID=${HOSTNAME##*-}
+              REPLICA_COUNT={{ .Values.metaserver.replicaCount }}
+              PEERS=""
+              for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+                if [ $i -ne $ID ]; then
+                  PEERS="${PEERS}http://{{ include "rust-hadoop.fullname" . }}-metaserver-$i.{{ include "rust-hadoop.fullname" . }}-metaserver-headless:8080,"
+                fi
+              done
+              PEERS=${PEERS%,}
+              exec /app/master \
+                --id $((ID + 1)) \
+                --addr 0.0.0.0:{{ .Values.metaserver.port }} \
+                --advertise-addr http://${HOSTNAME}.{{ include "rust-hadoop.fullname" . }}-metaserver-headless:{{ .Values.metaserver.port }} \
+                --peers "${PEERS}" \
+                --storage-dir /data/raft \
+                --http-port 8080 \
+                --shard-id {{ .Values.metaserver.shardId }} \
+                --config-servers http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }} \
+                --merge-threshold-rps=-1.0
+          ports:
+            - containerPort: {{ .Values.metaserver.port }}
+              name: api
+            - containerPort: {{ .Values.metaserver.httpPort }}
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.metaserver.httpPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.metaserver.httpPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.metaserver.storage.mountPath }}
+          resources:
+            {{- toYaml .Values.metaserver.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if .Values.metaserver.storage.storageClassName }}
+        storageClassName: {{ .Values.metaserver.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.metaserver.storage.size }}

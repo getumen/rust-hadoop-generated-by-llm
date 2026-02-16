@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-chunkserver
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: chunkserver
+spec:
+  ports:
+    - port: {{ .Values.chunkserver.port }}
+      name: api
+  selector:
+    {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
+    component: chunkserver
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-chunkserver
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    component: chunkserver
+spec:
+  serviceName: {{ include "rust-hadoop.fullname" . }}-chunkserver
+  replicas: {{ .Values.chunkserver.replicaCount }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: chunkserver
+  template:
+    metadata:
+      labels:
+        {{- include "rust-hadoop.selectorLabels" . | nindent 8 }}
+        component: chunkserver
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- include "rust-hadoop.selectorLabels" . | nindent 18 }}
+                  component: chunkserver
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: chunkserver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              exec /app/chunkserver \
+                --addr 0.0.0.0:{{ .Values.chunkserver.port }} \
+                --advertise-addr ${HOSTNAME}.{{ include "rust-hadoop.fullname" . }}-chunkserver:{{ .Values.chunkserver.port }} \
+                --config-servers http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }} \
+                --storage-dir /data/chunks
+          ports:
+            - containerPort: {{ .Values.chunkserver.port }}
+              name: api
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.chunkserver.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.chunkserver.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.chunkserver.storage.mountPath }}
+          resources:
+            {{- toYaml .Values.chunkserver.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if .Values.chunkserver.storage.storageClassName }}
+        storageClassName: {{ .Values.chunkserver.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.chunkserver.storage.size }}
