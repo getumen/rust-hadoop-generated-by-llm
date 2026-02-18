@@ -25,11 +25,11 @@ configserver:
     storageClassName: ""
   resources:
     requests:
-      cpu: "100m"
-      memory: "256Mi"
+      cpu: "100m"      # 0.1 CPU core - ShardMap management is lightweight
+      memory: "256Mi"  # 256 MB - Small metadata storage
     limits:
-      cpu: "500m"
-      memory: "512Mi"
+      cpu: "500m"      # 0.5 CPU core burst capacity
+      memory: "512Mi"  # 512 MB max memory
 
 # Metaserver Shard-1 (Range: "" to "/m")
 metaserver:
@@ -45,11 +45,11 @@ metaserver:
     storageClassName: ""
   resources:
     requests:
-      cpu: "100m"
-      memory: "256Mi"
+      cpu: "100m"      # 0.1 CPU core - Handles metadata operations and Raft consensus
+      memory: "256Mi"  # 256 MB - Metadata storage and Raft log
     limits:
-      cpu: "500m"
-      memory: "512Mi"
+      cpu: "500m"      # 0.5 CPU core burst for high load
+      memory: "512Mi"  # 512 MB max memory
 
 # Metaserver Shard-2 (Range: "/m" to "")
 metaserverShard2:
@@ -65,11 +65,11 @@ metaserverShard2:
     storageClassName: ""
   resources:
     requests:
-      cpu: "100m"
-      memory: "256Mi"
+      cpu: "100m"      # 0.1 CPU core - Handles metadata operations and Raft consensus
+      memory: "256Mi"  # 256 MB - Metadata storage and Raft log
     limits:
-      cpu: "500m"
-      memory: "512Mi"
+      cpu: "500m"      # 0.5 CPU core burst for high load
+      memory: "512Mi"  # 512 MB max memory
 
 # ChunkServers - Data storage nodes
 chunkserver:
@@ -84,24 +84,24 @@ chunkserver:
     storageClassName: ""
   resources:
     requests:
-      cpu: "100m"
-      memory: "256Mi"
+      cpu: "100m"      # 0.1 CPU core - Handles data I/O operations
+      memory: "256Mi"  # 256 MB - Data caching and buffering
     limits:
-      cpu: "500m"
-      memory: "512Mi"
+      cpu: "500m"      # 0.5 CPU core for I/O intensive workloads
+      memory: "512Mi"  # 512 MB max for large data operations
 
 # S3 Server - S3-compatible API frontend
 s3server:
   replicaCount: 1
   port: 9000
-  httpPort: 9001
+  httpPort: 9000
   resources:
     requests:
-      cpu: "100m"
-      memory: "128Mi"
+      cpu: "100m"      # 0.1 CPU core - API gateway, stateless
+      memory: "128Mi"  # 128 MB - Request/response buffering
     limits:
-      cpu: "500m"
-      memory: "512Mi"
+      cpu: "500m"      # 0.5 CPU core for high request load
+      memory: "512Mi"  # 512 MB max memory
 
 # Observability
 monitoring:
