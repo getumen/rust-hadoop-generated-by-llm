@@ -4,7 +4,7 @@ metadata:
   name: {{ include "rust-hadoop.fullname" . }}-config
   labels:
     {{- include "rust-hadoop.labels" . | nindent 4 }}
-spec:
+data:
   # Add common configurations here if needed
   # For example, shard topology or log levels
   shard_config.json: |

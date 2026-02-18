@@ -1,10 +1,33 @@
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use clap::Parser;
 use dfs_chunkserver::chunkserver::MyChunkServer;
 use dfs_chunkserver::dfs::chunk_server_service_server::ChunkServerServiceServer;
 use dfs_chunkserver::dfs::master_service_client::MasterServiceClient;
+use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 use std::path::PathBuf;
 use tonic::transport::Server;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+// Axum state for sharing the ChunkServer
+#[derive(Clone)]
+struct AppState {
+    chunk_server: MyChunkServer,
+}
+
+// Custom error type for Axum
+struct InternalError;
+
+impl IntoResponse for InternalError {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -21,6 +44,9 @@ struct Args {
     /// Address to advertise to master (defaults to addr if not specified)
     #[arg(long)]
     advertise_addr: Option<String>,
+
+    #[arg(long, default_value = "8082")]
+    http_port: u16,
 }
 
 #[tokio::main]
@@ -38,7 +64,25 @@ async fn main() -> anyhow::Result<()> {
 
     let chunk_server = MyChunkServer::new(args.storage_dir.clone(), args.config_servers.clone());
 
+    // Start HTTP Server for metrics
+    let app_state = AppState {
+        chunk_server: chunk_server.clone(),
+    };
+
+    let app = Router::new()
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
+        .with_state(app_state);
+
+    let http_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.http_port).into();
+    tokio::spawn(async move {
+        tracing::info!("HTTP server listening on {}", http_addr);
+        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+
     // Start background scrubber
+
     let server_for_scrubber = chunk_server.clone();
     tokio::spawn(async move {
         MyChunkServer::run_background_scrubber(
@@ -157,4 +201,57 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+async fn handle_health() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+async fn handle_metrics(State(app_state): State<AppState>) -> Result<String, InternalError> {
+    let storage_dir = app_state.chunk_server.get_storage_dir();
+    let registry = Registry::new();
+
+    let available_space_gauge = Gauge::new(
+        "dfs_chunkserver_available_space_bytes",
+        "Available space on chunkserver in bytes",
+    )
+    .unwrap();
+    let used_space_gauge = Gauge::new(
+        "dfs_chunkserver_used_space_bytes",
+        "Used space on chunkserver in bytes",
+    )
+    .unwrap();
+    let chunk_count_gauge = Gauge::new(
+        "dfs_chunkserver_total_chunks",
+        "Total number of chunks on this chunkserver",
+    )
+    .unwrap();
+
+    registry
+        .register(Box::new(available_space_gauge.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(used_space_gauge.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(chunk_count_gauge.clone()))
+        .unwrap();
+
+    // Gather stats
+    let available_space = fs2::free_space(&storage_dir).unwrap_or(0);
+    let total_space = fs2::total_space(&storage_dir).unwrap_or(0);
+    let used_space = total_space.saturating_sub(available_space);
+    let chunk_count = std::fs::read_dir(&storage_dir)
+        .map(|read_dir| read_dir.count())
+        .unwrap_or(0) as u64;
+
+    available_space_gauge.set(available_space as f64);
+    used_space_gauge.set(used_space as f64);
+    chunk_count_gauge.set(chunk_count as f64);
+
+    let mut buffer = vec![];
+    let encoder = TextEncoder::new();
+    encoder.encode(&registry.gather(), &mut buffer).unwrap();
+
+    Ok(String::from_utf8(buffer).unwrap())
 }

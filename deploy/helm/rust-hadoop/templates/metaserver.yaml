@@ -10,7 +10,7 @@ spec:
     - port: {{ .Values.metaserver.port }}
       name: api
     - port: {{ .Values.metaserver.httpPort }}
-      name: http
+      name: http-metrics
   clusterIP: None
   selector:
     {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
@@ -82,7 +82,7 @@ spec:
             - containerPort: {{ .Values.metaserver.port }}
               name: api
             - containerPort: {{ .Values.metaserver.httpPort }}
-              name: http
+              name: http-metrics
           livenessProbe:
             httpGet:
               path: /health

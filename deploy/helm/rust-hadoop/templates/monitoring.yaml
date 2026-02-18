@@ -1,0 +1,105 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-metaserver
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.prometheusRelease }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: metaserver
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http-metrics
+      interval: {{ .Values.monitoring.interval }}
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-chunkserver
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.prometheusRelease }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: chunkserver
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http-metrics
+      interval: {{ .Values.monitoring.interval }}
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-s3server
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.prometheusRelease }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rust-hadoop.selectorLabels" . | nindent 6 }}
+      component: s3server
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: s3-metrics
+      interval: {{ .Values.monitoring.interval }}
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-alerts
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.prometheusRelease }}
+spec:
+  groups:
+    - name: rust-hadoop.rules
+      rules:
+        - alert: MetaserverSafeMode
+          expr: dfs_master_safe_mode_status == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Metaserver {{`{{`}} $labels.instance {{`}}`}} is in Safe Mode"
+            description: "Metaserver is in Safe Mode, writes might be restricted."
+        - alert: HighRaftLogReplicationLag
+          expr: avg by (job) (raft_log_len - raft_commit_index) / raft_log_len * 100 > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High Raft log replication lag detected on {{`{{`}} $labels.job {{`}}`}}"
+            description: "Raft log replication lag is {{`{{`}} $value | printf \"%.2f\" {{`}}`}}%."
+        - alert: ChunkServerDiskLow
+          expr: (dfs_chunkserver_available_space_bytes / (dfs_chunkserver_used_space_bytes + dfs_chunkserver_available_space_bytes)) * 100 < 10
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "ChunkServer {{`{{`}} $labels.instance {{`}}`}} disk space low"
+            description: "Less than 10% disk space available on {{`{{`}} $labels.instance {{`}}`}}."
+        - alert: S3HighErrorRate
+          expr: rate(s3_requests_total{status=~"5.."}[5m]) / rate(s3_requests_total[5m]) * 100 > 5
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "High S3 error rate on {{`{{`}} $labels.instance {{`}}`}}"
+            description: "S3 server is returning 5xx errors for > 5% of requests."
+{{- end }}

@@ -374,6 +374,15 @@ pub enum AppState {
     Config(ConfigStateInner),
 }
 
+impl AppState {
+    pub fn is_safe_mode(&self) -> bool {
+        match self {
+            AppState::Master(m) => m.is_in_safe_mode(),
+            AppState::Config(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub last_included_index: usize,
@@ -499,6 +508,7 @@ pub struct ClusterInfo {
     pub votes_received: usize,
     pub cluster_config: ClusterConfiguration,
     pub config_change_state: ConfigChangeState,
+    pub is_safe_mode: bool,
 }
 
 /// A single Raft consensus node.
@@ -1539,6 +1549,8 @@ impl RaftNode {
                 let _ = reply_tx.send(self.current_leader_address.clone());
             }
             Event::GetClusterInfo { reply_tx } => {
+                let is_safe_mode = self.app_state.lock().unwrap().is_safe_mode();
+
                 let info = ClusterInfo {
                     node_id: self.id,
                     role: self.role,
@@ -1552,7 +1564,9 @@ impl RaftNode {
                     votes_received: self.votes_received,
                     cluster_config: self.cluster_config.clone(),
                     config_change_state: self.config_change_state.clone(),
+                    is_safe_mode,
                 };
+
                 let _ = reply_tx.send(info);
             }
             Event::GetReadIndex { reply_tx } => {

@@ -54,10 +54,15 @@ fn empty_response(status: StatusCode) -> Response {
 }
 
 pub async fn handle_root(State(state): State<S3AppState>, method: Method) -> impl IntoResponse {
-    match method {
+    let res = match method {
         Method::GET => list_buckets(state).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-    }
+    };
+    let status = res.status().as_u16().to_string();
+    crate::S3_REQUESTS
+        .with_label_values(&[method.as_str(), "/", &status])
+        .inc();
+    res
 }
 
 async fn list_buckets(state: S3AppState) -> Response {
@@ -126,7 +131,10 @@ pub async fn handle_request(
     let span =
         tracing::info_span!("s3_request", method = %method, path = %path, request_id = %request_id);
 
-    async move {
+    let method_metrics = method.clone();
+    let path_metrics = path.split('/').next().unwrap_or("unknown").to_string();
+
+    let response = async move {
         let body_bytes = axum::body::to_bytes(body, 1024 * 1024 * 1024)
             .await
             .unwrap_or_default();
@@ -189,7 +197,14 @@ pub async fn handle_request(
         }
     }
     .instrument(span)
-    .await
+    .await;
+
+    let status = response.status().as_u16().to_string();
+    crate::S3_REQUESTS
+        .with_label_values(&[method_metrics.as_str(), &path_metrics, &status])
+        .inc();
+
+    response
 }
 
 async fn initiate_multipart_upload(state: S3AppState, bucket: &str, key: &str) -> Response {

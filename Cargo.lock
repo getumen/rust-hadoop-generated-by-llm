@@ -454,6 +454,7 @@ name = "dfs-chunkserver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "clap",
  "crc32fast",
@@ -461,6 +462,7 @@ dependencies = [
  "dfs-common",
  "fs2",
  "lru",
+ "prometheus",
  "prost",
  "serde",
  "serde_json",
@@ -1997,6 +1999,7 @@ dependencies = [
  "hex",
  "md-5",
  "percent-encoding",
+ "prometheus",
  "quick-xml",
  "serde",
  "serde_json",

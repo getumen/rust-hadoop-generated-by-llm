@@ -67,6 +67,10 @@ impl MyChunkServer {
         }
     }
 
+    pub fn get_storage_dir(&self) -> PathBuf {
+        self.storage_dir.clone()
+    }
+
     pub async fn refresh_shard_map(&self) -> Result<(), String> {
         for config_addr in &self.config_server_addrs {
             use crate::dfs::config_service_client::ConfigServiceClient;

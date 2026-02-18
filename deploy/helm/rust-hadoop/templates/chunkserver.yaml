@@ -9,6 +9,8 @@ spec:
   ports:
     - port: {{ .Values.chunkserver.port }}
       name: api
+    - port: {{ .Values.chunkserver.httpPort }}
+      name: http-metrics
   selector:
     {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
     component: chunkserver
@@ -60,10 +62,13 @@ spec:
                 --addr 0.0.0.0:{{ .Values.chunkserver.port }} \
                 --advertise-addr ${HOSTNAME}.{{ include "rust-hadoop.fullname" . }}-chunkserver:{{ .Values.chunkserver.port }} \
                 --config-servers http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }} \
-                --storage-dir /data/chunks
+                --storage-dir /data/chunks \
+                --http-port {{ .Values.chunkserver.httpPort }}
           ports:
             - containerPort: {{ .Values.chunkserver.port }}
               name: api
+            - containerPort: {{ .Values.chunkserver.httpPort }}
+              name: http-metrics
           livenessProbe:
             tcpSocket:
               port: {{ .Values.chunkserver.port }}
