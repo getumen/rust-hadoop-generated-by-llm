@@ -99,11 +99,24 @@ async fn handle_health() -> impl IntoResponse {
 
 async fn handle_metrics() -> Result<String, InternalError> {
     let registry = Registry::new();
-    registry.register(Box::new(S3_REQUESTS.clone())).unwrap();
+    registry
+        .register(Box::new(S3_REQUESTS.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register S3 metrics: {}", e);
+            InternalError
+        })?;
 
     let mut buffer = vec![];
     let encoder = TextEncoder::new();
-    encoder.encode(&registry.gather(), &mut buffer).unwrap();
+    encoder
+        .encode(&registry.gather(), &mut buffer)
+        .map_err(|e| {
+            tracing::error!("Failed to encode S3 metrics: {}", e);
+            InternalError
+        })?;
 
-    Ok(String::from_utf8(buffer).unwrap())
+    String::from_utf8(buffer).map_err(|e| {
+        tracing::error!("Failed to convert metrics buffer to string: {}", e);
+        InternalError
+    })
 }

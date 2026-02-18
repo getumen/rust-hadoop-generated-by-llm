@@ -9,7 +9,7 @@ spec:
   type: ClusterIP
   ports:
     - port: {{ .Values.s3server.port }}
-      targetPort: 9000
+      targetPort: {{ .Values.s3server.port }}
       protocol: TCP
       name: s3-metrics
   selector:
@@ -52,20 +52,20 @@ spec:
             - name: CONFIG_SERVERS
               value: "http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }}"
             - name: PORT
-              value: "9000"
+              value: {{ .Values.s3server.port | quote }}
           ports:
-            - containerPort: 9000
+            - containerPort: {{ .Values.s3server.port }}
               name: s3-metrics
           livenessProbe:
             tcpSocket:
-              port: 9000
+              port: {{ .Values.s3server.port }}
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
             tcpSocket:
-              port: 9000
+              port: {{ .Values.s3server.port }}
             initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 3

@@ -132,7 +132,7 @@ pub async fn handle_request(
         tracing::info_span!("s3_request", method = %method, path = %path, request_id = %request_id);
 
     let method_metrics = method.clone();
-    let path_metrics = path.clone();
+    let path_metrics = path.split('/').next().unwrap_or("unknown").to_string();
 
     let response = async move {
         let body_bytes = axum::body::to_bytes(body, 1024 * 1024 * 1024)
