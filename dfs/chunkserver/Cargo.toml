@@ -30,6 +30,9 @@ anyhow = "1.0"
 dfs-common = { path = "../common" }
 dfs-client = { path = "../client" }
 lru = "0.16"
+prometheus = "0.14"
+axum = "0.8"
+
 
 [build-dependencies]
 tonic-prost-build = "0.14"

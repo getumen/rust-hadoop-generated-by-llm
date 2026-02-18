@@ -5,10 +5,35 @@ mod s3_types;
 mod state;
 
 use crate::state::AppState as S3AppState;
-use axum::{routing::any, Router};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{any, get},
+    Router,
+};
 use dfs_client::Client;
+use prometheus::{Encoder, IntCounterVec, Registry, TextEncoder};
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+// Prometheus metrics for S3 server
+pub static S3_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        prometheus::opts!("s3_requests_total", "Total number of S3 requests"),
+        &["method", "path", "status"],
+    )
+    .unwrap()
+});
+
+// Custom error type for Axum
+struct InternalError;
+
+impl IntoResponse for InternalError {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,15 +74,36 @@ async fn main() -> anyhow::Result<()> {
     let state = S3AppState { client };
 
     let app = Router::new()
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
         .route("/", any(handlers::handle_root))
         .route("/{*path}", any(handlers::handle_request))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 9000));
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(9000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("S3 Server listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn handle_health() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+async fn handle_metrics() -> Result<String, InternalError> {
+    let registry = Registry::new();
+    registry.register(Box::new(S3_REQUESTS.clone())).unwrap();
+
+    let mut buffer = vec![];
+    let encoder = TextEncoder::new();
+    encoder.encode(&registry.gather(), &mut buffer).unwrap();
+
+    Ok(String::from_utf8(buffer).unwrap())
 }

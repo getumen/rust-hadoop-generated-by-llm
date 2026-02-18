@@ -239,6 +239,11 @@ async fn handle_metrics(State(app_state): State<AppState>) -> Result<String, Int
         "Number of votes received in current term",
     )
     .unwrap();
+    let safe_mode_gauge = Gauge::new(
+        "dfs_master_safe_mode_status",
+        "Whether the Master is in Safe Mode (1=Yes, 0=No)",
+    )
+    .unwrap();
 
     registry.register(Box::new(role_gauge.clone())).unwrap();
     registry.register(Box::new(term_gauge.clone())).unwrap();
@@ -250,6 +255,9 @@ async fn handle_metrics(State(app_state): State<AppState>) -> Result<String, Int
         .unwrap();
     registry.register(Box::new(log_len_gauge.clone())).unwrap();
     registry.register(Box::new(votes_gauge.clone())).unwrap();
+    registry
+        .register(Box::new(safe_mode_gauge.clone()))
+        .unwrap();
 
     let role_val = match info.role {
         dfs_metaserver::simple_raft::Role::Follower => 0.0,
@@ -262,6 +270,7 @@ async fn handle_metrics(State(app_state): State<AppState>) -> Result<String, Int
     last_applied_gauge.set(info.last_applied as f64);
     log_len_gauge.set(info.log_len as f64);
     votes_gauge.set(info.votes_received as f64);
+    safe_mode_gauge.set(if info.is_safe_mode { 1.0 } else { 0.0 });
 
     let mut buffer = vec![];
     let encoder = TextEncoder::new();

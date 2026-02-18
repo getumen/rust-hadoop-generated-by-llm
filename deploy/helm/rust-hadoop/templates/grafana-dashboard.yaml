@@ -1,0 +1,82 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-grafana-dashboard
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+    rust-hadoop-dashboard.json: |
+      {
+        "title": "Rust Hadoop DFS Dashboard",
+        "tags": ["rust", "hadoop", "dfs"],
+        "timezone": "browser",
+        "refresh": "5s",
+        "schemaVersion": 38,
+        "panels": [
+          {
+            "title": "Metaserver: Current Role",
+            "type": "stat",
+            "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0},
+            "targets": [{"expr": "raft_role", "legendFormat": "{{`{{`}}instance{{`}}`}}: Role"}],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"type": "value", "options": {"0": {"text": "Follower", "color": "green"}, "1": {"text": "Candidate", "color": "yellow"}, "2": {"text": "Leader", "color": "red"}}}
+                ]
+              }
+            }
+          },
+          {
+            "title": "Metaserver: Safe Mode",
+            "type": "stat",
+            "gridPos": {"h": 8, "w": 6, "x": 6, "y": 0},
+            "targets": [{"expr": "dfs_master_safe_mode_status", "legendFormat": "{{`{{`}}instance{{`}}`}}: SafeMode"}],
+            "fieldConfig": {
+              "defaults": {
+                "mappings": [
+                  {"type": "value", "options": {"0": {"text": "OFF", "color": "green"}, "1": {"text": "ON", "color": "red"}}}
+                ]
+              }
+            }
+          },
+          {
+            "title": "S3: Request Rate",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "targets": [{"expr": "sum(rate(s3_requests_total[5m])) by (status)", "legendFormat": "Status {{`{{`}}status{{`}}`}}"}]
+          },
+          {
+            "title": "ChunkServer: Storage Usage",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+            "targets": [
+              {"expr": "dfs_chunkserver_used_space_bytes", "legendFormat": "{{`{{`}}instance{{`}}`}}: Used"},
+              {"expr": "dfs_chunkserver_available_space_bytes", "legendFormat": "{{`{{`}}instance{{`}}`}}: Available"}
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "bytes"
+              }
+            }
+          },
+          {
+            "title": "ChunkServer: Chunk Count",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+            "targets": [{"expr": "dfs_chunkserver_total_chunks", "legendFormat": "{{`{{`}}instance{{`}}`}}"}]
+          },
+          {
+            "title": "Raft: Log Progress",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+            "targets": [
+              {"expr": "raft_commit_index", "legendFormat": "Commit Index"},
+              {"expr": "raft_last_applied", "legendFormat": "Last Applied"},
+              {"expr": "raft_log_len", "legendFormat": "Log Length"}
+            ]
+          }
+        ]
+      }
+{{- end }}

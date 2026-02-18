@@ -11,7 +11,7 @@ spec:
     - port: {{ .Values.s3server.port }}
       targetPort: 9000
       protocol: TCP
-      name: s3
+      name: s3-metrics
   selector:
     {{- include "rust-hadoop.selectorLabels" . | nindent 4 }}
     component: s3server
@@ -51,9 +51,11 @@ spec:
               value: "http://{{ include "rust-hadoop.fullname" . }}-metaserver-headless:{{ .Values.metaserver.port }}"
             - name: CONFIG_SERVERS
               value: "http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }}"
+            - name: PORT
+              value: "9000"
           ports:
             - containerPort: 9000
-              name: s3
+              name: s3-metrics
           livenessProbe:
             tcpSocket:
               port: 9000

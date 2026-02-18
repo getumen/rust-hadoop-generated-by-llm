@@ -14,7 +14,7 @@ sharding:
 
 # Config Server (Meta-Shard) - Manages ShardMap
 configserver:
-  replicaCount: 3
+  replicaCount: 1
   port: 50050
   httpPort: 8080
   storage:
@@ -25,15 +25,15 @@ configserver:
     storageClassName: ""
   resources:
     requests:
-      cpu: "500m"      # 0.5 CPU core - ShardMap management is lightweight
-      memory: "512Mi"  # 512 MB - Small metadata storage
+      cpu: "100m"
+      memory: "256Mi"
     limits:
-      cpu: "1000m"     # 1 CPU core burst capacity
-      memory: "1Gi"    # 1 GB max memory
+      cpu: "500m"
+      memory: "512Mi"
 
 # Metaserver Shard-1 (Range: "" to "/m")
 metaserver:
-  replicaCount: 3
+  replicaCount: 1
   port: 50051
   httpPort: 8080
   shardId: "shard-1"
@@ -45,15 +45,15 @@ metaserver:
     storageClassName: ""
   resources:
     requests:
-      cpu: "1000m"     # 1 CPU core - Handles metadata operations and Raft consensus
-      memory: "1Gi"    # 1 GB - Metadata storage and Raft log
+      cpu: "100m"
+      memory: "256Mi"
     limits:
-      cpu: "2000m"     # 2 CPU cores burst for high load
-      memory: "2Gi"    # 2 GB max memory
+      cpu: "500m"
+      memory: "512Mi"
 
 # Metaserver Shard-2 (Range: "/m" to "")
 metaserverShard2:
-  replicaCount: 3
+  replicaCount: 1
   port: 50061
   httpPort: 8090
   shardId: "shard-2"
@@ -65,38 +65,50 @@ metaserverShard2:
     storageClassName: ""
   resources:
     requests:
-      cpu: "1000m"     # 1 CPU core - Handles metadata operations and Raft consensus
-      memory: "1Gi"    # 1 GB - Metadata storage and Raft log
+      cpu: "100m"
+      memory: "256Mi"
     limits:
-      cpu: "2000m"     # 2 CPU cores burst for high load
-      memory: "2Gi"    # 2 GB max memory
+      cpu: "500m"
+      memory: "512Mi"
 
 # ChunkServers - Data storage nodes
 chunkserver:
-  replicaCount: 3
+  replicaCount: 1
   port: 50053
+  httpPort: 8080
   storage:
-    size: 10Gi
+    size: 2Gi
     mountPath: /data
     # StorageClass for persistent volumes (leave empty for default)
     # For Rancher Desktop, use "local-path" (default provisioner)
     storageClassName: ""
   resources:
     requests:
-      cpu: "1000m"     # 1 CPU core - Handles data I/O operations
-      memory: "2Gi"    # 2 GB - Data caching and buffering
+      cpu: "100m"
+      memory: "256Mi"
     limits:
-      cpu: "2000m"     # 2 CPU cores for I/O intensive workloads
-      memory: "4Gi"    # 4 GB max for large data operations
+      cpu: "500m"
+      memory: "512Mi"
 
 # S3 Server - S3-compatible API frontend
 s3server:
   replicaCount: 1
   port: 9000
+  httpPort: 9001
   resources:
     requests:
-      cpu: "500m"      # 0.5 CPU core - API gateway, stateless
-      memory: "512Mi"  # 512 MB - Request/response buffering
+      cpu: "100m"
+      memory: "128Mi"
     limits:
-      cpu: "1000m"     # 1 CPU core for high request load
-      memory: "1Gi"    # 1 GB max memory
+      cpu: "500m"
+      memory: "512Mi"
+
+# Observability
+monitoring:
+  enabled: true
+  # Release name of the Prometheus Operator
+  prometheusRelease: prometheus
+  # Namespace where Prometheus is running
+  namespace: monitoring
+  # Interval for scraping metrics
+  interval: 30s

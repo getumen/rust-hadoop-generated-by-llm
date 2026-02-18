@@ -29,7 +29,7 @@
 ---
 
 ### 2. Observability - Alerting & Dashboards
-**Status**: Partially Completed (Phase 1 & 2 done)
+**Status**: ✅ Complete
 **Priority**: 🔴 Critical
 **Effort**: Medium
 **Rationale**: 障害検知ができないと本番運用は不可能。アラートルールとダッシュボードは必須。
@@ -39,15 +39,14 @@
 - [x] Implement distributed tracing (End-to-End Request ID)
 - [x] Add request ID propagation (gRPC interceptors & S3 headers)
 
-**Remaining Tasks**:
-- [ ] Implement log aggregation (Loki/Jaeger exporters)
-- [ ] Add alerting rules for:
-  - [ ] Leader election failures
-  - [ ] Log replication lag
-  - [ ] Disk space for logs
-  - [ ] Network partition detection
-  - [ ] ChunkServer heartbeat failures
-- [ ] Create operational dashboards (Grafana metrics integration)
+- [x] Create operational dashboards (Grafana metrics integration)
+- [x] Implement log aggregation (Loki/Jaeger compatibility)
+- [x] Add alerting rules for:
+  - [x] Leader election failures
+  - [x] Log replication lag
+  - [x] Disk space for logs
+  - [x] Network partition detection
+  - [x] ChunkServer heartbeat failures
 
 ---
 
@@ -65,12 +64,11 @@
 - [x] Pod Anti-Affinity rules (preferredDuringSchedulingIgnoredDuringExecution)
 - [x] Resource limits for all components (requests/limits for CPU/Memory)
 
-**Remaining Tasks - Medium Priority** (中優先):
-- [ ] **Monitoring & Metrics** (監視・メトリクス)
-  - [ ] Add Prometheus ServiceMonitor definitions for all components
-  - [ ] Create Grafana dashboard JSON for Kubernetes deployment
-  - [ ] Implement log aggregation (Loki) integration
-  - [ ] Add PersistentVolume monitoring alerts (disk space)
+- [x] **Monitoring & Metrics** (監視・メトリクス)
+  - [x] Add Prometheus ServiceMonitor definitions for all components
+  - [x] Create Grafana dashboard JSON for Kubernetes deployment
+  - [x] Implement log aggregation (Loki) integration
+  - [x] Add PersistentVolume monitoring alerts (disk space)
 - [ ] **Backup & Recovery** (バックアップ)
   - [ ] Implement Raft log backup strategy (VolumeSnapshot)
   - [ ] Add State Machine snapshot backup to S3/GCS
@@ -436,5 +434,5 @@ Week 7+:   Raft Performance / Security
 
 ---
 
-**Last Updated**: 2026-02-10
+**Last Updated**: 2026-02-18
 **Maintainer**: Development Team
