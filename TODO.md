@@ -40,7 +40,7 @@ S3互換サービスとしての信頼確保。
     - [ ] ChunkServer登録時にラックID（例: `/rack-1/host-1`）をメタデータに追加。
     - [ ] レプリカ配置時に「少なくとも1つは別ラック」とするプレイスメント・ポリシーの実装。
 - [ ] **Hedged Reads (Tail Latency Mitigation)**
-    - [ ] 1次リクエストの応答が一定時間（例: p95時間）来ない場合、別レプリカに投げる並行リクエスト管理。
+    - [ ] 1次リクエストの応答が一定時間（例: p95レイテンシ (ms)）来ない場合、別レプリカに投げる並行リクエスト管理。
     - [ ] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
 
 ### 4. Throughput & Storage Excellence
@@ -75,7 +75,7 @@ S3互換サービスとしての信頼確保。
 - [ ] **Object Locking (WORM)**: 削除・変更を物理的に禁止する保存期間（Retention）管理。
 - [ ] **Lifecycle Policies**: 日数経過に応じた自動削除・階層移動のポリシー実行。
 - [ ] **Cross-Cluster Replication**: クラスタ間を跨いだ非同期レプリケーション。
-- [ ] **Erasure Coding (RS 6,3)**: 3xレプリカから高効率なECへ、バックグラウンドでの変換。
+- [ ] **Erasure Coding (RS(6,3))**: 3xレプリカから高効率なECへ、バックグラウンドでの変換。
 
 ---
 
@@ -87,7 +87,23 @@ S3互換サービスとしての信頼確保。
 ---
 
 ## ✅ Completed & Archived
-(テスト、観測性、シャーディング、Helm対応等の完了済みリスト)
+
+### Core Distributed Logic
+- [x] **Namespace Sharding**: Range-based partitioning with dynamic split & merge logic.
+- [x] **Multi-Raft Cluster**: Master nodes organized into shards using Raft for high availability.
+- [x] **Safe Mode**: Initialization state for warm-up and cluster safety checks.
+- [x] **Dynamic Membership**: Support for adding/removing Master nodes via Joint Consensus.
+- [x] **Self-Healing Base**: Heartbeat-based liveness and basic block reporting.
+
+### Testing & Quality Assurance
+- [x] **Unit Testing**: Over 20 tests covering Raft state machine and core logic.
+- [x] **Integration Testing**: Chaos tests (Network partitions) and consistency checkers.
+- [x] **Toxiproxy Integration**: Simulating network instability in local K8s.
+
+### Observability & Infrastructure
+- [x] **Metrics & Dashboards**: Prometheus exporters for Metaserver/S3Server and Grafana dashboards.
+- [x] **Alerting**: Pre-configured rules for node failure and latency spikes.
+- [x] **Deployment**: Production-ready Helm Chart with PDBs, resource limits, and service monitors.
 
 **Last Updated**: 2026-02-19
 **Maintainer**: Development Team
