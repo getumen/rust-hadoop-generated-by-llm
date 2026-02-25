@@ -277,19 +277,20 @@ fn test_request_vote_decision() {
 #[test]
 fn test_append_entries_consistency_check() {
     // Test AppendEntries RPC consistency check
-    let mut log = Vec::new();
-    log.push(LogEntry {
-        term: 1,
-        command: Command::NoOp,
-    });
-    log.push(LogEntry {
-        term: 2,
-        command: Command::NoOp,
-    });
-    log.push(LogEntry {
-        term: 3,
-        command: Command::NoOp,
-    });
+    let log = [
+        LogEntry {
+            term: 1,
+            command: Command::NoOp,
+        },
+        LogEntry {
+            term: 2,
+            command: Command::NoOp,
+        },
+        LogEntry {
+            term: 3,
+            command: Command::NoOp,
+        },
+    ];
 
     // Case 1: prev_log_index is beyond our log -> reject
     let prev_log_index = 5;

@@ -426,6 +426,8 @@ pub struct MasterConfig {
     pub split_threshold_rps: f64,
     pub split_cooldown_secs: u64,
     pub merge_threshold_rps: f64,
+    pub ca_cert_path: Option<String>,
+    pub domain_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -451,6 +453,11 @@ impl MyMaster {
             config.merge_threshold_rps,
             config.split_cooldown_secs,
         ));
+
+        // Capture TLS config for spawned tasks
+        let ca_cert_path = config.ca_cert_path.clone();
+        let domain_name = config.domain_name.clone();
+
         // Spawn liveness check loop
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -740,6 +747,9 @@ impl MyMaster {
         // Spawn ShardMap refresh task
         let shard_map_refresh = shard_map.clone();
         let config_addrs_refresh = config.config_server_addrs.clone();
+        let ca_cert_refresh = ca_cert_path.clone();
+        let domain_name_refresh = domain_name.clone();
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
@@ -749,17 +759,18 @@ impl MyMaster {
                     continue;
                 }
 
+                // Try to fetch shard map from any config server
                 for config_addr in &config_addrs_refresh {
-                    let addr_to_connect = if config_addr.starts_with("http://") {
-                        config_addr.clone()
-                    } else {
-                        format!("http://{}", config_addr)
-                    };
-
                     use crate::dfs::config_service_client::ConfigServiceClient;
-                    if let Ok(mut client) =
-                        ConfigServiceClient::connect(addr_to_connect.clone()).await
+
+                    if let Ok(channel) = dfs_common::security::connect_endpoint(
+                        config_addr,
+                        ca_cert_refresh.as_deref(),
+                        domain_name_refresh.as_deref(),
+                    )
+                    .await
                     {
+                        let mut client = ConfigServiceClient::new(channel);
                         if let Ok(resp) = client
                             .fetch_shard_map(crate::dfs::FetchShardMapRequest {})
                             .await
@@ -781,7 +792,7 @@ impl MyMaster {
                             *w = new_map;
                             tracing::debug!(
                                 "Refreshed ShardMap from Config Server {}",
-                                addr_to_connect
+                                config_addr
                             );
                             break; // Success, wait for next interval
                         }
@@ -798,6 +809,8 @@ impl MyMaster {
         let master_address_task = config.master_address.clone();
         let state_clone_split = state.clone();
         let shard_map_clone_split = shard_map.clone();
+        let ca_cert_task = ca_cert_path.clone();
+        let domain_name_task = domain_name.clone();
 
         tokio::spawn(async move {
             let mut registered = false;
@@ -813,19 +826,22 @@ impl MyMaster {
                 let raft_tx = raft_tx_split.clone();
                 let config_addrs = config_server_addrs_task.clone();
                 let master_addr = master_address_task.clone();
+                let ca_cert = ca_cert_task.clone();
+                let domain = domain_name_task.clone();
 
                 // 1. Register with Config Server if not already registered
                 if !registered {
                     for config_addr in &config_addrs {
                         use crate::dfs::config_service_client::ConfigServiceClient;
-                        let addr_to_connect = if config_addr.starts_with("http://") {
-                            config_addr.clone()
-                        } else {
-                            format!("http://{}", config_addr)
-                        };
 
-                        if let Ok(mut client) = ConfigServiceClient::connect(addr_to_connect).await
+                        if let Ok(channel) = dfs_common::security::connect_endpoint(
+                            config_addr,
+                            ca_cert.as_deref(),
+                            domain.as_deref(),
+                        )
+                        .await
                         {
+                            let mut client = ConfigServiceClient::new(channel);
                             let reg_req = crate::dfs::RegisterMasterRequest {
                                 address: master_addr.clone(),
                                 shard_id: shard_id.clone(),
@@ -851,12 +867,15 @@ impl MyMaster {
                 };
                 for config_addr in &config_addrs {
                     use crate::dfs::config_service_client::ConfigServiceClient;
-                    let addr_to_connect = if config_addr.starts_with("http://") {
-                        config_addr.clone()
-                    } else {
-                        format!("http://{}", config_addr)
-                    };
-                    if let Ok(mut client) = ConfigServiceClient::connect(addr_to_connect).await {
+
+                    if let Ok(channel) = dfs_common::security::connect_endpoint(
+                        config_addr,
+                        ca_cert.as_deref(),
+                        domain.as_deref(),
+                    )
+                    .await
+                    {
+                        let mut client = ConfigServiceClient::new(channel);
                         let hb_req = crate::dfs::ShardHeartbeatRequest {
                             address: master_addr.clone(),
                             rps_per_prefix: rps_per_prefix.clone(),
@@ -1180,6 +1199,7 @@ impl MyMaster {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn check_shard_ownership(&self, path: &str) -> Result<(), Status> {
         let map = self.shard_map.lock().expect("Mutex poisoned");
         if let Some(target_shard) = map.get_shard(path) {
@@ -1201,6 +1221,7 @@ impl MyMaster {
     }
 
     /// Check if the cluster is in safe mode and reject write operations
+    #[allow(clippy::result_large_err)]
     fn check_safe_mode(&self) -> Result<(), Status> {
         let state_lock = self.state.lock().expect("Mutex poisoned");
         if let AppState::Master(ref state) = *state_lock {

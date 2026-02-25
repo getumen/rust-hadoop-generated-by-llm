@@ -5,9 +5,9 @@
 
 ### 1. Security & Identity (セキュリティ・認証)
 S3互換サービスとしての信頼確保。
-- [ ] **TLS Encryption**
-    - [ ] `tonic` / `axum` での自署名・CA証明書による通信暗号化サポート。
-    - [ ] Raftノード間通信（gRPC）のTLS化。
+- [x] **TLS Encryption** ✅ (完了)
+    - [x] `tonic` / `axum` での自署名・CA証明書による通信暗号化サポート。
+    - [x] Raftノード間通信（gRPC）のTLS化。
 - [ ] **S3 Signature V4 Authentication**
     - [ ] `Authorization` ヘッダーのパースと署名検証ロジックの実装（HMAC-SHA256）。
     - [ ] `X-Amz-Content-Sha256` によるペイロード整合性チェック。
@@ -105,5 +105,10 @@ S3互換サービスとしての信頼確保。
 - [x] **Alerting**: Pre-configured rules for node failure and latency spikes.
 - [x] **Deployment**: Production-ready Helm Chart with PDBs, resource limits, and service monitors.
 
-**Last Updated**: 2026-02-19
+### Code Quality & Technical Debt
+- [x] **RaftNode Initialization**: Refactored `RaftNode::new` to use `RaftNodeConfig` struct.
+- [x] **Clippy Compliance**: Fixed all clippy warnings across meta-server, chunk-server, and test suites.
+- [x] **Large Result Types**: Resolved large `Result` variant warnings by boxing large error types or adding allows.
+
+**Last Updated**: 2026-02-24
 **Maintainer**: Development Team

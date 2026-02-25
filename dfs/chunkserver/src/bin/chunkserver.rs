@@ -9,6 +9,7 @@ use clap::Parser;
 use dfs_chunkserver::chunkserver::MyChunkServer;
 use dfs_chunkserver::dfs::chunk_server_service_server::ChunkServerServiceServer;
 use dfs_chunkserver::dfs::master_service_client::MasterServiceClient;
+use dfs_chunkserver::dfs::HeartbeatRequest;
 use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 use std::path::PathBuf;
 use tonic::transport::Server;
@@ -47,10 +48,24 @@ struct Args {
 
     #[arg(long, default_value = "8082")]
     http_port: u16,
+
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    #[arg(long)]
+    ca_cert: Option<String>,
+
+    #[arg(long)]
+    domain_name: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -62,7 +77,13 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let addr = args.addr.parse()?;
 
-    let chunk_server = MyChunkServer::new(args.storage_dir.clone(), args.config_servers.clone());
+    let storage_dir = args.storage_dir.clone(); // Define storage_dir here
+    let chunk_server = MyChunkServer::new(
+        storage_dir.clone(),         // Pass storage_dir
+        args.config_servers.clone(), // Use config_servers as it's defined in Args
+        args.ca_cert.clone(),
+        args.domain_name.clone(),
+    );
 
     // Start HTTP Server for metrics
     let app_state = AppState {
@@ -75,10 +96,23 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state);
 
     let http_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.http_port).into();
+    let tls_cert = args.tls_cert.clone();
+    let tls_key = args.tls_key.clone();
+
     tokio::spawn(async move {
         tracing::info!("HTTP server listening on {}", http_addr);
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+            let config = dfs_common::security::get_axum_tls_config(&cert, &key)
+                .await
+                .unwrap();
+            axum_server::bind_rustls(http_addr, config)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        } else {
+            let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
     });
 
     // Start background scrubber
@@ -140,15 +174,55 @@ async fn main() -> anyhow::Result<()> {
             };
 
             for master_addr in masters {
-                let master_url = if master_addr.starts_with("http://") {
-                    master_addr.clone()
-                } else {
-                    format!("http://{}", master_addr)
+                let mut master_url = master_addr.clone();
+                if args.ca_cert.is_some() && !master_url.starts_with("https://") {
+                    if master_url.starts_with("http://") {
+                        master_url = master_url.replace("http://", "https://");
+                    } else {
+                        master_url = format!("https://{}", master_url);
+                    }
+                } else if !master_url.starts_with("http://") && args.ca_cert.is_none() {
+                    master_url = format!("http://{}", master_url);
+                }
+
+                let mut endpoint = match tonic::transport::Endpoint::from_shared(master_url.clone())
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!("Invalid master URL {}: {}", master_url, e);
+                        continue;
+                    }
                 };
-                tracing::debug!("Heartbeating to master: {}", master_url);
-                match MasterServiceClient::connect(master_url.clone()).await {
-                    Ok(mut client) => {
-                        let request = tonic::Request::new(dfs_chunkserver::dfs::HeartbeatRequest {
+
+                if let Some(ca_path) = &args.ca_cert {
+                    let domain = master_url
+                        .split("://")
+                        .last()
+                        .unwrap_or("")
+                        .split(':')
+                        .next()
+                        .unwrap_or("localhost")
+                        .to_string();
+                    if let Ok(tls_config) =
+                        dfs_common::security::get_client_tls_config(ca_path, &domain)
+                    {
+                        endpoint = endpoint
+                            .tls_config(tls_config)
+                            .expect("Failed to apply TLS config");
+                    }
+                }
+
+                match endpoint.connect().await {
+                    Ok(channel) => {
+                        let mut client = MasterServiceClient::with_interceptor(
+                            channel,
+                            dfs_common::telemetry::tracing_interceptor
+                                as fn(
+                                    tonic::Request<()>,
+                                )
+                                    -> Result<tonic::Request<()>, tonic::Status>,
+                        );
+                        let request = tonic::Request::new(HeartbeatRequest {
                             chunk_server_address: my_addr.clone(),
                             used_space,
                             available_space,
@@ -190,9 +264,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    tracing::info!("ChunkServer listening on {}", addr);
+    tracing::info!("ChunkServer gRPC server listening on {}", addr);
 
-    Server::builder()
+    let mut server = Server::builder();
+
+    if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
+        let tls_config = dfs_common::security::get_server_tls_config(&cert, &key)?;
+        server = server.tls_config(tls_config)?;
+    }
+
+    server
         .add_service(
             ChunkServerServiceServer::new(chunk_server)
                 .max_decoding_message_size(100 * 1024 * 1024),

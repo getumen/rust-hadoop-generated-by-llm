@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use dfs_client::dfs::master_service_client::MasterServiceClient;
+use dfs_client::dfs::*;
 use dfs_client::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +31,12 @@ struct Cli {
         help = "Map internal hostnames to local addresses (e.g. master1:50051=localhost:50051)"
     )]
     host_alias: Vec<String>,
+
+    #[arg(long, help = "CA certificate for TLS")]
+    ca_cert: Option<String>,
+
+    #[arg(long, help = "Domain name for TLS certificate verification")]
+    domain_name: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -150,6 +158,8 @@ enum ClusterAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -167,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     let client = Client::new(master_addrs, cli.config_servers)
-        .with_retry_config(cli.max_retries, cli.initial_backoff_ms);
+        .with_retry_config(cli.max_retries, cli.initial_backoff_ms)
+        .with_tls_config(cli.ca_cert.clone(), cli.domain_name.clone());
 
     for alias_pair in cli.host_alias {
         if let Some((alias, real)) = alias_pair.split_once('=') {
@@ -175,6 +186,46 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let client = Arc::new(client);
+
+    async fn connect_master(
+        master: &str,
+        ca_cert: &Option<String>,
+        domain_name: &Option<String>,
+    ) -> anyhow::Result<MasterServiceClient<tonic::transport::Channel>> {
+        let mut master_url = if master.starts_with("http") {
+            master.to_string()
+        } else {
+            format!("http://{}", master)
+        };
+
+        if ca_cert.is_some() && master_url.starts_with("http://") {
+            master_url = master_url.replace("http://", "https://");
+        }
+
+        let mut endpoint = tonic::transport::Endpoint::from_shared(master_url.clone())?;
+
+        if let Some(ca_path) = ca_cert {
+            let domain = domain_name.clone().unwrap_or_else(|| {
+                master_url
+                    .split("://")
+                    .last()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost")
+                    .to_string()
+            });
+            if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
+                endpoint = endpoint
+                    .tls_config(tls_config)
+                    .expect("Failed to apply TLS config");
+            }
+        }
+
+        let channel = endpoint.connect().await?;
+        Ok(MasterServiceClient::new(channel))
+    }
     match cli.command {
         Commands::Ls => {
             let files = client.list_all_files().await?;
@@ -211,16 +262,8 @@ async fn main() -> anyhow::Result<()> {
             println!("File renamed successfully: {} -> {}", source, dest);
         }
         Commands::SafeMode { action } => {
-            use dfs_client::dfs::master_service_client::MasterServiceClient;
-            use dfs_client::dfs::{GetSafeModeStatusRequest, SetSafeModeRequest};
-
-            let master_addr = if cli.master.starts_with("http://") {
-                cli.master.clone()
-            } else {
-                format!("http://{}", cli.master)
-            };
-
-            let mut grpc_client = MasterServiceClient::connect(master_addr).await?;
+            let mut grpc_client =
+                connect_master(&cli.master, &cli.ca_cert, &cli.domain_name).await?;
 
             match action {
                 SafeModeAction::Get => {
@@ -266,18 +309,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Cluster { action } => {
-            use dfs_client::dfs::master_service_client::MasterServiceClient;
-            use dfs_client::dfs::{
-                AddRaftServerRequest, GetClusterInfoRequest, RemoveRaftServerRequest,
-            };
-
-            let master_addr = if cli.master.starts_with("http://") {
-                cli.master.clone()
-            } else {
-                format!("http://{}", cli.master)
-            };
-
-            let mut grpc_client = MasterServiceClient::connect(master_addr).await?;
+            let mut grpc_client =
+                connect_master(&cli.master, &cli.ca_cert, &cli.domain_name).await?;
 
             match action {
                 ClusterAction::Info => {
