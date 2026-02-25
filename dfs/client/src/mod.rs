@@ -29,6 +29,8 @@ pub struct Client {
     config_server_addrs: Vec<String>,
     max_retries: usize,
     initial_backoff_ms: u64,
+    ca_cert_path: Option<String>,
+    domain_name: Option<String>,
 }
 
 impl Client {
@@ -41,7 +43,19 @@ impl Client {
             config_server_addrs,
             max_retries: MAX_RETRIES,
             initial_backoff_ms: INITIAL_BACKOFF_MS,
+            ca_cert_path: None,
+            domain_name: None,
         }
+    }
+
+    pub fn with_tls_config(
+        mut self,
+        ca_cert_path: Option<String>,
+        domain_name: Option<String>,
+    ) -> Self {
+        self.ca_cert_path = ca_cert_path;
+        self.domain_name = domain_name;
+        self
     }
 
     pub fn with_retry_config(mut self, max_retries: usize, initial_backoff_ms: u64) -> Self {
@@ -68,6 +82,37 @@ impl Client {
             }
         }
         url.to_string()
+    }
+
+    async fn connect_endpoint(&self, url: &str) -> anyhow::Result<Channel> {
+        let mut addr = url.to_string();
+        if self.ca_cert_path.is_some() && addr.starts_with("http://") {
+            addr = addr.replace("http://", "https://");
+        }
+        let resolved_addr = self.resolve_url(&addr);
+        let mut endpoint = tonic::transport::Endpoint::from_shared(resolved_addr.clone())?;
+
+        if let Some(ca_path) = &self.ca_cert_path {
+            let domain = self.domain_name.clone().unwrap_or_else(|| {
+                addr.split("://")
+                    .last()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost")
+                    .to_string()
+            });
+            if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
+                endpoint = endpoint
+                    .tls_config(tls_config)
+                    .expect("Failed to apply TLS config");
+            }
+        }
+
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| anyhow!("Failed to connect to {}: {}", resolved_addr, e))
     }
 
     pub async fn list_files(&self, path: &str) -> anyhow::Result<Vec<String>> {
@@ -250,10 +295,7 @@ impl Client {
 
         // 4. Write to first chunk server with replication pipeline
         let chunk_server_addr = format!("http://{}", chunk_servers[0]);
-        let resolved_addr = self.resolve_url(&chunk_server_addr);
-        let channel = tonic::transport::Endpoint::from_shared(resolved_addr.clone())?
-            .connect()
-            .await?;
+        let channel = self.connect_endpoint(&chunk_server_addr).await?;
         let mut chunk_client =
             crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(
                 channel,
@@ -339,42 +381,37 @@ impl Client {
             }
 
             let mut success = false;
-            for location in block.locations {
+            for location in &block.locations {
                 let chunk_server_addr = format!("http://{}", location);
-                let resolved_addr = self.resolve_url(&chunk_server_addr);
-                let channel_res = tonic::transport::Endpoint::from_shared(resolved_addr.clone());
-                match channel_res {
-                    Ok(endpoint) => match endpoint.connect().await {
-                        Ok(channel) => {
-                            let mut client = ChunkServerServiceClient::with_interceptor(
-                                channel,
-                                dfs_common::telemetry::tracing_interceptor
-                                    as fn(
-                                        tonic::Request<()>,
-                                    )
-                                        -> Result<tonic::Request<()>, tonic::Status>,
-                            )
-                            .max_decoding_message_size(100 * 1024 * 1024);
-                            let request = tonic::Request::new(ReadBlockRequest {
-                                block_id: block.block_id.clone(),
-                                offset: 0,
-                                length: 0, // 0 means read entire block
-                            });
-                            match client.read_block(request).await {
-                                Ok(response) => {
-                                    let data = response.into_inner().data;
-                                    file.write_all(&data)?;
-                                    success = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to read block from {}: {}", location, e)
-                                }
+                match self.connect_endpoint(&chunk_server_addr).await {
+                    Ok(channel) => {
+                        let mut client = ChunkServerServiceClient::with_interceptor(
+                            channel,
+                            dfs_common::telemetry::tracing_interceptor
+                                as fn(
+                                    tonic::Request<()>,
+                                )
+                                    -> Result<tonic::Request<()>, tonic::Status>,
+                        )
+                        .max_decoding_message_size(100 * 1024 * 1024);
+                        let request = tonic::Request::new(ReadBlockRequest {
+                            block_id: block.block_id.clone(),
+                            offset: 0,
+                            length: 0, // 0 means read entire block
+                        });
+                        match client.read_block(request).await {
+                            Ok(response) => {
+                                let data = response.into_inner().data;
+                                file.write_all(&data)?;
+                                success = true;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to read block from {}: {}", location, e)
                             }
                         }
-                        Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
-                    },
-                    Err(e) => tracing::error!("Invalid URL {}: {}", resolved_addr, e),
+                    }
+                    Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
                 }
             }
 
@@ -484,47 +521,42 @@ impl Client {
             let mut success = false;
             for location in &block.locations {
                 let chunk_server_addr = format!("http://{}", location);
-                let resolved_addr = self.resolve_url(&chunk_server_addr);
-                let channel_res = tonic::transport::Endpoint::from_shared(resolved_addr.clone());
-                match channel_res {
-                    Ok(endpoint) => match endpoint.connect().await {
-                        Ok(channel) => {
-                            let mut client = ChunkServerServiceClient::with_interceptor(
-                                channel,
-                                dfs_common::telemetry::tracing_interceptor
-                                    as fn(
-                                        tonic::Request<()>,
-                                    )
-                                        -> Result<tonic::Request<()>, tonic::Status>,
-                            )
-                            .max_decoding_message_size(100 * 1024 * 1024);
-                            let request = tonic::Request::new(ReadBlockRequest {
-                                block_id: block.block_id.clone(),
-                                offset: block_offset,
-                                length: block_length,
-                            });
-                            match client.read_block(request).await {
-                                Ok(response) => {
-                                    let resp = response.into_inner();
-                                    tracing::debug!(
-                                        "Read {} bytes from block {} (offset={}, length={})",
-                                        resp.bytes_read,
-                                        block.block_id,
-                                        block_offset,
-                                        block_length
-                                    );
-                                    result.extend_from_slice(&resp.data);
-                                    success = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to read block from {}: {}", location, e)
-                                }
+                match self.connect_endpoint(&chunk_server_addr).await {
+                    Ok(channel) => {
+                        let mut client = ChunkServerServiceClient::with_interceptor(
+                            channel,
+                            dfs_common::telemetry::tracing_interceptor
+                                as fn(
+                                    tonic::Request<()>,
+                                )
+                                    -> Result<tonic::Request<()>, tonic::Status>,
+                        )
+                        .max_decoding_message_size(100 * 1024 * 1024);
+                        let request = tonic::Request::new(ReadBlockRequest {
+                            block_id: block.block_id.clone(),
+                            offset: block_offset,
+                            length: block_length,
+                        });
+                        match client.read_block(request).await {
+                            Ok(response) => {
+                                let resp = response.into_inner();
+                                tracing::debug!(
+                                    "Read {} bytes from block {} (offset={}, length={})",
+                                    resp.bytes_read,
+                                    block.block_id,
+                                    block_offset,
+                                    block_length
+                                );
+                                result.extend_from_slice(&resp.data);
+                                success = true;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to read block from {}: {}", location, e)
                             }
                         }
-                        Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
-                    },
-                    Err(e) => tracing::error!("Invalid URL {}: {}", resolved_addr, e),
+                    }
+                    Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
                 }
             }
 
@@ -628,57 +660,45 @@ impl Client {
 
         for location in &block.locations {
             let chunk_server_addr = format!("http://{}", location);
-            let resolved_addr = self.resolve_url(&chunk_server_addr);
+            match self.connect_endpoint(&chunk_server_addr).await {
+                Ok(channel) => {
+                    let mut client = ChunkServerServiceClient::with_interceptor(
+                        channel,
+                        dfs_common::telemetry::tracing_interceptor
+                            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                    )
+                    .max_decoding_message_size(100 * 1024 * 1024);
 
-            let channel_res = tonic::transport::Endpoint::from_shared(resolved_addr.clone());
-            match channel_res {
-                Ok(endpoint) => match endpoint.connect().await {
-                    Ok(channel) => {
-                        let mut client = ChunkServerServiceClient::with_interceptor(
-                            channel,
-                            dfs_common::telemetry::tracing_interceptor
-                                as fn(
-                                    tonic::Request<()>,
-                                )
-                                    -> Result<tonic::Request<()>, tonic::Status>,
-                        )
-                        .max_decoding_message_size(100 * 1024 * 1024);
+                    let request = tonic::Request::new(ReadBlockRequest {
+                        block_id: block.block_id.clone(),
+                        offset: 0,
+                        length: 0, // Read entire block
+                    });
 
-                        let request = tonic::Request::new(ReadBlockRequest {
-                            block_id: block.block_id.clone(),
-                            offset: 0,
-                            length: 0, // Read entire block
-                        });
-
-                        match client.read_block(request).await {
-                            Ok(response) => {
-                                let data = response.into_inner().data;
-                                tracing::debug!(
-                                    "Successfully fetched block {} from {}",
-                                    block.block_id,
-                                    location
-                                );
-                                return Ok(data);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to read block {} from {}: {}",
-                                    block.block_id,
-                                    location,
-                                    e
-                                );
-                                // Try next location
-                                continue;
-                            }
+                    match client.read_block(request).await {
+                        Ok(response) => {
+                            let data = response.into_inner().data;
+                            tracing::debug!(
+                                "Successfully fetched block {} from {}",
+                                block.block_id,
+                                location
+                            );
+                            return Ok(data);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to read block {} from {}: {}",
+                                block.block_id,
+                                location,
+                                e
+                            );
+                            // Try next location
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to connect to {}: {}", location, e);
-                        continue;
-                    }
-                },
+                }
                 Err(e) => {
-                    tracing::warn!("Invalid URL {}: {}", resolved_addr, e);
+                    tracing::warn!("Failed to connect to {}: {}", location, e);
                     continue;
                 }
             }
@@ -860,10 +880,15 @@ impl Client {
             attempt += 1;
 
             let targets = if let Some(hint) = leader_hint.take() {
-                let hint_with_prefix = if hint.starts_with("http://") {
+                let prefix = if self.ca_cert_path.is_some() {
+                    "https://"
+                } else {
+                    "http://"
+                };
+                let hint_with_prefix = if hint.contains("://") {
                     hint
                 } else {
-                    format!("http://{}", hint)
+                    format!("{}{}", prefix, hint)
                 };
                 tracing::info!("Using leader hint with prefix: {}", hint_with_prefix);
                 let mut t = vec![hint_with_prefix];
@@ -878,22 +903,50 @@ impl Client {
                     continue;
                 }
 
-                let resolved_addr = self.resolve_url(&master_addr);
-                let channel = match tonic::transport::Endpoint::from_shared(resolved_addr.clone()) {
-                    Ok(endpoint) => match endpoint.connect().await {
-                        Ok(channel) => channel,
+                let mut addr = master_addr.clone();
+                if self.ca_cert_path.is_some() && addr.starts_with("http://") {
+                    addr = addr.replace("http://", "https://");
+                }
+
+                let resolved_addr = self.resolve_url(&addr);
+                let mut endpoint =
+                    match tonic::transport::Endpoint::from_shared(resolved_addr.clone()) {
+                        Ok(endpoint) => endpoint,
                         Err(e) => {
-                            tracing::error!(
-                                "Failed to connect to {} (resolved: {}): {}",
-                                master_addr,
-                                resolved_addr,
-                                e
-                            );
+                            tracing::error!("Invalid URL {}: {}", resolved_addr, e);
                             continue;
                         }
-                    },
+                    };
+
+                if let Some(ca_path) = &self.ca_cert_path {
+                    let domain = self.domain_name.clone().unwrap_or_else(|| {
+                        // Extract hostname from addr for default domain
+                        addr.split("://")
+                            .last()
+                            .unwrap_or("")
+                            .split(':')
+                            .next()
+                            .unwrap_or("localhost")
+                            .to_string()
+                    });
+                    if let Ok(tls_config) =
+                        dfs_common::security::get_client_tls_config(ca_path, &domain)
+                    {
+                        endpoint = endpoint
+                            .tls_config(tls_config)
+                            .expect("Failed to apply TLS config");
+                    }
+                }
+
+                let channel = match endpoint.connect().await {
+                    Ok(channel) => channel,
                     Err(e) => {
-                        tracing::error!("Invalid URL {}: {}", resolved_addr, e);
+                        tracing::error!(
+                            "Failed to connect to {} (resolved: {}): {}",
+                            addr,
+                            resolved_addr,
+                            e
+                        );
                         continue;
                     }
                 };

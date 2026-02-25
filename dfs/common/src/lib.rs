@@ -8,6 +8,7 @@ pub mod telemetry {
     pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
     /// Client-side interceptor to inject or generate a request ID
+    #[allow(clippy::result_large_err)]
     pub fn tracing_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
         let request_id = match req.metadata().get(REQUEST_ID_HEADER) {
             Some(id) => id.clone(),
@@ -36,6 +37,7 @@ pub mod telemetry {
     }
 
     /// Interceptor to propagate a SPECIFIC request ID (used in replication)
+    #[allow(clippy::result_large_err)]
     pub fn propagation_interceptor(
         request_id: String,
     ) -> impl Fn(Request<()>) -> Result<Request<()>, Status> {
@@ -48,4 +50,5 @@ pub mod telemetry {
     }
 }
 
+pub mod security;
 pub mod sharding;

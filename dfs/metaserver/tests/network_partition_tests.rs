@@ -54,10 +54,7 @@ impl MockNetwork {
 
         partitions.insert(node, others.clone());
         for &other in &others {
-            partitions
-                .entry(other)
-                .or_insert_with(HashSet::new)
-                .insert(node);
+            partitions.entry(other).or_default().insert(node);
         }
     }
 }
@@ -71,7 +68,7 @@ fn test_partition_prevents_split_brain() {
     let network = MockNetwork::new();
 
     // Initial state: 5 nodes, all can communicate
-    let _nodes = vec![0, 1, 2, 3, 4];
+    let _nodes = [0, 1, 2, 3, 4];
 
     // Partition: {0, 1} vs {2, 3, 4}
     network.create_partition(vec![0, 1], vec![2, 3, 4]);
@@ -129,7 +126,7 @@ fn test_leader_election_after_partition() {
     );
 
     // Majority partition can elect new leader
-    let remaining_nodes = vec![1, 2, 3, 4];
+    let remaining_nodes = [1, 2, 3, 4];
     let majority_votes = remaining_nodes.len();
     assert!(
         majority_votes >= majority_needed,
@@ -313,7 +310,7 @@ fn test_log_consistency_after_partition() {
     // Test that log consistency is maintained after partition healing
 
     // Before partition: all nodes have log entries [1, 2, 3]
-    let initial_log = vec![1, 2, 3];
+    let initial_log = [1, 2, 3];
 
     // Partition: {0, 1} vs {2, 3, 4}
     let network = MockNetwork::new();

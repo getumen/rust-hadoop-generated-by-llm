@@ -60,8 +60,12 @@ async fn main() -> anyhow::Result<()> {
         config_servers
     );
 
+    let ca_cert = std::env::var("CA_CERT").ok();
+    let domain_name = std::env::var("DOMAIN_NAME").ok();
+
     // The Client::new expects (master_addrs, config_server_addrs)
-    let client = Client::new(vec![master_addr], config_servers);
+    let client =
+        Client::new(vec![master_addr], config_servers).with_tls_config(ca_cert, domain_name);
 
     // Load shard map if config is provided (optional, Config Server is preferred)
     let shard_config_path = std::env::var("SHARD_CONFIG").ok();
@@ -86,9 +90,20 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(9000);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let tls_cert = std::env::var("TLS_CERT").ok();
+    let tls_key = std::env::var("TLS_KEY").ok();
+
     tracing::info!("S3 Server listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        let config = dfs_common::security::get_axum_tls_config(&cert, &key).await?;
+        axum_server::bind_rustls(addr, config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+    }
 
     Ok(())
 }

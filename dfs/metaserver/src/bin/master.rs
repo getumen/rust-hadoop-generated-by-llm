@@ -55,6 +55,18 @@ struct Args {
 
     #[arg(long, default_value = "1.0")]
     merge_threshold_rps: f64,
+
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    #[arg(long)]
+    ca_cert: Option<String>,
+
+    #[arg(long)]
+    domain_name: Option<String>,
 }
 
 // Axum state for sharing the Raft channel
@@ -74,6 +86,8 @@ impl IntoResponse for InternalError {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -113,15 +127,16 @@ async fn main() -> anyhow::Result<()> {
         .cloned()
         .collect();
 
-    let mut raft_node = RaftNode::new(
-        args.id,
-        peers.clone(),
-        advertise_addr.clone(),
-        args.storage_dir.clone(),
-        state.clone(),
-        raft_rx,
-        raft_tx_for_node,
-    );
+    let mut raft_node = RaftNode::new(dfs_metaserver::simple_raft::RaftNodeConfig {
+        id: args.id,
+        peers: peers.clone(),
+        client_address: advertise_addr.clone(),
+        storage_dir: args.storage_dir.clone(),
+        app_state: state.clone(),
+        inbox: raft_rx,
+        self_tx: raft_tx_for_node,
+        ca_cert_path: args.ca_cert.clone(),
+    });
 
     // Start Raft Node
     tokio::spawn(async move {
@@ -145,10 +160,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Start HTTP Server for Raft RPC
     let http_addr: std::net::SocketAddr = ([0, 0, 0, 0], args.http_port).into();
+    let tls_cert = args.tls_cert.clone();
+    let tls_key = args.tls_key.clone();
+
     tokio::spawn(async move {
         tracing::info!("HTTP server listening on {}", http_addr);
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+            let config = dfs_common::security::get_axum_tls_config(&cert, &key)
+                .await
+                .unwrap();
+            axum_server::bind_rustls(http_addr, config)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        } else {
+            let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
     });
 
     // Load Shard Map
@@ -171,12 +199,21 @@ async fn main() -> anyhow::Result<()> {
             split_threshold_rps: args.split_threshold_rps,
             split_cooldown_secs: args.split_cooldown_secs,
             merge_threshold_rps: args.merge_threshold_rps,
+            ca_cert_path: args.ca_cert.clone(),
+            domain_name: args.domain_name.clone(),
         },
     );
 
     tracing::info!("Master gRPC server listening on {}", addr);
 
-    Server::builder()
+    let mut server = Server::builder();
+
+    if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
+        let tls_config = dfs_common::security::get_server_tls_config(&cert, &key)?;
+        server = server.tls_config(tls_config)?;
+    }
+
+    server
         .add_service(MasterServiceServer::new(master).max_decoding_message_size(100 * 1024 * 1024))
         .serve(addr)
         .await?;

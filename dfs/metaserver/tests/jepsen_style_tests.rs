@@ -117,13 +117,10 @@ impl LinearizabilityChecker {
             let mut committed_writes: Vec<(Instant, Instant, i64)> = Vec::new();
 
             for op in &sorted {
-                match (&op.op_type, &op.result) {
-                    (OpType::Write, OpResult::WriteOk) => {
-                        if let Some(val) = op.input_value {
-                            committed_writes.push((op.invoke_time, op.complete_time, val));
-                        }
+                if let (OpType::Write, OpResult::WriteOk) = (&op.op_type, &op.result) {
+                    if let Some(val) = op.input_value {
+                        committed_writes.push((op.invoke_time, op.complete_time, val));
                     }
-                    _ => {}
                 }
             }
 

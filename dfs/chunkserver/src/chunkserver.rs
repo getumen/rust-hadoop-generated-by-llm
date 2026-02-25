@@ -26,10 +26,17 @@ pub struct MyChunkServer {
     // LRU cache for frequently accessed blocks
     // Cache size is in number of blocks (not bytes)
     block_cache: Arc<Mutex<LruCache<String, CachedBlock>>>,
+    ca_cert_path: Option<String>,
+    domain_name: Option<String>,
 }
 
 impl MyChunkServer {
-    pub fn new(storage_dir: PathBuf, config_server_addrs: Vec<String>) -> Self {
+    pub fn new(
+        storage_dir: PathBuf,
+        config_server_addrs: Vec<String>,
+        ca_cert_path: Option<String>,
+        domain_name: Option<String>,
+    ) -> Self {
         fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
 
         // Load shard map from config file if available
@@ -64,7 +71,45 @@ impl MyChunkServer {
             config_server_addrs,
             shard_map,
             block_cache,
+            ca_cert_path,
+            domain_name,
         }
+    }
+
+    async fn connect_endpoint(&self, url: &str) -> anyhow::Result<tonic::transport::Channel> {
+        let mut addr = url.to_string();
+        if self.ca_cert_path.is_some() && addr.starts_with("http://") {
+            addr = addr.replace("http://", "https://");
+        }
+        let resolved_addr = if addr.contains("://") {
+            addr.clone()
+        } else {
+            format!("http://{}", addr)
+        };
+
+        let mut endpoint = tonic::transport::Endpoint::from_shared(resolved_addr.clone())?;
+
+        if let Some(ca_path) = &self.ca_cert_path {
+            let domain = self.domain_name.clone().unwrap_or_else(|| {
+                addr.split("://")
+                    .last()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost")
+                    .to_string()
+            });
+            if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
+                endpoint = endpoint
+                    .tls_config(tls_config)
+                    .expect("Failed to apply TLS config");
+            }
+        }
+
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", resolved_addr, e))
     }
 
     pub fn get_storage_dir(&self) -> PathBuf {
@@ -74,14 +119,9 @@ impl MyChunkServer {
     pub async fn refresh_shard_map(&self) -> Result<(), String> {
         for config_addr in &self.config_server_addrs {
             use crate::dfs::config_service_client::ConfigServiceClient;
-            let addr = if config_addr.starts_with("http") {
-                config_addr.clone()
-            } else {
-                format!("http://{}", config_addr)
-            };
-
-            match ConfigServiceClient::connect(addr).await {
-                Ok(mut client) => {
+            match self.connect_endpoint(config_addr).await {
+                Ok(channel) => {
+                    let mut client = ConfigServiceClient::new(channel);
                     let request = tonic::Request::new(crate::dfs::FetchShardMapRequest {});
                     match client.fetch_shard_map(request).await {
                         Ok(response) => {
@@ -198,14 +238,10 @@ impl MyChunkServer {
         };
 
         for master_addr in masters {
-            let master_url = if master_addr.starts_with("http://") {
-                master_addr.clone()
-            } else {
-                format!("http://{}", master_addr)
-            };
-            match crate::dfs::master_service_client::MasterServiceClient::connect(master_url).await
-            {
-                Ok(mut client) => {
+            match self.connect_endpoint(&master_addr).await {
+                Ok(channel) => {
+                    let mut client =
+                        crate::dfs::master_service_client::MasterServiceClient::new(channel);
                     let request = tonic::Request::new(crate::dfs::GetBlockLocationsRequest {
                         block_id: block_id.to_string(),
                     });
@@ -246,12 +282,12 @@ impl MyChunkServer {
 
             tracing::info!("Trying to fetch block {} from {}", block_id, location);
 
-            match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
-                format!("http://{}", location),
-            )
-            .await
-            {
-                Ok(mut client) => {
+            match self.connect_endpoint(&location).await {
+                Ok(channel) => {
+                    let mut client =
+                        crate::dfs::chunk_server_service_client::ChunkServerServiceClient::new(
+                            channel,
+                        );
                     let request = tonic::Request::new(crate::dfs::ReadBlockRequest {
                         block_id: block_id.to_string(),
                         offset: 0,
@@ -310,21 +346,17 @@ impl MyChunkServer {
         };
 
         // 2. Send ReplicateBlock RPC to target
-        let target_url = format!("http://{}", target_addr);
-        let mut client =
-            match crate::dfs::chunk_server_service_client::ChunkServerServiceClient::connect(
-                target_url,
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to connect to target {}: {}",
-                        target_addr, e
-                    ))
-                }
-            };
+        let mut client = match self.connect_endpoint(target_addr).await {
+            Ok(channel) => {
+                crate::dfs::chunk_server_service_client::ChunkServerServiceClient::new(channel)
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to connect to target {}: {}",
+                    target_addr, e
+                ))
+            }
+        };
 
         let request = tonic::Request::new(crate::dfs::ReplicateBlockRequest {
             block_id: block_id.to_string(),
@@ -438,32 +470,27 @@ impl ChunkServerService for MyChunkServer {
                 let remaining_servers = req.next_servers[1..].to_vec();
 
                 // Forward to next server in pipeline
-                let next_addr = format!("http://{}", next_server);
-                match tonic::transport::Endpoint::from_shared(next_addr.clone()) {
-                    Ok(endpoint) => match endpoint.connect().await {
-                        Ok(channel) => {
-                            let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id.clone()))
-                                .max_decoding_message_size(100 * 1024 * 1024);
-                            let replicate_req = crate::dfs::ReplicateBlockRequest {
-                                block_id: req.block_id,
-                                data: req.data,
-                                next_servers: remaining_servers,
-                            };
+                match self.connect_endpoint(next_server).await {
+                    Ok(channel) => {
+                        let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id.clone()))
+                            .max_decoding_message_size(100 * 1024 * 1024);
+                        let replicate_req = crate::dfs::ReplicateBlockRequest {
+                            block_id: req.block_id.clone(),
+                            data: req.data.clone(),
+                            next_servers: remaining_servers,
+                        };
 
-                            if let Err(e) = client.replicate_block(replicate_req).await {
-                                tracing::error!("Failed to replicate to {}: {}", next_server, e);
-                                // Continue even if replication fails
-                            }
+                        if let Err(e) = client.replicate_block(replicate_req).await {
+                            tracing::error!("Failed to replicate to {}: {}", next_server, e);
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to connect to {} for replication: {}",
-                                next_server,
-                                e
-                            );
-                        }
-                    },
-                    Err(e) => tracing::error!("Invalid URL {}: {}", next_addr, e),
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to connect to {} for replication: {}",
+                            next_server,
+                            e
+                        );
+                    }
                 }
             }
 
@@ -660,31 +687,27 @@ impl ChunkServerService for MyChunkServer {
                 let next_server = &req.next_servers[0];
                 let remaining_servers = req.next_servers[1..].to_vec();
 
-                let next_addr = format!("http://{}", next_server);
-                match tonic::transport::Endpoint::from_shared(next_addr.clone()) {
-                    Ok(endpoint) => match endpoint.connect().await {
-                        Ok(channel) => {
-                            let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id))
-                                .max_decoding_message_size(100 * 1024 * 1024);
-                            let replicate_req = crate::dfs::ReplicateBlockRequest {
-                                block_id: req.block_id,
-                                data: req.data,
-                                next_servers: remaining_servers,
-                            };
+                match self.connect_endpoint(next_server).await {
+                    Ok(channel) => {
+                        let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id))
+                            .max_decoding_message_size(100 * 1024 * 1024);
+                        let replicate_req = crate::dfs::ReplicateBlockRequest {
+                            block_id: req.block_id,
+                            data: req.data,
+                            next_servers: remaining_servers,
+                        };
 
-                            if let Err(e) = client.replicate_block(replicate_req).await {
-                                tracing::error!("Failed to replicate to {}: {}", next_server, e);
-                            }
+                        if let Err(e) = client.replicate_block(replicate_req).await {
+                            tracing::error!("Failed to replicate to {}: {}", next_server, e);
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to connect to {} for replication: {}",
-                                next_server,
-                                e
-                            );
-                        }
-                    },
-                    Err(e) => tracing::error!("Invalid URL {}: {}", next_addr, e),
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to connect to {} for replication: {}",
+                            next_server,
+                            e
+                        );
+                    }
                 }
             }
 
@@ -706,7 +729,7 @@ mod tests {
     #[test]
     fn test_checksum_verification() {
         let dir = tempdir().unwrap();
-        let server = MyChunkServer::new(dir.path().to_path_buf(), vec![]);
+        let server = MyChunkServer::new(dir.path().to_path_buf(), vec![], None, None);
         let block_id = "test_block";
         let data = b"Hello, world! This is a test block for checksum verification.";
 

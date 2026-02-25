@@ -5,9 +5,9 @@
 
 ### 1. Security & Identity (セキュリティ・認証)
 S3互換サービスとしての信頼確保。
-- [ ] **TLS Encryption**
-    - [ ] `tonic` / `axum` での自署名・CA証明書による通信暗号化サポート。
-    - [ ] Raftノード間通信（gRPC）のTLS化。
+- [x] **TLS Encryption** ✅ (完了)
+    - [x] `tonic` / `axum` での自署名・CA証明書による通信暗号化サポート。
+    - [x] Raftノード間通信（gRPC）のTLS化。
 - [ ] **S3 Signature V4 Authentication**
     - [ ] `Authorization` ヘッダーのパースと署名検証ロジックの実装（HMAC-SHA256）。
     - [ ] `X-Amz-Content-Sha256` によるペイロード整合性チェック。

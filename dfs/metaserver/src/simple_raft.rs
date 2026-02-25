@@ -610,16 +610,29 @@ pub struct RaftNode {
     pub monotonic_time: u64,
 }
 
+pub struct RaftNodeConfig {
+    pub id: usize,
+    pub peers: Vec<String>,
+    pub client_address: String,
+    pub storage_dir: String,
+    pub app_state: Arc<Mutex<AppState>>,
+    pub inbox: mpsc::Receiver<Event>,
+    pub self_tx: mpsc::Sender<Event>,
+    pub ca_cert_path: Option<String>,
+}
+
 impl RaftNode {
-    pub fn new(
-        id: usize,
-        peers: Vec<String>,
-        client_address: String,
-        storage_dir: String,
-        app_state: Arc<Mutex<AppState>>,
-        inbox: mpsc::Receiver<Event>,
-        self_tx: mpsc::Sender<Event>,
-    ) -> Self {
+    pub fn new(config: RaftNodeConfig) -> Self {
+        let RaftNodeConfig {
+            id,
+            peers,
+            client_address,
+            storage_dir,
+            app_state,
+            inbox,
+            self_tx,
+            ca_cert_path,
+        } = config;
         let path = format!("{}/raft_node_{}", storage_dir, id);
         let db = DB::open_default(&path).expect("Failed to open RocksDB");
         let db = Arc::new(db);
@@ -627,12 +640,26 @@ impl RaftNode {
         let (current_term, voted_for, log, last_included_index, last_included_term) =
             Self::load_state(&db, &app_state);
 
-        // Note: 500ms timeout may be aggressive for large snapshot transfers.
-        // Consider increasing timeout for InstallSnapshot RPCs if needed.
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-            .expect("Failed to build HTTP client");
+        // Initialize HTTP client
+        let mut client_builder = reqwest::Client::builder().timeout(Duration::from_millis(1500)); // Increased timeout for TLS overhead
+
+        if let Some(cert_path) = ca_cert_path {
+            match std::fs::read(&cert_path) {
+                Ok(cert_data) => match reqwest::Certificate::from_pem(&cert_data) {
+                    Ok(cert) => {
+                        client_builder = client_builder.add_root_certificate(cert);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse CA certificate from {}: {}", cert_path, e)
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to read CA certificate from {}: {}", cert_path, e)
+                }
+            }
+        }
+
+        let http_client = client_builder.build().expect("Failed to build HTTP client");
 
         // Initialize cluster configuration from peers
         let mut initial_members = HashMap::new();
