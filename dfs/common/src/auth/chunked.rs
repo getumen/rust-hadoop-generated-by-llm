@@ -44,7 +44,11 @@ impl ChunkVerifier {
         mac.update(string_to_sign.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
 
-        if signature == expected_signature {
+        use subtle::ConstantTimeEq;
+        let sig_bytes = signature.as_bytes();
+        let expected_bytes = expected_signature.as_bytes();
+
+        if sig_bytes.len() == expected_bytes.len() && sig_bytes.ct_eq(expected_bytes).into() {
             self.prev_signature = signature;
             true
         } else {

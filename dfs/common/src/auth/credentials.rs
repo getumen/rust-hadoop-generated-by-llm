@@ -4,15 +4,31 @@ pub trait CredentialProvider: Send + Sync {
 }
 
 /// Simple implementation that reads credentials from environment variables.
-pub struct EnvCredentialProvider;
+pub struct EnvCredentialProvider {
+    access_key: Option<String>,
+    secret_key: Option<String>,
+}
+
+impl EnvCredentialProvider {
+    pub fn new() -> Self {
+        Self {
+            access_key: std::env::var("S3_ACCESS_KEY").ok(),
+            secret_key: std::env::var("S3_SECRET_KEY").ok(),
+        }
+    }
+}
+
+impl Default for EnvCredentialProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CredentialProvider for EnvCredentialProvider {
     fn get_secret_key(&self, access_key: &str) -> Option<String> {
-        let env_key = std::env::var("S3_ACCESS_KEY").ok()?;
-        if access_key == env_key {
-            std::env::var("S3_SECRET_KEY").ok()
-        } else {
-            None
+        match (&self.access_key, &self.secret_key) {
+            (Some(ak), Some(sk)) if access_key == ak => Some(sk.clone()),
+            _ => None,
         }
     }
 }

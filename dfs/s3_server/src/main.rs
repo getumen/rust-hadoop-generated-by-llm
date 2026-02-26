@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let allow_unsigned_payload =
         std::env::var("S3_ALLOW_UNSIGNED_PAYLOAD").unwrap_or_else(|_| "true".to_string()) == "true";
 
-    let credential_provider = Arc::new(EnvCredentialProvider);
+    let credential_provider = Arc::new(EnvCredentialProvider::new());
     let signing_key_cache = Arc::new(SigningKeyCache::default());
 
     let state = S3AppState {
@@ -99,15 +99,18 @@ async fn main() -> anyhow::Result<()> {
         allow_unsigned_payload,
     };
 
-    let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/metrics", get(handle_metrics))
+    let authed_routes = Router::new()
         .route("/", any(handlers::handle_root))
         .route("/{*path}", any(handlers::handle_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::auth_middleware,
-        ))
+        ));
+
+    let app = Router::new()
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
+        .merge(authed_routes)
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 

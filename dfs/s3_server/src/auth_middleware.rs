@@ -4,8 +4,9 @@ use axum::{
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Utc};
 use dfs_common::auth::{parse_credentials, AuthError, SigningInput};
 use std::collections::BTreeMap;
 
@@ -13,35 +14,34 @@ pub async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     // 1. Auth enabled check
     if !state.auth_enabled {
-        return Ok(next.run(req).await);
+        return next.run(req).await;
     }
 
-    // 2. Exempt endpoints
-    let path = req.uri().path();
-    if path == "/health" || path == "/metrics" {
-        return Ok(next.run(req).await);
-    }
-
-    // 3. TLS check
-    // In a real proxy, we'd check if it's HTTPS.
-    // For this lab, assume it's handled by let's say a flag in AppState if we want to enforce it.
+    // 2. TLS check
     if state.require_tls {
-        // Here we could check req.uri().scheme() or a custom header from a proxy
-        // Since we are using axum-server with TLS, we can assume it's TLS if we reach here if properly configured.
-        // But for strictness:
-        // if req.extensions().get::<axum_server::tls_rustls::TlsStream<...>>().is_none() { ... }
+        // In this environment, we can check if the request was made via TLS.
+        // If we are behind a proxy, we might check X-Forwarded-Proto.
+        let is_tls = req.uri().scheme_str() == Some("https")
+            || req
+                .headers()
+                .get("X-Forwarded-Proto")
+                .and_then(|v| v.to_str().ok())
+                == Some("https");
+
+        if !is_tls {
+            return s3_error_response(AuthError::InsecureTransport);
+        }
     }
 
-    // 4. Extract Query parameters for cred parsing and normalization
+    // 3. Extract Query parameters for cred parsing and normalization
     let query_string_raw = req.uri().query().unwrap_or("");
     let query_params: BTreeMap<String, String> =
         serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
 
     // Canonical Query String: sort by param name, then value; URI-encode; empty values as key=
-    // BTreeMap already sorts by key.
     let mut normalized_query_parts = Vec::new();
     for (k, v) in &query_params {
         let encoded_k = dfs_common::auth::encoding::uri_encode(k, true);
@@ -50,15 +50,38 @@ pub async fn auth_middleware(
     }
     let normalized_query_string = normalized_query_parts.join("&");
 
-    // 5. Parse credentials
+    // 4. Parse credentials
     let credentials = match parse_credentials(req.headers(), &query_params) {
         Ok(c) => c,
-        Err(_) => return Err(StatusCode::FORBIDDEN),
+        Err(e) => return s3_error_response(e),
     };
+
+    // 5. Clock Skew Validation (Security requirement)
+    if let Ok(req_time) = DateTime::parse_from_rfc3339(&credentials.timestamp)
+        .or_else(|_| DateTime::parse_from_str(&credentials.timestamp, "%Y%m%dT%H%M%SZ"))
+    {
+        let now = Utc::now();
+        let skew = (now - req_time.with_timezone(&Utc)).num_minutes().abs();
+        if skew > 15 {
+            return s3_error_response(AuthError::RequestTimeTooSkewed {
+                server_time: now.to_rfc3339(),
+                request_time: req_time.to_rfc3339(),
+            });
+        }
+    }
 
     // 6. Validate credential scope
     if credentials.region != state.server_region || credentials.service != "s3" {
-        return Err(StatusCode::BAD_REQUEST);
+        return s3_error_response(AuthError::InvalidCredentialScope {
+            expected: format!(
+                "{}/{}/s3/aws4_request",
+                credentials.date, state.server_region
+            ),
+            received: format!(
+                "{}/{}/{}/{}",
+                credentials.date, credentials.region, credentials.service, "aws4_request"
+            ),
+        });
     }
 
     // 7. Retrieve secret key
@@ -67,7 +90,11 @@ pub async fn auth_middleware(
         .get_secret_key(&credentials.access_key)
     {
         Some(k) => k,
-        None => return Err(StatusCode::FORBIDDEN),
+        None => {
+            return s3_error_response(AuthError::InvalidAccessKey {
+                access_key: credentials.access_key,
+            })
+        }
     };
 
     // Use cache for signing key
@@ -90,25 +117,25 @@ pub async fn auth_middleware(
     };
 
     // 8. Build SigningInput
-    // This is the hard part: normalizing everything
     let method = req.method().to_string();
-    let path = req.uri().path().to_string(); // S3 expects single encoding, path is already often decoded by axum?
-                                             // Actually req.uri().path() might be decoded. S3 needs the raw URI-encoded path from the request line.
-
-    // For now, let's assume we can reconstruct it or use it as is if it's simple.
-    // In a real implementation, we'd use the raw path.
+    let raw_path = req.uri().path();
+    // Re-encode path for canonical request if it's already decoded by axum
+    let path = dfs_common::auth::encoding::uri_encode(raw_path, false);
 
     let mut normalized_headers = BTreeMap::new();
     let mut signed_headers_vec = Vec::new();
     for name in &credentials.signed_headers {
         let name_lower = name.to_lowercase();
-        if let Some(value) = req.headers().get(&name_lower) {
-            let val_str = value.to_str().unwrap_or("").to_string();
-            // Collapse spaces and trim
-            let collapsed = val_str.split_whitespace().collect::<Vec<_>>().join(" ");
-            normalized_headers.insert(name_lower.clone(), vec![collapsed]);
-            signed_headers_vec.push(name_lower);
-        }
+        let val_str = req
+            .headers()
+            .get(&name_lower)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        // Collapse spaces and trim
+        let collapsed = val_str.split_whitespace().collect::<Vec<_>>().join(" ");
+        normalized_headers.insert(name_lower.clone(), vec![collapsed]);
+        signed_headers_vec.push(name_lower);
     }
     signed_headers_vec.sort();
     let signed_headers_list = signed_headers_vec.join(";");
@@ -122,7 +149,7 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| "UNSIGNED-PAYLOAD".to_string());
 
     if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload {
-        return Err(StatusCode::FORBIDDEN);
+        return s3_error_response(AuthError::MissingAuth);
     }
 
     let input = SigningInput {
@@ -136,18 +163,45 @@ pub async fn auth_middleware(
 
     // 9. Verify Signature
     match dfs_common::auth::signing::verify_signature_with_key(&input, &credentials, &signing_key) {
-        Ok(_) => Ok(next.run(req).await),
-        Err(AuthError::SignatureDoesNotMatch {
-            canonical_request,
-            string_to_sign,
-        }) => {
-            tracing::warn!(
-                "Signature mismatch. CR: {}, S2S: {}",
+        Ok(_) => next.run(req).await,
+        Err(e) => {
+            if let AuthError::SignatureDoesNotMatch {
                 canonical_request,
-                string_to_sign
-            );
-            Err(StatusCode::FORBIDDEN)
+                string_to_sign,
+            } = &e
+            {
+                tracing::warn!(
+                    "Signature mismatch. CR: {}, S2S: {}",
+                    canonical_request,
+                    string_to_sign
+                );
+            }
+            s3_error_response(e)
         }
-        Err(_) => Err(StatusCode::FORBIDDEN),
     }
+}
+
+fn s3_error_response(err: AuthError) -> Response {
+    let (code, message) = err.to_s3_error();
+    let status = match err {
+        AuthError::MissingAuth => StatusCode::FORBIDDEN,
+        AuthError::InvalidAccessKey { .. } => StatusCode::FORBIDDEN,
+        AuthError::SignatureDoesNotMatch { .. } => StatusCode::FORBIDDEN,
+        AuthError::RequestTimeTooSkewed { .. } => StatusCode::FORBIDDEN,
+        AuthError::InvalidCredentialScope { .. } => StatusCode::BAD_REQUEST,
+        AuthError::InsecureTransport => StatusCode::FORBIDDEN,
+        AuthError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>{}</Code>
+  <Message>{}</Message>
+  <Resource>/</Resource>
+</Error>"#,
+        code, message
+    );
+
+    (status, [("Content-Type", "application/xml")], xml).into_response()
 }

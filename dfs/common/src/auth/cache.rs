@@ -25,7 +25,7 @@ impl SigningKeyCache {
     }
 
     pub fn get(&self, access_key: &str, date: &str) -> Option<Vec<u8>> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let key = (access_key.to_string(), date.to_string());
 
         if let Some(entry) = cache.get(&key) {
@@ -39,7 +39,7 @@ impl SigningKeyCache {
     }
 
     pub fn insert(&self, access_key: &str, date: &str, signing_key: Vec<u8>) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let key = (access_key.to_string(), date.to_string());
         let entry = CacheEntry {
             key: signing_key,

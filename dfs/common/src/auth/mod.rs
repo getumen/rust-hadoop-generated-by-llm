@@ -102,27 +102,40 @@ pub fn parse_credentials(
         }
 
         // Authorization: AWS4-HMAC-SHA256 Credential=<ak>/<date>/<region>/<service>/aws4_request, SignedHeaders=..., Signature=...
-        let parts: Vec<&str> = auth_str.split(',').collect();
+        let parts: Vec<&str> = auth_str.split(',').map(|s| s.trim()).collect();
         if parts.len() < 3 {
             return Err(AuthError::MissingAuth);
         }
 
-        let cred_part = parts[0].split('=').nth(1).ok_or(AuthError::MissingAuth)?;
+        // parts[0]: AWS4-HMAC-SHA256 Credential=<ak>/<date>/...
+        let cred_kv: Vec<&str> = parts[0].split_whitespace().collect();
+        let cred_entry = cred_kv
+            .iter()
+            .find(|s| s.starts_with("Credential="))
+            .ok_or(AuthError::MissingAuth)?;
+        let cred_part = cred_entry.split('=').nth(1).ok_or(AuthError::MissingAuth)?;
+
         let cred_subparts: Vec<&str> = cred_part.split('/').collect();
         if cred_subparts.len() < 5 {
             return Err(AuthError::MissingAuth);
         }
 
-        let signed_headers_part = parts[1].split('=').nth(1).ok_or(AuthError::MissingAuth)?;
+        let signed_headers_part = parts[1]
+            .split('=')
+            .nth(1)
+            .ok_or(AuthError::MissingAuth)?
+            .trim();
         let signed_headers: Vec<String> = signed_headers_part
             .split(';')
-            .map(|s| s.to_string())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .collect();
 
         let signature = parts[2]
             .split('=')
             .nth(1)
             .ok_or(AuthError::MissingAuth)?
+            .trim()
             .to_string();
 
         let timestamp = headers
