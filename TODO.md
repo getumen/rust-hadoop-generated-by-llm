@@ -64,7 +64,7 @@ S3互換サービスとしての信頼確保。
 - [ ] **Server-Side Encryption (SSE)**: AES-256を用いた保管時暗号化の実装。
 - [ ] **Pre-signed URLs**: 短期間有効な署名付きURLの生成と検証。
 - [ ] **Virtual-Host Style Routing**: ホスト名ベースのバケット特定とリクエスト正規化。
-- [ ] **Strict Path Normalization**: S3独自のURIエンコード・正規化ルール（RFC 3986）への完全準拠。
+- [ ] **Strict Path Normalization**: S3独自のSigV4向けURIエンコード・正規化ルール（RFC 3986をベースにした「S3フレーバー」）への準拠。
 
 ### 6. Client Interface & Efficiency
 - [ ] **FUSE Mount**: `rust-fuse` 等を用いた、POSIX準拠なマウントインターフェース。

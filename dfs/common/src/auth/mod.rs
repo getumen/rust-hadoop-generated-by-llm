@@ -116,7 +116,7 @@ pub fn parse_credentials(
         let cred_part = cred_entry.split('=').nth(1).ok_or(AuthError::MissingAuth)?;
 
         let cred_subparts: Vec<&str> = cred_part.split('/').collect();
-        if cred_subparts.len() < 5 {
+        if cred_subparts.len() < 5 || cred_subparts[4] != "aws4_request" {
             return Err(AuthError::MissingAuth);
         }
 
@@ -166,7 +166,7 @@ pub fn parse_credentials(
             .get("X-Amz-Credential")
             .ok_or(AuthError::MissingAuth)?;
         let cred_subparts: Vec<&str> = cred_part.split('/').collect();
-        if cred_subparts.len() < 5 {
+        if cred_subparts.len() < 5 || cred_subparts[4] != "aws4_request" {
             return Err(AuthError::MissingAuth);
         }
 
@@ -199,4 +199,114 @@ pub fn parse_credentials(
     }
 
     Err(AuthError::MissingAuth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_credentials, AuthError};
+    use http::header::AUTHORIZATION;
+    use http::HeaderMap;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn parse_credentials_query_valid() {
+        let headers = HeaderMap::new();
+        let mut query = BTreeMap::new();
+
+        query.insert(
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        );
+        query.insert(
+            "X-Amz-Credential".to_string(),
+            "AKIDEXAMPLE/20240220/us-east-1/s3/aws4_request".to_string(),
+        );
+        query.insert(
+            "X-Amz-SignedHeaders".to_string(),
+            "host;x-amz-date".to_string(),
+        );
+        query.insert(
+            "X-Amz-Signature".to_string(),
+            "abcdef1234567890".to_string(),
+        );
+        query.insert("X-Amz-Date".to_string(), "20240220T010203Z".to_string());
+
+        let creds = parse_credentials(&headers, &query).expect("expected valid credentials");
+
+        assert_eq!(creds.access_key, "AKIDEXAMPLE");
+        assert_eq!(creds.date, "20240220");
+        assert_eq!(creds.region, "us-east-1");
+        assert_eq!(creds.service, "s3");
+        assert_eq!(
+            creds.signed_headers,
+            vec!["host".to_string(), "x-amz-date".to_string()]
+        );
+        assert_eq!(creds.signature, "abcdef1234567890");
+        assert_eq!(creds.timestamp, "20240220T010203Z");
+    }
+
+    #[test]
+    fn parse_credentials_header_valid() {
+        let mut headers = HeaderMap::new();
+        let query = BTreeMap::new();
+
+        headers.insert(AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240220/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abcdef1234567890".parse().unwrap());
+        headers.insert("x-amz-date", "20240220T010203Z".parse().unwrap());
+
+        let creds = parse_credentials(&headers, &query).expect("expected valid credentials");
+
+        assert_eq!(creds.access_key, "AKIDEXAMPLE");
+        assert_eq!(creds.date, "20240220");
+        assert_eq!(creds.region, "us-east-1");
+        assert_eq!(creds.service, "s3");
+        assert_eq!(
+            creds.signed_headers,
+            vec!["host".to_string(), "x-amz-date".to_string()]
+        );
+        assert_eq!(creds.signature, "abcdef1234567890");
+        assert_eq!(creds.timestamp, "20240220T010203Z");
+    }
+
+    #[test]
+    fn parse_credentials_query_invalid_scope() {
+        let headers = HeaderMap::new();
+        let mut query = BTreeMap::new();
+
+        query.insert(
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        );
+        // Missing "aws4_request" at the end
+        query.insert(
+            "X-Amz-Credential".to_string(),
+            "AKIDEXAMPLE/20240220/us-east-1/s3/invalid".to_string(),
+        );
+        query.insert("X-Amz-SignedHeaders".to_string(), "host".to_string());
+        query.insert("X-Amz-Signature".to_string(), "sig".to_string());
+        query.insert("X-Amz-Date".to_string(), "date".to_string());
+
+        let result = parse_credentials(&headers, &query);
+        assert!(matches!(result, Err(AuthError::MissingAuth)));
+    }
+
+    #[test]
+    fn parse_credentials_header_invalid_scope() {
+        let mut headers = HeaderMap::new();
+        let query = BTreeMap::new();
+
+        headers.insert(AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240220/us-east-1/s3/bad, SignedHeaders=host, Signature=sig".parse().unwrap());
+        headers.insert("x-amz-date", "date".parse().unwrap());
+
+        let result = parse_credentials(&headers, &query);
+        assert!(matches!(result, Err(AuthError::MissingAuth)));
+    }
+
+    #[test]
+    fn parse_credentials_missing_auth() {
+        let headers = HeaderMap::new();
+        let query = BTreeMap::new();
+
+        let result = parse_credentials(&headers, &query);
+        assert!(matches!(result, Err(AuthError::MissingAuth)));
+    }
 }

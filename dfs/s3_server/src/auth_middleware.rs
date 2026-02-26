@@ -38,19 +38,35 @@ pub async fn auth_middleware(
 
     // 3. Extract Query parameters for cred parsing and normalization
     let query_string_raw = req.uri().query().unwrap_or("");
-    let query_params: BTreeMap<String, String> =
-        serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
 
-    // Canonical Query String: sort by param name, then value; URI-encode; empty values as key=
+    // Canonical Query String: derive from raw query without re-encoding to
+    // avoid mismatches with the client's signature calculation.
+    let mut raw_query_pairs: Vec<(&str, &str)> = query_string_raw
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let mut split = pair.splitn(2, '=');
+            let k = split.next().unwrap_or("");
+            let v = split.next().unwrap_or("");
+            (k, v)
+        })
+        .collect();
+
+    raw_query_pairs.sort_by(|(k1, v1), (k2, v2)| match k1.cmp(k2) {
+        std::cmp::Ordering::Equal => v1.cmp(v2),
+        other => other,
+    });
+
     let mut normalized_query_parts = Vec::new();
-    for (k, v) in &query_params {
-        let encoded_k = dfs_common::auth::encoding::uri_encode(k, true);
-        let encoded_v = dfs_common::auth::encoding::uri_encode(v, true);
-        normalized_query_parts.push(format!("{}={}", encoded_k, encoded_v));
+    for (k, v) in raw_query_pairs {
+        normalized_query_parts.push(format!("{}={}", k, v));
     }
     let normalized_query_string = normalized_query_parts.join("&");
 
     // 4. Parse credentials
+    // We still need a map for cred parsing
+    let query_params: BTreeMap<String, String> =
+        serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
     let credentials = match parse_credentials(req.headers(), &query_params) {
         Ok(c) => c,
         Err(e) => return s3_error_response(e),
@@ -118,23 +134,21 @@ pub async fn auth_middleware(
 
     // 8. Build SigningInput
     let method = req.method().to_string();
-    let raw_path = req.uri().path();
-    // Re-encode path for canonical request if it's already decoded by axum
-    let path = dfs_common::auth::encoding::uri_encode(raw_path, false);
+    let path = req.uri().path().to_string();
 
     let mut normalized_headers = BTreeMap::new();
     let mut signed_headers_vec = Vec::new();
     for name in &credentials.signed_headers {
         let name_lower = name.to_lowercase();
-        let val_str = req
-            .headers()
-            .get(&name_lower)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        // Collapse spaces and trim
-        let collapsed = val_str.split_whitespace().collect::<Vec<_>>().join(" ");
-        normalized_headers.insert(name_lower.clone(), vec![collapsed]);
+        let header_values = req.headers().get_all(&name_lower);
+        let mut vals = Vec::new();
+        for val in header_values {
+            if let Ok(s) = val.to_str() {
+                vals.push(s.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        let joined = vals.join(",");
+        normalized_headers.insert(name_lower.clone(), vec![joined]);
         signed_headers_vec.push(name_lower);
     }
     signed_headers_vec.sort();
