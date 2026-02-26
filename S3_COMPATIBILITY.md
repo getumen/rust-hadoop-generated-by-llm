@@ -8,6 +8,7 @@ Rust Hadoop DFSは、標準的なS3ツールやエコシステム（AWS CLI, Spa
 - **メタデータ対応**: ユーザー定義のメタデータ（`x-amz-meta-*`）をサポート。
 - **マルチパートアップロード**: 大容量ファイルの分割アップロードに対応。
 - **ETag (MD5)**: オブジェクトの整合性検証のためのMD5 ETag計算をサポート。
+- **認証 (SigV4)**: AWS Signature Version 4 によるリクエストの認証と整合性検証をサポート。
 
 ## 起動方法
 
@@ -17,9 +18,28 @@ S3サーバーはデフォルトでポート `9000` で待機します。
 # Docker Composeを使用する場合
 docker compose up -d s3-server
 
-# バイナリを直接実行する場合 (必要環境変数: MASTER_ADDR, SHARD_CONFIG)
-MASTER_ADDR=http://localhost:50051 SHARD_CONFIG=shard_config.json ./target/release/s3-server
+# バイナリを直接実行する場合
+S3_AUTH_ENABLED=true S3_ACCESS_KEY=ak S3_SECRET_KEY=sk MASTER_ADDR=http://localhost:50051 ./target/release/s3-server
 ```
+
+## セキュリティと認証
+
+S3サーバーは標準の SigV4 認証をサポートしています。詳細な技術仕様については [auth_v4_spec.md](docs/auth_v4_spec.md) を参照してください。
+
+### 設定フラグ
+
+| 環境変数                    | 初期値      | 説明                                                                                      |
+| :-------------------------- | :---------- | :---------------------------------------------------------------------------------------- |
+| `S3_AUTH_ENABLED`           | `false`     | 認証を有効化するかどうか。`false` の場合は任意の認証情報を許可。                          |
+| `S3_REQUIRE_TLS`            | `false`     | `true` の場合、認証が必要なリクエストにTLS通信を強制。                                    |
+| `S3_ALLOW_UNSIGNED_PAYLOAD` | `true`      | `UNSIGNED-PAYLOAD` を許可するかどうか。                                                   |
+| `S3_REGION`                 | `us-east-1` | クレデンシャルスコープ検証時にサーバーが期待するリージョン名。                            |
+| `S3_ACCESS_KEY`             | (空)        | サーバー側で受け入れるアクセスキー（現在は `EnvCredentialProvider` による単一キーのみ）。 |
+| `S3_SECRET_KEY`             | (空)        | サーバー側で保持するシークレットキー。                                                    |
+
+### 認証エラーのデバッグ
+
+署名が一致しない場合（`SignatureDoesNotMatch`）、ミドルウェアは `CanonicalRequest` と `StringToSign` をデバッグログに出力します。これにより、クライアント側の署名作成プロセスにおける不一致箇所の特定が容易になります。
 
 ## エコシステムとの統合
 
@@ -97,6 +117,6 @@ curl -H "Range: bytes=0-1023" \
 
 ## 制限事項と今後の改善
 
-- **認証**: 現在、アクセスキー/シークレットキーの検証を行わない「ダミー認証」となっています。任意の資格情報でアクセス可能です。
+- **認証**: SigV4 (Core) が実装済みです。現在は単一のアクセスキー（環境変数）のみをサポートしていますが、Phase 4/5で IAM データベースとの連携を予定しています。
 - **CopyObject**: 現在、サーバー側で一度ファイルを一時的に読み込み、再書き込みするナイーブな実装となっています。将来的にはメタデータ操作のみで完結する最適化を予定しています。
 - **Presigned URLs**: 現在未実装です。Phase 5で実装予定です。

@@ -1,3 +1,4 @@
+mod auth_middleware;
 #[cfg(test)]
 mod handler_tests;
 mod handlers;
@@ -7,14 +8,17 @@ mod state;
 use crate::state::AppState as S3AppState;
 use axum::{
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
 };
 use dfs_client::Client;
+use dfs_common::auth::cache::SigningKeyCache;
+use dfs_common::auth::credentials::EnvCredentialProvider;
 use prometheus::{Encoder, IntCounterVec, Registry, TextEncoder};
 use std::net::SocketAddr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Prometheus metrics for S3 server
@@ -75,13 +79,38 @@ async fn main() -> anyhow::Result<()> {
         client.set_shard_map(shard_map);
     }
 
-    let state = S3AppState { client };
+    // Initialize Auth state
+    let auth_enabled = std::env::var("S3_AUTH_ENABLED").unwrap_or_default() == "true";
+    let server_region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let require_tls = std::env::var("S3_REQUIRE_TLS").unwrap_or_default() == "true";
+    let allow_unsigned_payload =
+        std::env::var("S3_ALLOW_UNSIGNED_PAYLOAD").unwrap_or_else(|_| "true".to_string()) == "true";
+
+    let credential_provider = Arc::new(EnvCredentialProvider::new());
+    let signing_key_cache = Arc::new(SigningKeyCache::default());
+
+    let state = S3AppState {
+        client,
+        auth_enabled,
+        credential_provider,
+        signing_key_cache,
+        server_region,
+        require_tls,
+        allow_unsigned_payload,
+    };
+
+    let authed_routes = Router::new()
+        .route("/", any(handlers::handle_root))
+        .route("/{*path}", any(handlers::handle_request))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware::auth_middleware,
+        ));
 
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/", any(handlers::handle_root))
-        .route("/{*path}", any(handlers::handle_request))
+        .merge(authed_routes)
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
