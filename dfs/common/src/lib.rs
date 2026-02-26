@@ -50,5 +50,6 @@ pub mod telemetry {
     }
 }
 
+pub mod auth;
 pub mod security;
 pub mod sharding;

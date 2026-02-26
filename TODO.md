@@ -8,11 +8,14 @@ S3互換サービスとしての信頼確保。
 - [x] **TLS Encryption** ✅ (完了)
     - [x] `tonic` / `axum` での自署名・CA証明書による通信暗号化サポート。
     - [x] Raftノード間通信（gRPC）のTLS化。
-- [ ] **S3 Signature V4 Authentication**
-    - [ ] `Authorization` ヘッダーのパースと署名検証ロジックの実装（HMAC-SHA256）。
-    - [ ] `X-Amz-Content-Sha256` によるペイロード整合性チェック。
+- [x] **S3 Signature V4 Authentication (Core Engine)** ✅
+    - [x] `CanonicalRequest` / `StringToSign` 計算ロジックの実装（HMAC-SHA256）。
+    - [x] チャンク署名 (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) への対応（ロジック実装）。
+    - [x] `Authorization` ヘッダーおよびクエリパラメータからの認証情報抽出。
+    - [x] タイミング攻撃対策（定数時間比較）の導入。
 - [ ] **IAM & Credentials Management**
     - [ ] AccessKey/SecretKeyを紐付けるユーザ管理DB（RocksDB等）のメタデータ層への追加。
+    - [ ] New セッショントークン（STS）および一時的な資格情報（SecurityToken）の管理。
     - [ ] バケット/パス単位のAllow/Denyポリシー評価エンジンの実装。
 
 ### 2. Data Reliability (データ保護)
@@ -60,6 +63,8 @@ S3互換サービスとしての信頼確保。
 - [ ] **Object Versioning**: `filename?versionId=...` 形式の履歴管理と削除マーカーの実装。
 - [ ] **Server-Side Encryption (SSE)**: AES-256を用いた保管時暗号化の実装。
 - [ ] **Pre-signed URLs**: 短期間有効な署名付きURLの生成と検証。
+- [ ] **Virtual-Host Style Routing**: ホスト名ベースのバケット特定とリクエスト正規化。
+- [ ] **Strict Path Normalization**: S3独自のURIエンコード・正規化ルール（RFC 3986）への完全準拠。
 
 ### 6. Client Interface & Efficiency
 - [ ] **FUSE Mount**: `rust-fuse` 等を用いた、POSIX準拠なマウントインターフェース。
