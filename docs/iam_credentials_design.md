@@ -33,6 +33,11 @@
     - [Phase 3: IAM ポリシー評価エンジン（推定3-4日）](#phase-3-iam-ポリシー評価エンジン推定3-4日)
     - [Phase 4: 仕上げ（推定1-2日）](#phase-4-仕上げ推定1-2日)
   - [10. 設定パラメータ一覧](#10-設定パラメータ一覧)
+  - [| `STS_MAX_DURATION`     | u64    | `43200`    | 最大の一時セッション有効期限（秒）                       |](#-sts_max_duration------u64-----43200-----最大の一時セッション有効期限秒-----------------------)
+  - [11. 運用と制限](#11-運用と制限)
+    - [11.1 設定の更新 (Hot Reload)](#111-設定の更新-hot-reload)
+    - [11.2 トークンの失効 (Revocation)](#112-トークンの失効-revocation)
+    - [11.3 セキュリティ](#113-セキュリティ)
 
 ---
 ## 1. 概要と目標
@@ -52,12 +57,12 @@
 ---
 ## 2. アーキテクチャシフト（自作IAMからの脱却）
 
-| 特徴                   | 旧設計 (フルスクラッチIAM)     | 新設計 (OIDC + STS)                                    |
-| :--------------------- | :----------------------------- | :----------------------------------------------------- |
-| **ユーザ情報の保存先** | S3サーバー内蔵の RocksDB       | 外部の IdP (Keycloak, Auth0 等)                        |
-| **管理 API**           | 自作REST API (`/iam/users` 等) | IdP の管理コンソールを利用 (開発不要)                  |
-| **認証方式**           | AWS Signature V4 のみ          | IdP での OIDC ログイン → STS で SigV4 に変換           |
-| **状態管理 (State)**   | RocksDB による永続化が必須     | 一時クレデンシャルのインメモリキャッシュのみで完結可能 |
+| 特徴                   | 旧設計 (フルスクラッチIAM)     | 新設計 (OIDC + STS)                          |
+| :--------------------- | :----------------------------- | :------------------------------------------- |
+| **ユーザ情報の保存先** | S3サーバー内蔵の RocksDB       | 外部の IdP (Keycloak, Auth0 等)              |
+| **管理 API**           | 自作REST API (`/iam/users` 等) | IdP の管理コンソールを利用 (開発不要)        |
+| **認証方式**           | AWS Signature V4 のみ          | IdP での OIDC ログイン → STS で SigV4 に変換 |
+| **状態管理 (State)**   | RocksDB による永続化が必須     | サーバー側状態は不要 (トークンに内包)        |
 
 > [!NOTE]
 > `S3_ACCESS_KEY` と `S3_SECRET_KEY` による静的クレデンシャルは、**管理者（Root）用アカウント** として引き続き利用可能とする（既存実装の後方互換）。
@@ -148,8 +153,9 @@ AWS S3 と同様に「S3 サーバー群がスケールアウトしても、ど�
 
 * **メリット**: S3 サーバーの再起動でセッションが揮発しない。クラスタ内の全 S3 ノードで中央DB（RocksDB 等）なしに一貫したトークン検証が可能。
 * **仕組み**:
-  1. `AssumeRoleWithWebIdentity` 実行時、S3 サーバー群で共有する内部共通鍵（`STS_SIGNING_KEY` 等）を使い、クレームと有効期限をパッキングした「内部 SessionToken」を生成する。
-  2. クライアントからのS3リクエストに `x-amz-security-token` ヘッダーが付与されていた場合、その内部共通鍵で構成要素を復号・検証し、ポリシー評価に必要な属性（`groups` 等）をインメモリに復元してリクエストを処理する。
+  1. `AssumeRoleWithWebIdentity` 実行時、S3 サーバー群で共有する内部共通鍵（`STS_SIGNING_KEY` 等）を使い、JWT のクレーム（`sub`, `groups`等）、引き受ける `RoleArn`、生成した一時秘密鍵（`temp_secret_key`）、有効期限をパッキング・暗号化した「内部 SessionToken」を生成する。
+  2. クライアントからのS3リクエストに `x-amz-security-token` ヘッダーが付与されていた場合、その内部共通鍵で構成要素を復号・整合性検証し、抽出された `RoleArn` に紐づくポリシーを**サーバー側の静的設定 (`iam_config.json`)** から特定して認可処理を行う。
+  3. **注記**: トークン自体に巨大なポリシー JSON を含めないことで、HTTP ヘッダのサイズ制限（一般に 8KB〜16KB）超過を回避しつつ、ステートレス性を維持する。
 
 ---
 ## 6. Phase 3: IAM ポリシー評価エンジン (静的コンフィグ駆動)
@@ -200,8 +206,10 @@ Role と Policy を定義し、OIDC(JWT) のクレームからどの Role を As
 ```
 
 ### 6.3 評価ロジックの実装
-1. **AssumeRole フェーズ (Phase 2)**: クライアントが STS で指定した `RoleArn` が `iam_config.json` に存在し、かつ JWT の `groups` 等が `AssumeRolePolicyDocument` の条件を満たすか検査する。満たせば、Roleの `Policies` を SessionToken にエンコードして返却。
-2. **S3 リクエスト認可フェーズ**: リクエストの S3 アクション（例: `s3:PutObject`）とリソース ARN が、復号したセッショントークン内の JSON ポリシーで明示的に `Allow` されているか、標準的な IAM 評価アルゴリズム（Explicit Deny → Allow → Implicit Deny）で判定する。
+1. **AssumeRole フェーズ (Phase 2)**: クライアントが STS で指定した `RoleArn` が `iam_config.json` に存在し、かつ JWT のクレーム（例: `groups` 配列）が `AssumeRolePolicyDocument` の条件を満たすか検査する。
+   - **条件評価**: `groups` のような配列属性に対しては、`ForAnyValue:StringEquals` 相当（配列内のいずれかが一致すれば OK）の評価をサポートする。
+2. **S3 リクエスト認可フェーズ**: リクエストの S3 アクション（例: `s3:GetObject`）とリソース ARN が、復号したセッショントークン内の `RoleArn` に対応する JSON ポリシーで明示的に `Allow` されているか、標準的な IAM 評価アルゴリズム（Explicit Deny → Allow → Implicit Deny）で判定する。
+   - ポリシー自体はサーバーが起動時にロードした `iam_config.json` から `RoleArn` をキーに参照する。これによりトークンサイズの肥大化を防ぐ。
 
 ```rust
 pub struct PolicyEvaluator {
@@ -209,9 +217,10 @@ pub struct PolicyEvaluator {
 }
 
 impl PolicyEvaluator {
-    pub fn evaluate(&self, action: &str, resource: &str, session_policies: &[PolicyDocument]) -> bool {
-        // AWS標準の Action / Resource (ワイルドカード対応) マッチング
-        // ... (実装はPhase5相当のエンジンを流用)
+    pub fn evaluate(&self, action: &str, resource: &str, role_arn: &str, context: &EvaluationContext) -> bool {
+        // 1. role_arn に紐づくポリシーを静的設定から特定
+        // 2. AWS標準の Action / Resource (ワイルドカード対応) マッチング
+        // ... (実装はPhase3で構築する評価エンジンを使用)
     }
 }
 ```
@@ -226,9 +235,9 @@ impl PolicyEvaluator {
   │
   ├─ x-amz-security-token ヘッダがあるか？
   │    ├─ Yes (STSの一時クレデンシャル)
-  │    │     1. SessionToken を内部共通鍵で復号し、クレームと SecretKey を復元
+  │    │     1. SessionToken を内部共通鍵で復号し、クレーム、RoleArn、SecretKey を復元
   │    │     2. 復元した temp_secret_key で SigV4 署名検証
-  │    │     3. PolicyEvaluator に復元したポリシー情報を渡し、認可(Allow/Deny)を判定
+  │    │     3. 復元した RoleArn と属性情報を使い、PolicyEvaluator で認可判定
   │    │
   │    └─ No (永続クレデンシャル = 管理者)
   │          1. EnvCredentialProvider で SigV4署名検証
