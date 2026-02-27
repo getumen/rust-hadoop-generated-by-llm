@@ -220,6 +220,7 @@ impl PolicyEvaluator {
         // 1. role_arn に紐づくポリシーを静的設定から特定
         // 2. AWS標準の Action / Resource (ワイルドカード対応) マッチング
         // ... (実装はPhase3で構築する評価エンジンを使用)
+        todo!("Policy evaluation engine will be implemented in Phase 3")
     }
 }
 ```
