@@ -13,10 +13,31 @@ S3互換サービスとしての信頼確保。
     - [x] チャンク署名 (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) への対応（ロジック実装）。
     - [x] `Authorization` ヘッダーおよびクエリパラメータからの認証情報抽出。
     - [x] タイミング攻撃対策（定数時間比較）の導入。
-- [ ] **IAM & Credentials Management**
-    - [ ] AccessKey/SecretKeyを紐付けるユーザ管理DB（RocksDB等）のメタデータ層への追加。
-    - [ ] New セッショントークン（STS）および一時的な資格情報（SecurityToken）の管理。
-    - [ ] バケット/パス単位のAllow/Denyポリシー評価エンジンの実装。
+- [ ] **OIDC & STS Integration (IAM 代替)** — [詳細設計書](docs/iam_credentials_design.md)
+    - [ ] **Phase 1: OIDC (OpenID Connect) 連携基盤**（推定2-3日）
+        - [ ] OIDC Provider (Keycloak等) の Discovery URLからのJWKS取得・キャッシュ処理。
+        - [ ] JWT（IDトークン）の署名検証、有効期限・Audienceチェックの実装。
+        - [ ] テスト用OIDC Providerモック（またはローカルKeycloakコンテナ）の設定。
+    - [ ] **Phase 2: STS (Security Token Service) 実装**（推定2-3日）
+        - [ ] `AssumeRoleWithWebIdentity` エンドポイントの実装（JWTから一時クレデンシャル交換）。
+        - [ ] ステートレスな `SessionToken` の生成（内部共通鍵によるクレームの暗号化/署名パッキング）。
+        - [ ] `AuthError` の STS 関連バリアント拡張（`ExpiredToken` 等）。
+        - [ ] `auth_middleware` における `x-amz-security-token` の復号・検証の統合。
+    - [ ] **Phase 3: IAM ポリシー評価エンジン (静的コンフィグ駆動)**（推定3-4日）
+        - [ ] `iam_config.json` 等の静的ファイル読み込み・オンメモリ保持構造(`Role` と `Policy` の定義)の実装。
+        - [ ] AWS標準のIAM JSONポリシー（Effect, Action, Resource等）を処理する `PolicyEvaluator`の実装。
+        - [ ] `resolve_s3_action_and_resource()` ヘルパー（HTTP→S3アクション変換）。
+        - [ ] `auth_middleware` への認可（ポリシー評価）の統合と `AccessDenied` エラー処理。
+    - [ ] **Phase 4: 仕上げ**（推定1-2日）
+        - [ ] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、および実装後のフィードバックを反映した詳細設計書の最終クリーンアップ）。
+        - [ ] HelmChartの環境変数追加（`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` 等）。
+        - [ ] E2Eテスト（OIDC Login -> STS -> S3 API）のスクリプト作成 (`test_scripts/oidc_sts_test.sh`)。
+- [ ] **Audit Logging (Security Event Trail)**
+    - [ ] 認証・認可・IAM管理操作の監査ログをRocksDBに記録。
+    - [ ] 保持期間（TTL）ベースの自動ローテーション。
+- [ ] **IAM Observability**
+    - [ ] IAM メトリクス（認証成功/失敗率、ポリシー評価レイテンシ等）の Prometheus エクスポート。
+    - [ ] 既存 Grafana ダッシュボードへのIAMパネル追加。
 
 ### 2. Data Reliability (データ保護)
 データの欠損や静かな破損を許さないための仕組み。
@@ -61,8 +82,9 @@ S3互換サービスとしての信頼確保。
 
 ### 5. Advanced S3 Compatibility
 - [ ] **Object Versioning**: `filename?versionId=...` 形式の履歴管理と削除マーカーの実装。
-- [ ] **Server-Side Encryption (SSE)**: AES-256を用いた保管時暗号化の実装。
-- [ ] **Pre-signed URLs**: 短期間有効な署名付きURLの生成と検証。
+- [ ] **Server-Side Encryption (SSE)**: AES-256を用いた保管時暗号化の実装。 *(前提: IAM ポリシー評価の `Condition` キーで暗号化制御を行うため IAM が完了していること)*
+- [ ] **Pre-signed URLs**: 短期間有効な署名付きURLの生成と検証。 *(前提: IAM & STS が完了していること)*
+- [ ] **Bucket Policy**: バケット単位のリソースベースポリシー（`GET/PUT/DELETE /{bucket}?policy`）。 *(前提: IAM ポリシー評価エンジンが完了していること)*
 - [ ] **Virtual-Host Style Routing**: ホスト名ベースのバケット特定とリクエスト正規化。
 - [ ] **Strict Path Normalization**: S3独自のSigV4向けURIエンコード・正規化ルール（RFC 3986をベースにした「S3フレーバー」）への準拠。
 
@@ -77,8 +99,8 @@ S3互換サービスとしての信頼確保。
 大規模運用や特定の規制要件に対応するための項目。
 
 ### 7. Governance & Global Scale
-- [ ] **Object Locking (WORM)**: 削除・変更を物理的に禁止する保存期間（Retention）管理。
-- [ ] **Lifecycle Policies**: 日数経過に応じた自動削除・階層移動のポリシー実行。
+- [ ] **Object Locking (WORM)**: 削除・変更を物理的に禁止する保存期間（Retention）管理。 *(推奨: IAM ポリシー評価エンジンが先に完了していること)*
+- [ ] **Lifecycle Policies**: 日数経過に応じた自動削除・階層移動のポリシー実行。 *(前提: IAM 権限による設定操作の制御が必要)*
 - [ ] **Cross-Cluster Replication**: クラスタ間を跨いだ非同期レプリケーション。
 - [ ] **Erasure Coding (RS(6,3))**: 3xレプリカから高効率なECへ、バックグラウンドでの変換。
 
@@ -115,5 +137,5 @@ S3互換サービスとしての信頼確保。
 - [x] **Clippy Compliance**: Fixed all clippy warnings across meta-server, chunk-server, and test suites.
 - [x] **Large Result Types**: Resolved large `Result` variant warnings by boxing large error types or adding allows.
 
-**Last Updated**: 2026-02-24
+**Last Updated**: 2026-02-27
 **Maintainer**: Development Team
