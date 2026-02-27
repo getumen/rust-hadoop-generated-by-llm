@@ -33,7 +33,6 @@
     - [Phase 3: IAM ポリシー評価エンジン（推定3-4日）](#phase-3-iam-ポリシー評価エンジン推定3-4日)
     - [Phase 4: 仕上げ（推定1-2日）](#phase-4-仕上げ推定1-2日)
   - [10. 設定パラメータ一覧](#10-設定パラメータ一覧)
-  - [| `STS_MAX_DURATION`     | u64    | `43200`    | 最大の一時セッション有効期限（秒）                       |](#-sts_max_duration------u64-----43200-----最大の一時セッション有効期限秒-----------------------)
   - [11. 運用と制限](#11-運用と制限)
     - [11.1 設定の更新 (Hot Reload)](#111-設定の更新-hot-reload)
     - [11.2 トークンの失効 (Revocation)](#112-トークンの失効-revocation)
@@ -179,8 +178,8 @@ Role と Policy を定義し、OIDC(JWT) のクレームからどの Role を As
             "Principal": { "Federated": "OIDC_ISSUER" },
             "Action": "sts:AssumeRoleWithWebIdentity",
             "Condition": {
-              "StringEquals": {
-                "OIDC_ISSUER:groups": "tenant-a"
+              "ForAnyValue:StringEquals": {
+                "OIDC_ISSUER:groups": ["tenant-a"]
               }
             }
           }
@@ -207,7 +206,7 @@ Role と Policy を定義し、OIDC(JWT) のクレームからどの Role を As
 
 ### 6.3 評価ロジックの実装
 1. **AssumeRole フェーズ (Phase 2)**: クライアントが STS で指定した `RoleArn` が `iam_config.json` に存在し、かつ JWT のクレーム（例: `groups` 配列）が `AssumeRolePolicyDocument` の条件を満たすか検査する。
-   - **条件評価**: `groups` のような配列属性に対しては、`ForAnyValue:StringEquals` 相当（配列内のいずれかが一致すれば OK）の評価をサポートする。
+   - **条件評価**: `groups` のような配列属性（Array Claims）に対しては、`ForAnyValue:StringEquals` 相当（配列内のいずれかが一致すれば OK）の評価をネイティブにサポートする。また、単一文字列としてのマッチングも「配列に含まれるか」の判定として扱う。
 2. **S3 リクエスト認可フェーズ**: リクエストの S3 アクション（例: `s3:GetObject`）とリソース ARN が、復号したセッショントークン内の `RoleArn` に対応する JSON ポリシーで明示的に `Allow` されているか、標準的な IAM 評価アルゴリズム（Explicit Deny → Allow → Implicit Deny）で判定する。
    - ポリシー自体はサーバーが起動時にロードした `iam_config.json` から `RoleArn` をキーに参照する。これによりトークンサイズの肥大化を防ぐ。
 
@@ -249,12 +248,12 @@ impl PolicyEvaluator {
 ---
 ## 8. セキュリティ考慮事項
 
-| 脅威                     | 対策                                                                         |
-| ------------------------ | ---------------------------------------------------------------------------- |
-| 重複 JWT のリプレイ攻撃  | STS発行時に JWT の `jti` (Token ID) をチェックし一度きりにする（オプション） |
-| Session Token の総当たり | 256文字長以上の cryptographically secure なランダム文字列                    |
-| 期限切れトークンの再利用 | `expiration` クレームの復号・検証による拒否。                                |
-| JWTの漏洩                | HTTPSプロトコルを必須とする。`OIDC_ISSUER_URL` への通信もTLS必須。           |
+| 脅威                     | 対策                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 重複 JWT のリプレイ攻撃  | STS発行時に JWT の `jti` (Token ID) をチェックし重複を排除する（ステートレス性を優先する場合は TTL 付きの外部ストア (Redis等) を将来的に導入）。 |
+| Session Token の総当たり | AES-GCM (AEAD) による暗号化と整合性保護。鍵強度(256bit)と Nonce/Tag による改ざん・推測防止。                                                     |
+| 期限切れトークンの再利用 | `expiration` クレームの復号・検証による拒否。                                                                                                    |
+| JWTの漏洩                | HTTPSプロトコルを必須とする。`OIDC_ISSUER_URL` への通信もTLS必須。                                                                               |
 
 ---
 ## 9. 実装フェーズ
@@ -265,8 +264,8 @@ impl PolicyEvaluator {
 - JWT検証ロジックの実装。
 
 ### Phase 2: STS 実装（推定2-3日）
-- `s3_server/src/sts_handler.rs` に `AssumeRoleWithWebIdentity` 追加。
-- ステートレスな `SessionToken` 生成・復号ロジック（AES-GCM 等を使用）の実装。
+- `s3_server/src/sts_handler.rs` に `AssumeRoleWithWebIdentity` 追加。内部トークンの署名・暗号化には AES-GCM を使用。
+- ステートレスな `SessionToken` 生成・復号ロジックの実装。将来の鍵ローテーションに向け、トークンのヘッダ部（またはメタデータ）に `KID` を付与する構造とする。
 
 ### Phase 3: IAM ポリシー評価エンジン（推定3-4日）
 - `iam_config.json` 等の静的ファイル読み込み・オンメモリ保持構造の実装。
@@ -287,11 +286,14 @@ impl PolicyEvaluator {
 | `OIDC_CLIENT_ID`       | string | なし       | 本 S3 サーバーの Client ID (audience 検証用)             |
 | `STS_DEFAULT_DURATION` | u64    | `3600`     | デフォルトの一時セッション有効期限（秒）                 |
 | `STS_MAX_DURATION`     | u64    | `43200`    | 最大の一時セッション有効期限（秒）                       |
+| `STS_SIGNING_KEY`      | string | なし       | STS セッショントークンの暗号化用共通鍵 (32 bytes)        |
+| `IAM_CONFIG_PATH`      | string | なし       | `iam_config.json` へのパス                               |
+
 ---
 ## 11. 運用と制限
 
 ### 11.1 設定の更新 (Hot Reload)
-`iam_config.json` の変更を反映させるため、プロセス再起動なしで設定を再読み込みする仕組み（例：`SIGHUP` シグナル受診時、または `notify` クレートによるファイル監視）を Phase 4 以降で検討する。
+`iam_config.json` の変更を反映させるため、プロセス再起動なしで設定を再読み込みする仕組み（例：`SIGHUP` シグナル受信時、または `notify` クレートによるファイル監視）を Phase 4 以降で検討する。
 
 ### 11.2 トークンの失効 (Revocation)
 ステートレスモデルでは、発行済みのトークンを個別に無効化することは困難である。

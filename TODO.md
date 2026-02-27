@@ -29,7 +29,7 @@ S3互換サービスとしての信頼確保。
         - [ ] `resolve_s3_action_and_resource()` ヘルパー（HTTP→S3アクション変換）。
         - [ ] `auth_middleware` への認可（ポリシー評価）の統合と `AccessDenied` エラー処理。
     - [ ] **Phase 4: 仕上げ**（推定1-2日）
-        - [ ] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、本設計書の Phase 4 完了に伴う改訂）。
+        - [ ] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、および実装後のフィードバックを反映した詳細設計書の最終クリーンアップ）。
         - [ ] HelmChartの環境変数追加（`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` 等）。
         - [ ] E2Eテスト（OIDC Login -> STS -> S3 API）のスクリプト作成 (`test_scripts/oidc_sts_test.sh`)。
 - [ ] **Audit Logging (Security Event Trail)**
