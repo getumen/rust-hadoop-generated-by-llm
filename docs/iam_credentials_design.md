@@ -82,8 +82,8 @@
 │          │                                                               │
 │          ▼ (5) OK なら一時クレデンシャルを発行                                │
 │  ┌─────────────────┐     ┌────────────────────────────────────────────┐  │
-│  │  STS Manager    ├────▶│ メモリ内キャッシュ (LRU / TTL) に             │  │
-│  └───────┬─────────┘     │ SessionRecord を保存                       │  │
+│  │  STS Manager    ├────▶│ クレームと一時 SecretKey をパッキング・暗号化   │  │
+│  └───────┬─────────┘     │ して SessionToken を生成 (ステートレス)       │  │
 │          │               └────────────────────────────────────────────┘  │
 └──────────┼───────────────────────────────────────────────────────────────┘
        (6) │ 200 OK
@@ -155,7 +155,7 @@ AWS S3 と同様に「S3 サーバー群がスケールアウトしても、ど�
 ## 6. Phase 3: IAM ポリシー評価エンジン (静的コンフィグ駆動)
 
 ### 6.1 真の S3 互換に向けた静的ポリシーマッピング
-単なる「バケット名のプレフィックス一致 (`start_with`)」では、「読み込み専用 (ReadOnly)」や「バケット一覧の許可 (`s3:ListAllMyBuckets`)」などのきめ細かい制御ができない。そこで、AWS S3 互換の**JSON ボリシー評価エンジン**を再導入しつつ、DBによるCRUD管理ではなく**起動時に読み込む静的な設定ファイル (`iam_config.json`)** で一元管理する。
+単なる「バケット名のプレフィックス一致 (`start_with`)」では、「読み込み専用 (ReadOnly)」や「バケット一覧の許可 (`s3:ListAllMyBuckets`)」などのきめ細かい制御ができない。そこで、AWS S3 互換の**JSON ポリシー評価エンジン**を再導入しつつ、DBによるCRUD管理ではなく**起動時に読み込む静的な設定ファイル (`iam_config.json`)** で一元管理する。
 
 ### 6.2 `iam_config.json` の構造
 Role と Policy を定義し、OIDC(JWT) のクレームからどの Role を Assume（引き受け）できるかを `AssumeRolePolicyDocument` (Trust Relationship) で制御する。
@@ -226,9 +226,9 @@ impl PolicyEvaluator {
   │
   ├─ x-amz-security-token ヘッダがあるか？
   │    ├─ Yes (STSの一時クレデンシャル)
-  │    │     1. SessionTokenManager でトークンの有効性を検証
-  │    │     2. ヒットした SessionRecord の temp_secret_key で SigV4署名検証
-  │    │     3. PolicyEvaluator に SessionRecord.claims を渡し、認可(Allow/Deny)を判定
+  │    │     1. SessionToken を内部共通鍵で復号し、クレームと SecretKey を復元
+  │    │     2. 復元した temp_secret_key で SigV4 署名検証
+  │    │     3. PolicyEvaluator に復元したポリシー情報を渡し、認可(Allow/Deny)を判定
   │    │
   │    └─ No (永続クレデンシャル = 管理者)
   │          1. EnvCredentialProvider で SigV4署名検証
@@ -244,7 +244,7 @@ impl PolicyEvaluator {
 | ------------------------ | ---------------------------------------------------------------------------- |
 | 重複 JWT のリプレイ攻撃  | STS発行時に JWT の `jti` (Token ID) をチェックし一度きりにする（オプション） |
 | Session Token の総当たり | 256文字長以上の cryptographically secure なランダム文字列                    |
-| 期限切れトークンの再利用 | `expiration` チェック + `tokio::time` による掃除タスク。                     |
+| 期限切れトークンの再利用 | `expiration` クレームの復号・検証による拒否。                                |
 | JWTの漏洩                | HTTPSプロトコルを必須とする。`OIDC_ISSUER_URL` への通信もTLS必須。           |
 
 ---
@@ -257,7 +257,7 @@ impl PolicyEvaluator {
 
 ### Phase 2: STS 実装（推定2-3日）
 - `s3_server/src/sts_handler.rs` に `AssumeRoleWithWebIdentity` 追加。
-- インメモリの `SessionTokenManager` 実装 (STS発行と保持)。
+- ステートレスな `SessionToken` 生成・復号ロジック（AES-GCM 等を使用）の実装。
 
 ### Phase 3: IAM ポリシー評価エンジン（推定3-4日）
 - `iam_config.json` 等の静的ファイル読み込み・オンメモリ保持構造の実装。
@@ -278,3 +278,16 @@ impl PolicyEvaluator {
 | `OIDC_CLIENT_ID`       | string | なし       | 本 S3 サーバーの Client ID (audience 検証用)             |
 | `STS_DEFAULT_DURATION` | u64    | `3600`     | デフォルトの一時セッション有効期限（秒）                 |
 | `STS_MAX_DURATION`     | u64    | `43200`    | 最大の一時セッション有効期限（秒）                       |
+---
+## 11. 運用と制限
+
+### 11.1 設定の更新 (Hot Reload)
+`iam_config.json` の変更を反映させるため、プロセス再起動なしで設定を再読み込みする仕組み（例：`SIGHUP` シグナル受診時、または `notify` クレートによるファイル監視）を Phase 4 以降で検討する。
+
+### 11.2 トークンの失効 (Revocation)
+ステートレスモデルでは、発行済みのトークンを個別に無効化することは困難である。
+- **基本戦略**: 有効期限 (`DurationSeconds`) を短く設定する。
+- **緊急対応**: 必要であれば、`STS_SIGNING_KEY` をローテーションすることで全トークンを一括失効させる。または、特定の `jti` (JWT ID) を短期間ブラックリスト（Redis等）に入れる仕組みを将来的に検討する。
+
+### 11.3 セキュリティ
+`STS_SIGNING_KEY` は非常に重要な機密情報である。環境変数またはシークレットマネージャー（K8s Secret 等）で厳重に管理し、定期的なローテーションを推奨する。
