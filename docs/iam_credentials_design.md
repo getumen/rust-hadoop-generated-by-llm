@@ -161,7 +161,7 @@ AWS S3 と同様に「S3 サーバー群がスケールアウトしても、ど�
 ## 6. Phase 3: IAM ポリシー評価エンジン (静的コンフィグ駆動)
 
 ### 6.1 真の S3 互換に向けた静的ポリシーマッピング
-単なる「バケット名のプレフィックス一致 (`start_with`)」では、「読み込み専用 (ReadOnly)」や「バケット一覧の許可 (`s3:ListAllMyBuckets`)」などのきめ細かい制御ができない。そこで、AWS S3 互換の**JSON ポリシー評価エンジン**を再導入しつつ、DBによるCRUD管理ではなく**起動時に読み込む静的な設定ファイル (`iam_config.json`)** で一元管理する。
+単なる「バケット名のプレフィックス一致 (`starts_with`)」では、「読み込み専用 (ReadOnly)」や「バケット一覧の許可 (`s3:ListAllMyBuckets`)」などのきめ細かい制御ができない。そこで、AWS S3 互換の**JSON ポリシー評価エンジン**を再導入しつつ、DBによるCRUD管理ではなく**起動時に読み込む静的な設定ファイル (`iam_config.json`)** で一元管理する。
 
 ### 6.2 `iam_config.json` の構造
 Role と Policy を定義し、OIDC(JWT) のクレームからどの Role を Assume（引き受け）できるかを `AssumeRolePolicyDocument` (Trust Relationship) で制御する。

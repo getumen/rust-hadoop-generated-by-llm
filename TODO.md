@@ -13,7 +13,7 @@ S3互換サービスとしての信頼確保。
     - [x] チャンク署名 (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) への対応（ロジック実装）。
     - [x] `Authorization` ヘッダーおよびクエリパラメータからの認証情報抽出。
     - [x] タイミング攻撃対策（定数時間比較）の導入。
-- [ ] **OIDC & STS Integration (IAM 代替)** — [詳細設計書](docs/iam_credentials_design.md) (※要改訂)
+- [ ] **OIDC & STS Integration (IAM 代替)** — [詳細設計書](docs/iam_credentials_design.md)
     - [ ] **Phase 1: OIDC (OpenID Connect) 連携基盤**（推定2-3日）
         - [ ] OIDC Provider (Keycloak等) の Discovery URLからのJWKS取得・キャッシュ処理。
         - [ ] JWT（IDトークン）の署名検証、有効期限・Audienceチェックの実装。
@@ -137,5 +137,5 @@ S3互換サービスとしての信頼確保。
 - [x] **Clippy Compliance**: Fixed all clippy warnings across meta-server, chunk-server, and test suites.
 - [x] **Large Result Types**: Resolved large `Result` variant warnings by boxing large error types or adding allows.
 
-**Last Updated**: 2026-02-26
+**Last Updated**: 2026-02-27
 **Maintainer**: Development Team
