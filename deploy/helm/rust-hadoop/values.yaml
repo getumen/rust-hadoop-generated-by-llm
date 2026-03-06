@@ -102,6 +102,51 @@ s3server:
     limits:
       cpu: "500m"      # 0.5 CPU core for high request load
       memory: "512Mi"  # 512 MB max memory
+  auth:
+    enabled: false
+    requireTls: false
+    oidc:
+      issuerUrl: "" # e.g. https://keycloak.example.com/realms/master
+      clientId: ""   # e.g. rust-hadoop-s3
+    sts:
+      signingKey: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" # 32 bytes hex
+    iamConfig: |
+      {
+        "Roles": [
+          {
+            "RoleName": "tenant-a-role",
+            "Arn": "arn:dfs:iam:::role/tenant-a-role",
+            "AssumeRolePolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": { "Federated": "OIDC_ISSUER" },
+                  "Action": "sts:AssumeRoleWithWebIdentity",
+                  "Condition": {
+                    "ForAnyValue:StringEquals": {
+                      "OIDC_ISSUER:groups": ["tenant-a"]
+                    }
+                  }
+                }
+              ]
+            },
+            "Policies": [
+              {
+                "PolicyName": "TenantAReadWrite",
+                "PolicyDocument": {
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+                      "Resource": ["arn:dfs:s3:::tenant-a-*"]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
 
 # Observability
 monitoring:

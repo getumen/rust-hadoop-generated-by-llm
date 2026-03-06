@@ -5,7 +5,10 @@ pub mod cache;
 pub mod chunked;
 pub mod credentials;
 pub mod encoding;
+pub mod oidc;
+pub mod policy;
 pub mod signing;
+pub mod sts;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParsedCredentials {
@@ -50,6 +53,10 @@ pub enum AuthError {
     InvalidCredentialScope { expected: String, received: String },
     #[error("Insecure transport. SigV4 requires TLS")]
     InsecureTransport,
+    #[error("Invalid token: {0}")]
+    InvalidToken(String),
+    #[error("Token has expired")]
+    ExpiredToken,
     #[error("Internal authentication error: {0}")]
     InternalError(String),
 }
@@ -80,6 +87,14 @@ impl AuthError {
             AuthError::InsecureTransport => (
                 "AccessDenied".to_string(),
                 "Access Denied (Insecure Transport)".to_string(),
+            ),
+            AuthError::InvalidToken(_) => (
+                "InvalidTokenId".to_string(),
+                "The security token included in the request is invalid.".to_string(),
+            ),
+            AuthError::ExpiredToken => (
+                "ExpiredToken".to_string(),
+                "The provided token has expired.".to_string(),
             ),
             AuthError::InternalError(_) => (
                 "InternalError".to_string(),

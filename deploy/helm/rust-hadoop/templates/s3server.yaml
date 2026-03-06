@@ -53,9 +53,25 @@ spec:
               value: "http://{{ include "rust-hadoop.fullname" . }}-configserver-headless:{{ .Values.configserver.port }}"
             - name: PORT
               value: {{ .Values.s3server.port | quote }}
+            - name: S3_AUTH_ENABLED
+              value: {{ .Values.s3server.auth.enabled | quote }}
+            - name: S3_REQUIRE_TLS
+              value: {{ .Values.s3server.auth.requireTls | quote }}
+            - name: OIDC_ISSUER_URL
+              value: {{ .Values.s3server.auth.oidc.issuerUrl | quote }}
+            - name: OIDC_CLIENT_ID
+              value: {{ .Values.s3server.auth.oidc.clientId | quote }}
+            - name: STS_SIGNING_KEY
+              value: {{ .Values.s3server.auth.sts.signingKey | quote }}
+            - name: IAM_CONFIG_PATH
+              value: "/etc/s3server/iam_config.json"
           ports:
             - containerPort: {{ .Values.s3server.port }}
               name: s3-metrics
+          volumeMounts:
+            - name: iam-config
+              mountPath: /etc/s3server/iam_config.json
+              subPath: iam_config.json
           livenessProbe:
             tcpSocket:
               port: {{ .Values.s3server.port }}
@@ -72,3 +88,10 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.s3server.resources | nindent 12 }}
+      volumes:
+        - name: iam-config
+          configMap:
+            name: {{ include "rust-hadoop.fullname" . }}-config
+            items:
+              - key: iam_config.json
+                path: iam_config.json

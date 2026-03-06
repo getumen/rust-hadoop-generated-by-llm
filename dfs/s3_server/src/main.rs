@@ -4,8 +4,9 @@ mod handler_tests;
 mod handlers;
 mod s3_types;
 mod state;
+mod sts_handler;
 
-use crate::state::AppState as S3AppState;
+use crate::state::{AppState as S3AppState, OidcValidator, PolicyEvaluator, StsTokenManager};
 use axum::{
     http::StatusCode,
     middleware,
@@ -89,6 +90,55 @@ async fn main() -> anyhow::Result<()> {
     let credential_provider = Arc::new(EnvCredentialProvider::new());
     let signing_key_cache = Arc::new(SigningKeyCache::default());
 
+    let oidc_validator = if let (Ok(issuer), Ok(client_id)) = (
+        std::env::var("OIDC_ISSUER_URL"),
+        std::env::var("OIDC_CLIENT_ID"),
+    ) {
+        let validator = Arc::new(OidcValidator::new(issuer, client_id));
+        // We might want to fetch JWKS in the background or during startup
+        let v_clone = validator.clone();
+        tokio::spawn(async move {
+            if let Err(e) = v_clone.fetch_jwks().await {
+                tracing::error!("Failed to fetch JWKS: {}", e);
+            }
+        });
+        Some(validator)
+    } else {
+        None
+    };
+
+    let sts_token_manager = if let Ok(key_str) = std::env::var("STS_SIGNING_KEY") {
+        let mut key = [0u8; 32];
+        let key_bytes = key_str.as_bytes();
+        let len = key_bytes.len().min(32);
+        key[..len].copy_from_slice(&key_bytes[..len]);
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(1, key);
+        Some(Arc::new(StsTokenManager::new(keys, 1)))
+    } else {
+        None
+    };
+
+    let policy_evaluator = if let Ok(path) = std::env::var("IAM_CONFIG_PATH") {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                match serde_json::from_str::<dfs_common::auth::policy::IamConfig>(&content) {
+                    Ok(config) => Some(Arc::new(PolicyEvaluator::new(config))),
+                    Err(e) => {
+                        tracing::error!("Failed to parse IAM config: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to read IAM config at {}: {}", path, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = S3AppState {
         client,
         auth_enabled,
@@ -97,6 +147,9 @@ async fn main() -> anyhow::Result<()> {
         server_region,
         require_tls,
         allow_unsigned_payload,
+        oidc_validator,
+        sts_token_manager,
+        policy_evaluator,
     };
 
     let authed_routes = Router::new()

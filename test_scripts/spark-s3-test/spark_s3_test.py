@@ -43,10 +43,16 @@ def test_write_and_read_csv(spark, bucket_name):
     print("CSV write successful!")
 
     # Read back
-    read_df = spark.read.option("header", "true").csv(output_path)
-    # Cast age to int as CSV read returns strings by default unless inferSchema is used
-    from pyspark.sql.functions import col
-    read_df = read_df.withColumn("age", col("age").cast(IntegerType()))
+    read_df = spark.read.option("header", "true").option("inferSchema", "true").csv(output_path)
+    print(f"Read CSV columns: {read_df.columns}")
+    read_df.printSchema()
+
+    # Cast age to int if it's not already (though inferSchema should handle it)
+    if "age" in read_df.columns:
+        from pyspark.sql.functions import col
+        read_df = read_df.withColumn("age", col("age").cast(IntegerType()))
+    else:
+        print(f"ERROR: 'age' column not found in {read_df.columns}")
 
     # Verify row count
     assert read_df.count() == 3, f"Expected 3 rows, got {read_df.count()}"
@@ -64,9 +70,9 @@ def test_write_and_read_parquet(spark, bucket_name):
     print("\n=== Test: Write and Read Parquet ===")
 
     data = [
-        (1, "Product A", 100.0),
-        (2, "Product B", 200.0),
-        (3, "Product C", 150.0),
+        (1, "Product A", "100.0"),
+        (2, "Product B", "200.0"),
+        (3, "Product C", "150.0"),
     ]
     schema = StructType([
         StructField("id", IntegerType(), True),

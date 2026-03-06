@@ -20,6 +20,13 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    // 1.5 Skip auth for STS requests (they authenticate via OIDC JWT internally)
+    if let Some(query) = req.uri().query() {
+        if query.contains("Action=AssumeRoleWithWebIdentity") {
+            return next.run(req).await;
+        }
+    }
+
     // 2. TLS check
     if state.require_tls {
         // In this environment, we can check if the request was made via TLS.
@@ -101,15 +108,51 @@ pub async fn auth_middleware(
     }
 
     // 7. Retrieve secret key
-    let secret_key = match state
-        .credential_provider
-        .get_secret_key(&credentials.access_key)
-    {
-        Some(k) => k,
-        None => {
-            return s3_error_response(AuthError::InvalidAccessKey {
-                access_key: credentials.access_key,
-            })
+    let mut evaluation_context = None;
+    let mut role_arn_from_token = None;
+
+    // Check for STS token in headers or query
+    let sts_token = req
+        .headers()
+        .get("x-amz-security-token")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| query_params.get("X-Amz-Security-Token").map(|s| s.as_str()));
+
+    let secret_key = if let Some(token) = sts_token {
+        let sts_mgr = match state.sts_token_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return s3_error_response(AuthError::InternalError(
+                    "STS is not enabled on this server".to_string(),
+                ));
+            }
+        };
+
+        let session_data = match sts_mgr.decrypt_token(token) {
+            Ok(data) => data,
+            Err(e) => return s3_error_response(e),
+        };
+
+        // Check session expiration
+        let now = Utc::now().timestamp() as u64;
+        if session_data.expiration < now {
+            return s3_error_response(AuthError::ExpiredToken);
+        }
+
+        role_arn_from_token = Some(session_data.role_arn.clone());
+        evaluation_context = Some(session_data.claims.to_policy_context());
+        session_data.temp_secret_key
+    } else {
+        match state
+            .credential_provider
+            .get_secret_key(&credentials.access_key)
+        {
+            Some(k) => k,
+            None => {
+                return s3_error_response(AuthError::InvalidAccessKey {
+                    access_key: credentials.access_key,
+                })
+            }
         }
     };
 
@@ -177,7 +220,28 @@ pub async fn auth_middleware(
 
     // 9. Verify Signature
     match dfs_common::auth::signing::verify_signature_with_key(&input, &credentials, &signing_key) {
-        Ok(_) => next.run(req).await,
+        Ok(_) => {
+            // 10. Policy Evaluation (Phase 3)
+            if let Some(role_arn) = role_arn_from_token {
+                if let (Some(pe), Some(ctx)) = (&state.policy_evaluator, &evaluation_context) {
+                    let (s3_action, s3_resource) = resolve_s3_action_and_resource(&req);
+                    if !pe.evaluate(&s3_action, &s3_resource, &role_arn, ctx) {
+                        tracing::warn!(
+                            "Policy evaluation failed for {} on {}",
+                            s3_action,
+                            s3_resource
+                        );
+                        return s3_error_response(AuthError::MissingAuth); // S3 returns AccessDenied (hidden as MissingAuth helper)
+                    }
+                }
+            }
+
+            let mut req = req;
+            if let Some(ctx) = evaluation_context {
+                req.extensions_mut().insert(ctx);
+            }
+            next.run(req).await
+        }
         Err(e) => {
             if let AuthError::SignatureDoesNotMatch {
                 canonical_request,
@@ -204,6 +268,8 @@ fn s3_error_response(err: AuthError) -> Response {
         AuthError::RequestTimeTooSkewed { .. } => StatusCode::FORBIDDEN,
         AuthError::InvalidCredentialScope { .. } => StatusCode::BAD_REQUEST,
         AuthError::InsecureTransport => StatusCode::FORBIDDEN,
+        AuthError::InvalidToken(_) => StatusCode::FORBIDDEN,
+        AuthError::ExpiredToken => StatusCode::FORBIDDEN,
         AuthError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
@@ -218,4 +284,38 @@ fn s3_error_response(err: AuthError) -> Response {
     );
 
     (status, [("Content-Type", "application/xml")], xml).into_response()
+}
+
+fn resolve_s3_action_and_resource(req: &Request<Body>) -> (String, String) {
+    let method = req.method();
+    let path = req.uri().path();
+
+    // Path format: /bucket or /bucket/key
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    let (action, resource) = match (method, parts.as_slice()) {
+        (&axum::http::Method::GET, []) => ("s3:ListAllMyBuckets", "arn:dfs:s3:::*".to_string()),
+        (&axum::http::Method::GET, [_bucket]) => {
+            ("s3:ListBucket", format!("arn:dfs:s3:::{}", parts[0]))
+        }
+        (&axum::http::Method::GET, [_bucket, ..]) => {
+            ("s3:GetObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+        }
+        (&axum::http::Method::PUT, [_bucket, ..]) => {
+            ("s3:PutObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+        }
+        (&axum::http::Method::DELETE, [_bucket, ..]) => (
+            "s3:DeleteObject",
+            format!("arn:dfs:s3:::{}", parts.join("/")),
+        ),
+        (&axum::http::Method::HEAD, [_bucket]) => {
+            ("s3:ListBucket", format!("arn:dfs:s3:::{}", parts[0]))
+        }
+        (&axum::http::Method::HEAD, [_bucket, ..]) => {
+            ("s3:GetObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+        }
+        _ => ("s3:Unknown", "arn:dfs:s3:::*".to_string()),
+    };
+
+    (action.to_string(), resource.to_string())
 }
