@@ -1,0 +1,166 @@
+networks:
+  spark-s3-net:
+    driver: bridge
+
+volumes:
+  master1-shard1-data:
+  master1-shard2-data:
+  cs1-shard1-data:
+  cs1-shard2-data:
+
+
+services:
+  # DFS Master Shard 1
+  master1-shard1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: [ "/app/master", "--id", "1", "--addr", "0.0.0.0:50051", "--http-port", "8080", "--peers", "", "--storage-dir", "/data/raft", "--shard-config", "/app/shard_config.json", "--advertise-addr", "http://oidc-dfs-master1-shard1:50051", "--shard-id", "shard-1" ]
+    volumes:
+      - master1-shard1-data:/data/raft
+      - ../../shard_config.json:/app/shard_config.json:ro
+    networks:
+      - spark-s3-net
+    container_name: oidc-dfs-master1-shard1
+    hostname: oidc-dfs-master1-shard1
+
+  # DFS Master Shard 2
+  master1-shard2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: [ "/app/master", "--id", "1", "--addr", "0.0.0.0:50051", "--http-port", "8080", "--peers", "", "--storage-dir", "/data/raft", "--shard-config", "/app/shard_config.json", "--advertise-addr", "http://oidc-dfs-master1-shard2:50051", "--shard-id", "shard-2" ]
+    volumes:
+      - master1-shard2-data:/data/raft
+      - ../../shard_config.json:/app/shard_config.json:ro
+    networks:
+      - spark-s3-net
+    container_name: oidc-dfs-master1-shard2
+    hostname: oidc-dfs-master1-shard2
+
+  # ChunkServer Shard 1
+  chunkserver1-shard1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--config-servers", "http://oidc-dfs-master1-shard1:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "oidc-dfs-chunkserver1-shard1:50052" ]
+    volumes:
+      - cs1-shard1-data:/data/chunks
+      - ../../shard_config.json:/app/shard_config.json:ro
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    depends_on:
+      - master1-shard1
+    networks:
+      - spark-s3-net
+    container_name: oidc-dfs-chunkserver1-shard1
+    hostname: oidc-dfs-chunkserver1-shard1
+
+  # ChunkServer Shard 2
+  chunkserver1-shard2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: [ "/app/chunkserver", "--addr", "0.0.0.0:50052", "--config-servers", "http://oidc-dfs-master1-shard2:50051", "--storage-dir", "/data/chunks", "--advertise-addr", "oidc-dfs-chunkserver1-shard2:50052" ]
+    volumes:
+      - cs1-shard2-data:/data/chunks
+      - ../../shard_config.json:/app/shard_config.json:ro
+    environment:
+      - SHARD_CONFIG=/app/shard_config.json
+    depends_on:
+      - master1-shard2
+    networks:
+      - spark-s3-net
+    container_name: oidc-dfs-chunkserver1-shard2
+    hostname: oidc-dfs-chunkserver1-shard2
+
+  # S3 Server
+  s3-server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: [ "/app/s3-server" ]
+    environment:
+      - MASTER_ADDR=http://oidc-dfs-master1-shard1:50051
+      - SHARD_CONFIG=/app/shard_config.json
+      - RUST_LOG=dfs_client=debug,s3_server=debug,tower_http=debug
+      - S3_AUTH_ENABLED=true
+      - S3_REQUIRE_TLS=false
+      - OIDC_ISSUER_URL=http://mock-oidc:8080
+      - OIDC_CLIENT_ID=test-client
+      - STS_SIGNING_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+      - IAM_CONFIG_PATH=/app/iam_config.json
+      - S3_ACCESS_KEY=admin
+      - S3_SECRET_KEY=adminsecret12345
+    volumes:
+      - ../../shard_config.json:/app/shard_config.json:ro
+      - ./iam_config.json:/app/iam_config.json:ro
+    ports:
+      - "9000:9000"
+    depends_on:
+      - master1-shard1
+      - master1-shard2
+      - chunkserver1-shard1
+      - chunkserver1-shard2
+    networks:
+      - spark-s3-net
+    container_name: oidc-dfs-s3-server
+    hostname: oidc-dfs-s3-server
+
+  # Spark Master
+  spark-master:
+    image: apache/spark:3.5.3
+    command: [ "/opt/spark/sbin/start-master.sh" ]
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    ports:
+      - "8088:8080"
+      - "7077:7077"
+    networks:
+      - spark-s3-net
+    hostname: spark-master
+
+  # Spark Worker
+  spark-worker:
+    image: apache/spark:3.5.3
+    command: [ "/opt/spark/sbin/start-worker.sh", "spark://spark-master:7077" ]
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    depends_on:
+      - spark-master
+    networks:
+      - spark-s3-net
+    hostname: spark-worker
+
+  # Spark Submit Job Runner
+  spark-submit:
+    image: apache/spark:3.5.3
+    user: root
+    volumes:
+      - ./spark_s3_test.py:/app/spark_s3_test.py:ro
+    depends_on:
+      - spark-master
+      - spark-worker
+      - s3-server
+    environment:
+      - AWS_ACCESS_KEY_ID=dummy
+      - AWS_SECRET_ACCESS_KEY=dummy
+    networks:
+      - spark-s3-net
+    entrypoint: [ "sleep", "infinity" ]
+    hostname: spark-submit
+
+  # Mock OIDC Provider
+  mock-oidc:
+    image: python:3.9-slim
+    command: >
+      bash -c "pip install pyjwt cryptography && python3 /app/mock_oidc_server.py"
+    volumes:
+      - ./mock_oidc_server.py:/app/mock_oidc_server.py:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - spark-s3-net
+    hostname: mock-oidc
