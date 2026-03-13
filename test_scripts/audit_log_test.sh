@@ -24,21 +24,34 @@ cargo build -p s3-server
 S3_PID=$!
 
 # Cleanup on exit
-trap "kill $S3_PID 2>/dev/null || true; rm -rf $AUDIT_DB_PATH" EXIT
+trap "kill $S3_PID 2>/dev/null || true; rm -rf \"$AUDIT_DB_PATH\"" EXIT
 
-# Wait for server
+# Wait for server readiness by polling /health
 echo "Waiting for S3 Server to start..."
-sleep 5
+for i in $(seq 1 30); do
+    if curl -s -o /dev/null -w '%{http_code}' http://localhost:9005/health | grep -q 200; then
+        echo "  Server is ready (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "Error: S3 Server did not start within 30 seconds"
+        exit 1
+    fi
+    sleep 1
+done
 
 echo "Performing requests..."
 
-# Attempt access without credentials (should fail and log as anonymous)
+# Request 1: Anonymous access without credentials (should fail and log as anonymous)
 echo "Request 1: Anonymous access to /test-bucket"
 curl -s http://localhost:9005/test-bucket > /dev/null || true
 
-# Attempt with invalid credentials
-echo "Request 2: Invalid credentials"
-curl -s -H "Authorization: AWS4-HMAC-SHA256 Credential=INVALID/20240313/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=bad" http://localhost:9005/test-bucket > /dev/null || true
+# Request 2: Invalid credentials with required SigV4 headers
+echo "Request 2: Invalid credentials with x-amz-date"
+curl -s \
+    -H "Authorization: AWS4-HMAC-SHA256 Credential=INVALID/20240313/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=bad" \
+    -H "x-amz-date: 20240313T120000Z" \
+    http://localhost:9005/test-bucket > /dev/null || true
 
 # Wait for log flush
 sleep 2
@@ -48,6 +61,15 @@ kill $S3_PID
 wait $S3_PID 2>/dev/null || true
 
 echo "Reading Audit Logs..."
-./target/debug/audit_reader "$AUDIT_DB_PATH"
+OUTPUT=$(./target/debug/audit_reader "$AUDIT_DB_PATH")
+echo "$OUTPUT"
 
-echo "=== Audit Log Test Completed ==="
+# Verify that audit records were actually written
+RECORD_COUNT=$(echo "$OUTPUT" | grep -c "AuditRecord" || true)
+if [ "$RECORD_COUNT" -lt 2 ]; then
+    echo "Error: Expected at least 2 audit records, got $RECORD_COUNT"
+    exit 1
+fi
+
+echo "✓ Found $RECORD_COUNT audit records"
+echo "=== Audit Log Test PASSED ==="

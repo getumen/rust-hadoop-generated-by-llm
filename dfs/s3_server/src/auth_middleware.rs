@@ -23,12 +23,22 @@ pub async fn auth_middleware(
     }
 
     let request_id = Uuid::new_v4().to_string();
+    // Prefer x-real-ip (set by trusted proxy), fall back to x-forwarded-for first entry.
+    // When neither is present, use a placeholder. For accurate peer address without
+    // a proxy, Axum's ConnectInfo<SocketAddr> extractor should be configured.
     let remote_ip = req
         .headers()
-        .get("x-forwarded-for")
+        .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let user_agent = req
         .headers()
         .get(axum::http::header::USER_AGENT)
@@ -515,15 +525,21 @@ fn resolve_s3_action_and_resource_from_parts(
         (&axum::http::Method::GET, [_bucket, ..]) => {
             ("s3:GetObject", format!("arn:dfs:s3:::{}", parts.join("/")))
         }
+        (&axum::http::Method::PUT, [_bucket]) => {
+            ("s3:CreateBucket", format!("arn:dfs:s3:::{}", parts[0]))
+        }
         (&axum::http::Method::PUT, [_bucket, ..]) => {
             ("s3:PutObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+        }
+        (&axum::http::Method::DELETE, [_bucket]) => {
+            ("s3:DeleteBucket", format!("arn:dfs:s3:::{}", parts[0]))
         }
         (&axum::http::Method::DELETE, [_bucket, ..]) => (
             "s3:DeleteObject",
             format!("arn:dfs:s3:::{}", parts.join("/")),
         ),
         (&axum::http::Method::HEAD, [_bucket]) => {
-            ("s3:ListBucket", format!("arn:dfs:s3:::{}", parts[0]))
+            ("s3:HeadBucket", format!("arn:dfs:s3:::{}", parts[0]))
         }
         (&axum::http::Method::HEAD, [_bucket, ..]) => {
             ("s3:GetObject", format!("arn:dfs:s3:::{}", parts.join("/")))

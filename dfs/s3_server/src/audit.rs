@@ -4,7 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Maximum number of keys to delete in a single WriteBatch during cleanup
+/// to avoid unbounded memory growth.
+const CLEANUP_BATCH_LIMIT: usize = 10_000;
 
 pub struct AuditLogger {
     tx: mpsc::Sender<AuditRecord>,
@@ -32,15 +36,37 @@ impl AuditLogger {
                     Some(record) = rx.recv() => {
                         batch_buffer.push(record);
                         if batch_buffer.len() >= batch_size {
-                            if let Err(e) = Self::flush_batch(&db_clone, &mut batch_buffer) {
-                                error!("Failed to flush audit logs: {}", e);
+                            let db_ref = db_clone.clone();
+                            let records = std::mem::replace(
+                                &mut batch_buffer,
+                                Vec::with_capacity(batch_size),
+                            );
+                            match tokio::task::spawn_blocking(move || {
+                                Self::flush_batch(&db_ref, records)
+                            })
+                            .await
+                            {
+                                Ok(Err(e)) => error!("Failed to flush audit logs: {}", e),
+                                Err(e) => error!("Flush task panicked: {}", e),
+                                _ => {}
                             }
                         }
                     }
                     _ = interval.tick() => {
                         if !batch_buffer.is_empty() {
-                            if let Err(e) = Self::flush_batch(&db_clone, &mut batch_buffer) {
-                                error!("Failed to flush audit logs (interval): {}", e);
+                            let db_ref = db_clone.clone();
+                            let records = std::mem::replace(
+                                &mut batch_buffer,
+                                Vec::with_capacity(batch_size),
+                            );
+                            match tokio::task::spawn_blocking(move || {
+                                Self::flush_batch(&db_ref, records)
+                            })
+                            .await
+                            {
+                                Ok(Err(e)) => error!("Failed to flush audit logs (interval): {}", e),
+                                Err(e) => error!("Flush task panicked: {}", e),
+                                _ => {}
                             }
                         }
                     }
@@ -55,8 +81,14 @@ impl AuditLogger {
             let mut cleanup_interval = time::interval(Duration::from_secs(3600)); // Every hour
             loop {
                 cleanup_interval.tick().await;
-                if let Err(e) = Self::cleanup_old_logs(&db_cleanup, retention_days) {
-                    error!("Failed to cleanup old audit logs: {}", e);
+                let db_ref = db_cleanup.clone();
+                let days = retention_days;
+                match tokio::task::spawn_blocking(move || Self::cleanup_old_logs(&db_ref, days))
+                    .await
+                {
+                    Ok(Err(e)) => error!("Failed to cleanup old audit logs: {}", e),
+                    Err(e) => error!("Cleanup task panicked: {}", e),
+                    _ => {}
                 }
             }
         });
@@ -64,18 +96,21 @@ impl AuditLogger {
         Ok(Self { tx, _db: db })
     }
 
+    /// Queue an audit record for async persistence.
+    /// Uses `try_send` to avoid spawning tasks or blocking the caller.
+    /// If the channel is full, the record is dropped and a warning is emitted.
     pub fn log(&self, record: AuditRecord) {
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = tx.send(record).await {
-                error!("Failed to queue audit log: {}", e);
-            }
-        });
+        if let Err(e) = self.tx.try_send(record) {
+            warn!("Audit log channel full or closed, dropping record: {}", e);
+        }
     }
 
-    fn flush_batch(db: &DB, buffer: &mut Vec<AuditRecord>) -> anyhow::Result<()> {
+    /// Write a batch of records to RocksDB. On failure the records are lost
+    /// (they have already been taken from the buffer). The caller should log
+    /// the error so operators are aware.
+    fn flush_batch(db: &DB, records: Vec<AuditRecord>) -> anyhow::Result<()> {
         let mut batch = WriteBatch::default();
-        for record in buffer.drain(..) {
+        for record in &records {
             let ts = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
                 .map(|dt| dt.timestamp_millis())
                 .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
@@ -86,13 +121,15 @@ impl AuditLogger {
             key.extend_from_slice(b":");
             key.extend_from_slice(record.request_id.as_bytes());
 
-            let val = serde_json::to_vec(&record)?;
+            let val = serde_json::to_vec(record)?;
             batch.put(key, val);
         }
         db.write(batch)?;
         Ok(())
     }
 
+    /// Delete audit logs older than `retention_days`.
+    /// Deletes in chunks of `CLEANUP_BATCH_LIMIT` to avoid unbounded memory usage.
     fn cleanup_old_logs(db: &DB, retention_days: u32) -> anyhow::Result<()> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
         let cutoff_ms = cutoff.timestamp_millis();
@@ -101,24 +138,112 @@ impl AuditLogger {
         end_key.extend_from_slice(b"audit:");
         end_key.extend_from_slice(&cutoff_ms.to_be_bytes());
 
-        // delete_range might not be available in this environment's rocksdb version
-        // fallback to iterator-based deletion
         let iter = db.prefix_iterator(b"audit:");
         let mut batch = WriteBatch::default();
-        let mut count = 0;
+        let mut count: usize = 0;
+        let mut total: usize = 0;
         for result in iter {
             let (key, _) = result?;
             if key[..] >= end_key[..] {
                 break;
             }
-            batch.delete(key);
+            batch.delete(&key);
             count += 1;
+
+            // Flush in chunks to bound memory usage
+            if count >= CLEANUP_BATCH_LIMIT {
+                db.write(batch)?;
+                total += count;
+                batch = WriteBatch::default();
+                count = 0;
+            }
         }
-        db.write(batch)?;
+        if count > 0 {
+            db.write(batch)?;
+            total += count;
+        }
         info!(
             "Cleaned up {} audit logs older than {} days",
-            count, retention_days
+            total, retention_days
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn make_record(timestamp: &str, request_id: &str) -> AuditRecord {
+        AuditRecord {
+            timestamp: timestamp.to_string(),
+            request_id: request_id.to_string(),
+            remote_ip: "127.0.0.1".to_string(),
+            user_id: "test-user".to_string(),
+            role_arn: None,
+            action: "s3:GetObject".to_string(),
+            resource: "arn:dfs:s3:::test-bucket/key".to_string(),
+            status_code: 200,
+            error_code: None,
+            user_agent: Some("test-agent".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_flush_batch_key_ordering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, tmp.path()).unwrap();
+
+        let records = vec![
+            make_record("2026-03-13T10:00:00+00:00", "aaa"),
+            make_record("2026-03-13T09:00:00+00:00", "bbb"),
+            make_record("2026-03-13T11:00:00+00:00", "ccc"),
+        ];
+
+        AuditLogger::flush_batch(&db, records).unwrap();
+
+        // Verify records are stored and ordered by timestamp (key prefix)
+        let iter = db.prefix_iterator(b"audit:");
+        let mut request_ids = Vec::new();
+        for result in iter {
+            let (_key, val) = result.unwrap();
+            let record: AuditRecord = serde_json::from_slice(&val).unwrap();
+            request_ids.push(record.request_id);
+        }
+        assert_eq!(request_ids, vec!["bbb", "aaa", "ccc"]); // 09:00, 10:00, 11:00
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, tmp.path()).unwrap();
+
+        // Insert an old record (100 days ago) and a recent record (now)
+        let old_ts = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        let recent_ts = Utc::now().to_rfc3339();
+
+        let records = vec![
+            make_record(&old_ts, "old-record"),
+            make_record(&recent_ts, "new-record"),
+        ];
+        AuditLogger::flush_batch(&db, records).unwrap();
+
+        // Cleanup with 30-day retention
+        AuditLogger::cleanup_old_logs(&db, 30).unwrap();
+
+        // Only the recent record should remain
+        let iter = db.prefix_iterator(b"audit:");
+        let mut remaining = Vec::new();
+        for result in iter {
+            let (_key, val) = result.unwrap();
+            let record: AuditRecord = serde_json::from_slice(&val).unwrap();
+            remaining.push(record.request_id);
+        }
+        assert_eq!(remaining, vec!["new-record"]);
     }
 }
