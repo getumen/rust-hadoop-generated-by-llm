@@ -1,3 +1,4 @@
+mod audit;
 mod auth_middleware;
 #[cfg(test)]
 mod handler_tests;
@@ -139,6 +140,30 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let audit_logger =
+        if std::env::var("AUDIT_LOG_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true" {
+            let log_dir =
+                std::env::var("AUDIT_LOG_DIR").unwrap_or_else(|_| "/tmp/s3_audit_log".to_string());
+            let retention = std::env::var("AUDIT_LOG_RETENTION_DAYS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(30);
+            let batch_size = std::env::var("AUDIT_LOG_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100);
+
+            match crate::audit::AuditLogger::new(log_dir, retention, batch_size) {
+                Ok(logger) => Some(Arc::new(logger)),
+                Err(e) => {
+                    tracing::error!("Failed to initialize AuditLogger: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let state = S3AppState {
         client,
         auth_enabled,
@@ -150,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         oidc_validator,
         sts_token_manager,
         policy_evaluator,
+        audit_logger,
     };
 
     let authed_routes = Router::new()

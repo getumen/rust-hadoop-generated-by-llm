@@ -2745,6 +2745,7 @@ dependencies = [
  "prometheus",
  "quick-xml",
  "rand 0.10.0",
+ "rocksdb",
  "serde",
  "serde_json",
  "serde_urlencoded",

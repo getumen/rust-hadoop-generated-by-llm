@@ -33,9 +33,9 @@ S3互換サービスとしての信頼確保。
         - [x] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、および実装後のフィードバックを反映した詳細設計書の最終クリーンアップ）。
         - [x] HelmChartの環境変数追加（`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` 等）。
         - [x] E2Eテスト（OIDC Login -> STS -> S3 API）のスクリプト作成 (`test_scripts/oidc_sts_test.sh`)。
-- [ ] **Audit Logging (Security Event Trail)**
-    - [ ] 認証・認可・IAM管理操作の監査ログをRocksDBに記録。
-    - [ ] 保持期間（TTL）ベースの自動ローテーション。
+- [x] **Audit Logging (Security Event Trail)** ✅
+    - [x] 認証・認可・IAM管理操作の監査ログをRocksDBに記録。
+    - [x] 保持期間（TTL）ベースの自動ローテーション。
 - [ ] **IAM Observability**
     - [ ] IAM メトリクス（認証成功/失敗率、ポリシー評価レイテンシ等）の Prometheus エクスポート。
     - [ ] 既存 Grafana ダッシュボードへのIAMパネル追加。

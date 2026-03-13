@@ -3,6 +3,14 @@ name = "s3-server"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "s3-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "audit_reader"
+path = "src/bin/audit_reader.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
@@ -28,3 +36,4 @@ percent-encoding = "2.3"
 prometheus = "0.14"
 rand = "0.10.0"
 serde_urlencoded = "0.7"
+rocksdb = "0.24"

@@ -7,8 +7,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use dfs_common::auth::audit::AuditRecord;
 use dfs_common::auth::{parse_credentials, AuthError, SigningInput};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 pub async fn auth_middleware(
     State(state): State<AppState>,
@@ -19,6 +21,22 @@ pub async fn auth_middleware(
     if !state.auth_enabled {
         return next.run(req).await;
     }
+
+    let request_id = Uuid::new_v4().to_string();
+    let remote_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let user_agent = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
 
     // 1.5 Skip auth for STS requests (they authenticate via OIDC JWT internally)
     if let Some(query) = req.uri().query() {
@@ -39,7 +57,23 @@ pub async fn auth_middleware(
                 == Some("https");
 
         if !is_tls {
-            return s3_error_response(AuthError::InsecureTransport);
+            let res = s3_error_response(AuthError::InsecureTransport);
+            if let Some(logger) = &state.audit_logger {
+                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                logger.log(AuditRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    request_id,
+                    remote_ip,
+                    user_id: "anonymous".to_string(),
+                    role_arn: None,
+                    action,
+                    resource,
+                    status_code: res.status().as_u16(),
+                    error_code: Some("AccessDenied".to_string()),
+                    user_agent,
+                });
+            }
+            return res;
         }
     }
 
@@ -76,7 +110,26 @@ pub async fn auth_middleware(
         serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
     let credentials = match parse_credentials(req.headers(), &query_params) {
         Ok(c) => c,
-        Err(e) => return s3_error_response(e),
+        Err(e) => {
+            let res = s3_error_response(e.clone());
+            if let Some(logger) = &state.audit_logger {
+                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (err_code, _) = e.to_s3_error();
+                logger.log(AuditRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    request_id,
+                    remote_ip,
+                    user_id: "anonymous".to_string(),
+                    role_arn: None,
+                    action,
+                    resource,
+                    status_code: res.status().as_u16(),
+                    error_code: Some(err_code),
+                    user_agent,
+                });
+            }
+            return res;
+        }
     };
 
     // 5. Clock Skew Validation (Security requirement)
@@ -86,16 +139,34 @@ pub async fn auth_middleware(
         let now = Utc::now();
         let skew = (now - req_time.with_timezone(&Utc)).num_minutes().abs();
         if skew > 15 {
-            return s3_error_response(AuthError::RequestTimeTooSkewed {
+            let err = AuthError::RequestTimeTooSkewed {
                 server_time: now.to_rfc3339(),
                 request_time: req_time.to_rfc3339(),
-            });
+            };
+            let res = s3_error_response(err.clone());
+            if let Some(logger) = &state.audit_logger {
+                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (err_code, _) = err.to_s3_error();
+                logger.log(AuditRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    request_id,
+                    remote_ip,
+                    user_id: credentials.access_key,
+                    role_arn: None,
+                    action,
+                    resource,
+                    status_code: res.status().as_u16(),
+                    error_code: Some(err_code),
+                    user_agent,
+                });
+            }
+            return res;
         }
     }
 
     // 6. Validate credential scope
     if credentials.region != state.server_region || credentials.service != "s3" {
-        return s3_error_response(AuthError::InvalidCredentialScope {
+        let err = AuthError::InvalidCredentialScope {
             expected: format!(
                 "{}/{}/s3/aws4_request",
                 credentials.date, state.server_region
@@ -104,7 +175,25 @@ pub async fn auth_middleware(
                 "{}/{}/{}/{}",
                 credentials.date, credentials.region, credentials.service, "aws4_request"
             ),
-        });
+        };
+        let res = s3_error_response(err.clone());
+        if let Some(logger) = &state.audit_logger {
+            let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+            let (err_code, _) = err.to_s3_error();
+            logger.log(AuditRecord {
+                timestamp: Utc::now().to_rfc3339(),
+                request_id,
+                remote_ip,
+                user_id: credentials.access_key,
+                role_arn: None,
+                action,
+                resource,
+                status_code: res.status().as_u16(),
+                error_code: Some(err_code),
+                user_agent,
+            });
+        }
+        return res;
     }
 
     // 7. Retrieve secret key
@@ -130,13 +219,49 @@ pub async fn auth_middleware(
 
         let session_data = match sts_mgr.decrypt_token(token) {
             Ok(data) => data,
-            Err(e) => return s3_error_response(e),
+            Err(e) => {
+                let res = s3_error_response(e.clone());
+                if let Some(logger) = &state.audit_logger {
+                    let (action, resource) =
+                        resolve_s3_action_and_resource_from_parts(&method, &path);
+                    let (err_code, _) = e.to_s3_error();
+                    logger.log(AuditRecord {
+                        timestamp: Utc::now().to_rfc3339(),
+                        request_id,
+                        remote_ip,
+                        user_id: credentials.access_key,
+                        role_arn: None,
+                        action,
+                        resource,
+                        status_code: res.status().as_u16(),
+                        error_code: Some(err_code),
+                        user_agent,
+                    });
+                }
+                return res;
+            }
         };
 
         // Check session expiration
         let now = Utc::now().timestamp() as u64;
         if session_data.expiration < now {
-            return s3_error_response(AuthError::ExpiredToken);
+            let res = s3_error_response(AuthError::ExpiredToken);
+            if let Some(logger) = &state.audit_logger {
+                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                logger.log(AuditRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    request_id,
+                    remote_ip,
+                    user_id: credentials.access_key,
+                    role_arn: Some(session_data.role_arn),
+                    action,
+                    resource,
+                    status_code: res.status().as_u16(),
+                    error_code: Some("ExpiredToken".to_string()),
+                    user_agent,
+                });
+            }
+            return res;
         }
 
         role_arn_from_token = Some(session_data.role_arn.clone());
@@ -149,9 +274,28 @@ pub async fn auth_middleware(
         {
             Some(k) => k,
             None => {
-                return s3_error_response(AuthError::InvalidAccessKey {
-                    access_key: credentials.access_key,
-                })
+                let err = AuthError::InvalidAccessKey {
+                    access_key: credentials.access_key.clone(),
+                };
+                let res = s3_error_response(err.clone());
+                if let Some(logger) = &state.audit_logger {
+                    let (action, resource) =
+                        resolve_s3_action_and_resource_from_parts(&method, &path);
+                    let (err_code, _) = err.to_s3_error();
+                    logger.log(AuditRecord {
+                        timestamp: Utc::now().to_rfc3339(),
+                        request_id,
+                        remote_ip,
+                        user_id: credentials.access_key,
+                        role_arn: None,
+                        action,
+                        resource,
+                        status_code: res.status().as_u16(),
+                        error_code: Some(err_code),
+                        user_agent,
+                    });
+                }
+                return res;
             }
         }
     };
@@ -176,8 +320,8 @@ pub async fn auth_middleware(
     };
 
     // 8. Build SigningInput
-    let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    let method_str = method.to_string();
+    let path_str = path.clone();
 
     let mut normalized_headers = BTreeMap::new();
     let mut signed_headers_vec = Vec::new();
@@ -206,12 +350,28 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| "UNSIGNED-PAYLOAD".to_string());
 
     if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload {
-        return s3_error_response(AuthError::MissingAuth);
+        let res = s3_error_response(AuthError::MissingAuth);
+        if let Some(logger) = &state.audit_logger {
+            let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+            logger.log(AuditRecord {
+                timestamp: Utc::now().to_rfc3339(),
+                request_id,
+                remote_ip,
+                user_id: credentials.access_key,
+                role_arn: role_arn_from_token,
+                action,
+                resource,
+                status_code: res.status().as_u16(),
+                error_code: Some("AccessDenied".to_string()),
+                user_agent,
+            });
+        }
+        return res;
     }
 
     let input = SigningInput {
-        method,
-        path,
+        method: method_str,
+        path: path_str,
         query_string: normalized_query_string,
         headers: normalized_headers,
         signed_headers_list,
@@ -222,16 +382,31 @@ pub async fn auth_middleware(
     match dfs_common::auth::signing::verify_signature_with_key(&input, &credentials, &signing_key) {
         Ok(_) => {
             // 10. Policy Evaluation (Phase 3)
-            if let Some(role_arn) = role_arn_from_token {
+            if let Some(role_arn) = &role_arn_from_token {
                 if let (Some(pe), Some(ctx)) = (&state.policy_evaluator, &evaluation_context) {
                     let (s3_action, s3_resource) = resolve_s3_action_and_resource(&req);
-                    if !pe.evaluate(&s3_action, &s3_resource, &role_arn, ctx) {
+                    if !pe.evaluate(&s3_action, &s3_resource, role_arn, ctx) {
                         tracing::warn!(
                             "Policy evaluation failed for {} on {}",
                             s3_action,
                             s3_resource
                         );
-                        return s3_error_response(AuthError::MissingAuth); // S3 returns AccessDenied (hidden as MissingAuth helper)
+                        let res = s3_error_response(AuthError::MissingAuth);
+                        if let Some(logger) = &state.audit_logger {
+                            logger.log(AuditRecord {
+                                timestamp: Utc::now().to_rfc3339(),
+                                request_id,
+                                remote_ip,
+                                user_id: credentials.access_key,
+                                role_arn: Some(role_arn.clone()),
+                                action: s3_action.clone(),
+                                resource: s3_resource.clone(),
+                                status_code: res.status().as_u16(),
+                                error_code: Some("AccessDenied".to_string()),
+                                user_agent,
+                            });
+                        }
+                        return res;
                     }
                 }
             }
@@ -240,7 +415,25 @@ pub async fn auth_middleware(
             if let Some(ctx) = evaluation_context {
                 req.extensions_mut().insert(ctx);
             }
-            next.run(req).await
+            let res = next.run(req).await;
+
+            if let Some(logger) = &state.audit_logger {
+                let (s3_action, s3_resource) =
+                    resolve_s3_action_and_resource_from_parts(&method, &path);
+                logger.log(AuditRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    request_id,
+                    remote_ip,
+                    user_id: credentials.access_key,
+                    role_arn: role_arn_from_token,
+                    action: s3_action,
+                    resource: s3_resource,
+                    status_code: res.status().as_u16(),
+                    error_code: None,
+                    user_agent,
+                });
+            }
+            res
         }
         Err(e) => {
             if let AuthError::SignatureDoesNotMatch {
@@ -254,7 +447,24 @@ pub async fn auth_middleware(
                     string_to_sign
                 );
             }
-            s3_error_response(e)
+            let res = s3_error_response(e.clone());
+            if let Some(logger) = &state.audit_logger {
+                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (err_code, _) = e.to_s3_error();
+                logger.log(AuditRecord {
+                    timestamp: Utc::now().to_rfc3339(),
+                    request_id,
+                    remote_ip,
+                    user_id: credentials.access_key,
+                    role_arn: role_arn_from_token,
+                    action,
+                    resource,
+                    status_code: res.status().as_u16(),
+                    error_code: Some(err_code),
+                    user_agent,
+                });
+            }
+            res
         }
     }
 }
@@ -287,9 +497,13 @@ fn s3_error_response(err: AuthError) -> Response {
 }
 
 fn resolve_s3_action_and_resource(req: &Request<Body>) -> (String, String) {
-    let method = req.method();
-    let path = req.uri().path();
+    resolve_s3_action_and_resource_from_parts(req.method(), req.uri().path())
+}
 
+fn resolve_s3_action_and_resource_from_parts(
+    method: &axum::http::Method,
+    path: &str,
+) -> (String, String) {
     // Path format: /bucket or /bucket/key
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 

@@ -17,4 +17,5 @@ pub struct AppState {
     pub oidc_validator: Option<Arc<OidcValidator>>,
     pub sts_token_manager: Option<Arc<StsTokenManager>>,
     pub policy_evaluator: Option<Arc<PolicyEvaluator>>,
+    pub audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
