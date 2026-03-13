@@ -1,0 +1,238 @@
+use crate::state::AppState as S3AppState;
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use dfs_common::auth::sts::StsSessionData;
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StsQueryParams {
+    #[serde(rename = "Action")]
+    pub action: Option<String>,
+    #[serde(rename = "DurationSeconds")]
+    pub duration_seconds: Option<u64>,
+    #[serde(rename = "RoleArn")]
+    pub role_arn: Option<String>,
+    #[serde(rename = "RoleSessionName")]
+    pub role_session_name: Option<String>,
+    #[serde(rename = "WebIdentityToken")]
+    pub web_identity_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssumeRoleWithWebIdentityResponse {
+    #[serde(rename = "AssumeRoleWithWebIdentityResult")]
+    pub result: AssumeRoleWithWebIdentityResult,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssumeRoleWithWebIdentityResult {
+    #[serde(rename = "Credentials")]
+    pub credentials: Credentials,
+    #[serde(rename = "SubjectFromWebIdentityToken")]
+    pub subject_from_web_identity_token: String,
+    #[serde(rename = "AssumedRoleUser")]
+    pub assumed_role_user: AssumedRoleUser,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Credentials {
+    #[serde(rename = "AccessKeyId")]
+    pub access_key_id: String,
+    #[serde(rename = "SecretAccessKey")]
+    pub secret_access_key: String,
+    #[serde(rename = "SessionToken")]
+    pub session_token: String,
+    #[serde(rename = "Expiration")]
+    pub expiration: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssumedRoleUser {
+    #[serde(rename = "AssumedRoleId")]
+    pub assumed_role_id: String,
+    #[serde(rename = "Arn")]
+    pub arn: String,
+}
+
+pub async fn handle_sts(
+    State(state): State<S3AppState>,
+    Query(params): Query<StsQueryParams>,
+) -> Response {
+    if params.action != Some("AssumeRoleWithWebIdentity".to_string()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let oidc = match &state.oidc_validator {
+        Some(o) => o,
+        None => {
+            return sts_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "OIDC_NOT_ENABLED",
+                "OIDC validation is not enabled on this server.",
+            )
+        }
+    };
+
+    let sts_mgr = match &state.sts_token_manager {
+        Some(s) => s,
+        None => {
+            return sts_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STS_NOT_ENABLED",
+                "STS is not enabled on this server.",
+            )
+        }
+    };
+
+    let policy_eval = match &state.policy_evaluator {
+        Some(p) => p,
+        None => {
+            return sts_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "IAM_NOT_ENABLED",
+                "IAM policy evaluation is not enabled on this server.",
+            )
+        }
+    };
+
+    let web_identity_token = match &params.web_identity_token {
+        Some(t) => t,
+        None => {
+            return sts_error(
+                StatusCode::BAD_REQUEST,
+                "MissingToken",
+                "WebIdentityToken is required",
+            )
+        }
+    };
+
+    let role_arn = match &params.role_arn {
+        Some(r) => r,
+        None => {
+            return sts_error(
+                StatusCode::BAD_REQUEST,
+                "MissingRole",
+                "RoleArn is required",
+            )
+        }
+    };
+
+    // 1. Validate OIDC Token
+    let claims = match oidc.validate_token(web_identity_token).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("OIDC validation failed: {}", e);
+            return sts_error(
+                StatusCode::FORBIDDEN,
+                "InvalidIdentityToken",
+                &e.to_string(),
+            );
+        }
+    };
+
+    // 2. Check Role Trust Policy
+    let context = claims.to_policy_context();
+    if !policy_eval.can_assume_role(role_arn, &context) {
+        return sts_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "User is not authorized to assume this role.",
+        );
+    }
+
+    // 3. Generate Temporary Credentials
+    let duration = params.duration_seconds.unwrap_or(3600);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expiration_ts = now + duration;
+
+    // Generate a random temp secret key (e.g. 40 chars like AWS)
+    use rand::RngExt;
+    let temp_secret_key: String = rand::rng()
+        .sample_iter(&rand::distr::Alphanumeric)
+        .take(40)
+        .map(char::from)
+        .collect();
+
+    // Use a synthetic AccessKeyId for the session (e.g. ASIA...)
+    let access_key_id = format!(
+        "ASIA{}",
+        &uuid::Uuid::new_v4().to_string().replace("-", "")[..16]
+    )
+    .to_uppercase();
+
+    let session_data = StsSessionData {
+        role_arn: role_arn.clone(),
+        temp_secret_key: temp_secret_key.clone(),
+        expiration: expiration_ts,
+        claims: claims.clone(),
+    };
+
+    let session_token = match sts_mgr.generate_token(&session_data) {
+        Ok(t) => t,
+        Err(e) => {
+            return sts_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &e.to_string(),
+            )
+        }
+    };
+
+    let expiration_str = chrono::DateTime::from_timestamp(expiration_ts as i64, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let session_name = params.role_session_name.as_deref().unwrap_or("session");
+
+    let result = AssumeRoleWithWebIdentityResponse {
+        result: AssumeRoleWithWebIdentityResult {
+            credentials: Credentials {
+                access_key_id,
+                secret_access_key: temp_secret_key,
+                session_token,
+                expiration: expiration_str,
+            },
+            subject_from_web_identity_token: claims.sub.clone(),
+            assumed_role_user: AssumedRoleUser {
+                assumed_role_id: format!(
+                    "{}:{}",
+                    role_arn.split('/').next_back().unwrap_or("role"),
+                    session_name
+                ),
+                arn: format!(
+                    "arn:dfs:sts:::assumed-role/{}/{}",
+                    role_arn.split('/').next_back().unwrap_or("role"),
+                    session_name
+                ),
+            },
+        },
+    };
+
+    match quick_xml::se::to_string(&result) {
+        Ok(xml) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(axum::body::Body::from(xml))
+            .unwrap(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn sts_error(status: StatusCode, code: &str, message: &str) -> Response {
+    let xml = format!(
+        r#"<ErrorResponse><Error><Code>{}</Code><Message>{}</Message></Error><RequestId></RequestId></ErrorResponse>"#,
+        code, message
+    );
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/xml")
+        .body(axum::body::Body::from(xml))
+        .unwrap()
+}

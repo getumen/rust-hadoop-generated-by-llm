@@ -1,5 +1,8 @@
 use dfs_client::Client;
-use dfs_common::auth::{cache::SigningKeyCache, credentials::CredentialProvider};
+pub use dfs_common::auth::{
+    cache::SigningKeyCache, credentials::CredentialProvider, oidc::OidcValidator,
+    policy::PolicyEvaluator, sts::StsTokenManager,
+};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -11,4 +14,7 @@ pub struct AppState {
     pub server_region: String,
     pub require_tls: bool,
     pub allow_unsigned_payload: bool,
+    pub oidc_validator: Option<Arc<OidcValidator>>,
+    pub sts_token_manager: Option<Arc<StsTokenManager>>,
+    pub policy_evaluator: Option<Arc<PolicyEvaluator>>,
 }

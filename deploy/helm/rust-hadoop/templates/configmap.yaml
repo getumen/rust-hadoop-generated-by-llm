@@ -16,3 +16,4 @@ data:
         }
       ]
     }
+  iam_config.json: {{ .Values.s3server.auth.iamConfig | toYaml | nindent 4 }}

@@ -1,4 +1,4 @@
-use crate::{s3_types::*, state::AppState as S3AppState};
+use crate::{s3_types::*, state::AppState as S3AppState, sts_handler};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE};
 use axum::{
     body::Body,
@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct S3Query {
+    #[serde(rename = "Action")]
+    pub action: Option<String>,
     pub uploads: Option<String>,
     pub delete: Option<String>,
     #[serde(rename = "uploadId")]
@@ -53,7 +55,20 @@ fn empty_response(status: StatusCode) -> Response {
         .unwrap()
 }
 
-pub async fn handle_root(State(state): State<S3AppState>, method: Method) -> impl IntoResponse {
+pub async fn handle_root(
+    State(state): State<S3AppState>,
+    method: Method,
+    Query(params): Query<S3Query>,
+    // Re-extract Query for STS if needed, but we can't easily do it inside.
+    // Let's just use a more manual approach or a nested match.
+    full_query: Query<sts_handler::StsQueryParams>,
+) -> Response {
+    if let Some(action) = &params.action {
+        if action == "AssumeRoleWithWebIdentity" {
+            return sts_handler::handle_sts(State(state), full_query).await;
+        }
+    }
+
     let res = match method {
         Method::GET => list_buckets(state).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -250,6 +265,37 @@ async fn upload_part(
             .unwrap(),
         Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+fn decode_chunked_payload(body: Bytes) -> Bytes {
+    let mut result = Vec::new();
+    let mut current = &body[..];
+
+    while !current.is_empty() {
+        let line_end = match current.windows(2).position(|w| w == b"\r\n") {
+            Some(p) => p,
+            None => break,
+        };
+
+        let header = &current[..line_end];
+        let header_str = std::str::from_utf8(header).unwrap_or("");
+        let chunk_size_str = header_str.split(';').next().unwrap_or("0");
+        let chunk_size = usize::from_str_radix(chunk_size_str, 16).unwrap_or(0);
+
+        current = &current[line_end + 2..];
+
+        if chunk_size == 0 {
+            break;
+        }
+
+        if current.len() >= chunk_size {
+            result.extend_from_slice(&current[..chunk_size]);
+            current = &current[chunk_size + 2..]; // skip data and trailing \r\n
+        } else {
+            break;
+        }
+    }
+    Bytes::from(result)
 }
 
 async fn complete_multipart_upload(
@@ -602,11 +648,29 @@ async fn list_objects(state: S3AppState, bucket: &str, params: S3Query) -> Respo
                     }
                 }
 
+                // Fetch actual metadata for size and etag
+                let mut size = 0u64;
+                let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
+
+                if let Ok(Some(info)) = state.client.get_file_info(&f).await {
+                    size = info.size;
+                }
+
+                // Try to read .meta file for ETag
+                let meta_path = format!("{}.meta", f);
+                if let Ok(meta_content) = state.client.get_file_content(&meta_path).await {
+                    if let Ok(metadata) = serde_json::from_slice::<Metadata>(&meta_content) {
+                        if let Some(e) = metadata.headers.get("ETag") {
+                            etag = e.clone();
+                        }
+                    }
+                }
+
                 objects.push(Object {
-                    key,
+                    key: key.clone(),
                     last_modified: "2025-01-01T00:00:00.000Z".into(),
-                    etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
-                    size: 0,
+                    etag,
+                    size,
                     storage_class: "STANDARD".into(),
                     owner: Owner {
                         id: "dfs".into(),
@@ -675,13 +739,30 @@ async fn put_object(
 ) -> Response {
     let dest_path = format!("/{}/{}", bucket, key);
     let mut temp_file = NamedTempFile::new().unwrap();
+    let content_sha256 = headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    let body = if content_sha256 == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
+        decode_chunked_payload(body)
+    } else {
+        body
+    };
+
     if let Err(e) = temp_file.write_all(&body) {
         tracing::error!("Failed to write temp file: {}", e);
         return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
     let temp_path = temp_file.path();
     let etag = format!("\"{:x}\"", Md5::digest(&body));
-    tracing::info!("PutObject: key={}, size={}, etag={}", key, body.len(), etag);
+    tracing::info!(
+        "PutObject: key={}, size={}, sha256={}, etag={}",
+        key,
+        body.len(),
+        content_sha256,
+        etag
+    );
 
     match state.client.create_file(temp_path, &dest_path).await {
         Ok(_) => {
@@ -988,6 +1069,12 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
     let path = format!("/{}/{}", bucket, key);
     match state.client.exists(&path).await {
         Ok(true) => {
+            // Get size for Content-Length
+            let mut size = 0u64;
+            if let Ok(Some(info)) = state.client.get_file_info(&path).await {
+                size = info.size;
+            }
+
             // Try to get metadata
             let meta_path = format!("{}.meta", path);
             let temp_dir = std::env::temp_dir();
@@ -1005,6 +1092,7 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
                         let mut response = Response::builder()
                             .status(StatusCode::OK)
                             .header(ETAG, etag)
+                            .header(CONTENT_LENGTH, size)
                             .body(Body::empty())
                             .unwrap();
                         let headers_map = response.headers_mut();
@@ -1021,9 +1109,11 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
                 }
                 let _ = std::fs::remove_file(meta_temp);
             }
+
             Response::builder()
                 .status(StatusCode::OK)
                 .header(ETAG, etag)
+                .header(CONTENT_LENGTH, size)
                 .body(Body::empty())
                 .unwrap()
         }
@@ -1160,11 +1250,29 @@ async fn list_objects_v2(state: S3AppState, bucket: &str, params: S3Query) -> Re
                     }
                 }
 
+                // Fetch actual metadata for size and etag
+                let mut size = 0u64;
+                let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
+
+                if let Ok(Some(info)) = state.client.get_file_info(f).await {
+                    size = info.size;
+                }
+
+                // Try to read .meta file for ETag
+                let meta_path = format!("{}.meta", f);
+                if let Ok(meta_content) = state.client.get_file_content(&meta_path).await {
+                    if let Ok(metadata) = serde_json::from_slice::<Metadata>(&meta_content) {
+                        if let Some(e) = metadata.headers.get("ETag") {
+                            etag = e.clone();
+                        }
+                    }
+                }
+
                 objects.push(Object {
                     key: key.clone(),
                     last_modified: "2025-01-01T00:00:00.000Z".into(),
-                    etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
-                    size: 0,
+                    etag,
+                    size,
                     storage_class: "STANDARD".into(),
                     owner: Owner {
                         id: "dfs".into(),

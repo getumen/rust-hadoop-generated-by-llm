@@ -13,25 +13,26 @@ S3互換サービスとしての信頼確保。
     - [x] チャンク署名 (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) への対応（ロジック実装）。
     - [x] `Authorization` ヘッダーおよびクエリパラメータからの認証情報抽出。
     - [x] タイミング攻撃対策（定数時間比較）の導入。
-- [ ] **OIDC & STS Integration (IAM 代替)** — [詳細設計書](docs/iam_credentials_design.md)
-    - [ ] **Phase 1: OIDC (OpenID Connect) 連携基盤**（推定2-3日）
-        - [ ] OIDC Provider (Keycloak等) の Discovery URLからのJWKS取得・キャッシュ処理。
-        - [ ] JWT（IDトークン）の署名検証、有効期限・Audienceチェックの実装。
-        - [ ] テスト用OIDC Providerモック（またはローカルKeycloakコンテナ）の設定。
-    - [ ] **Phase 2: STS (Security Token Service) 実装**（推定2-3日）
-        - [ ] `AssumeRoleWithWebIdentity` エンドポイントの実装（JWTから一時クレデンシャル交換）。
-        - [ ] ステートレスな `SessionToken` の生成（内部共通鍵によるクレームの暗号化/署名パッキング）。
-        - [ ] `AuthError` の STS 関連バリアント拡張（`ExpiredToken` 等）。
-        - [ ] `auth_middleware` における `x-amz-security-token` の復号・検証の統合。
-    - [ ] **Phase 3: IAM ポリシー評価エンジン (静的コンフィグ駆動)**（推定3-4日）
-        - [ ] `iam_config.json` 等の静的ファイル読み込み・オンメモリ保持構造(`Role` と `Policy` の定義)の実装。
-        - [ ] AWS標準のIAM JSONポリシー（Effect, Action, Resource等）を処理する `PolicyEvaluator`の実装。
-        - [ ] `resolve_s3_action_and_resource()` ヘルパー（HTTP→S3アクション変換）。
-        - [ ] `auth_middleware` への認可（ポリシー評価）の統合と `AccessDenied` エラー処理。
-    - [ ] **Phase 4: 仕上げ**（推定1-2日）
-        - [ ] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、および実装後のフィードバックを反映した詳細設計書の最終クリーンアップ）。
-        - [ ] HelmChartの環境変数追加（`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` 等）。
-        - [ ] E2Eテスト（OIDC Login -> STS -> S3 API）のスクリプト作成 (`test_scripts/oidc_sts_test.sh`)。
+- [x] **OIDC & STS Integration (IAM 代替)** ✅ — [詳細設計書](docs/iam_credentials_design.md)
+    - [x] **Phase 1: OIDC (OpenID Connect) 連携基盤** ✅
+        - [x] OIDC Provider (Keycloak等) の Discovery URLからのJWKS取得・キャッシュ処理。
+        - [x] JWT（IDトークン）の署名検証、有効期限・Audienceチェックの実装。
+        - [x] テスト用OIDC Providerモック（またはローカルKeycloakコンテナ）の設定。
+    - [x] **Phase 2: STS (Security Token Service) 実装** ✅
+        - [x] `AssumeRoleWithWebIdentity` エンドポイントの実装（JWTから一時クレデンシャル交換）。
+        - [x] ステートレスな `SessionToken`（JWT/Fernet形式等）の生成と、S3サーバー間での共有。
+        - [x] `auth_middleware` における `x-amz-security-token` の処理。
+        - [x] `auth_middleware` における `x-amz-security-token` の復号・検証の統合。
+    - [x] **Phase 3: IAM ポリシー評価エンジン (静的コンフィグ駆動)** ✅
+        - [x] `iam_config.json` 等の静的ファイル読み込み・オンメモリ保持構造の実装。
+        - [x] AWS標準の Action / Resource (ワイルドカード対応) マッチングの実装。
+        - [x] `resolve_s3_action_and_resource()` ヘルパー（HTTP→S3アクション変換）。
+        - [x] `auth_middleware` への認可（ポリシー評価）の統合。
+        - [x] `auth_middleware` への認可（ポリシー評価）の統合と `AccessDenied` エラー処理。
+    - [x] **Phase 4: 仕上げ** ✅
+        - [x] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、および実装後のフィードバックを反映した詳細設計書の最終クリーンアップ）。
+        - [x] HelmChartの環境変数追加（`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` 等）。
+        - [x] E2Eテスト（OIDC Login -> STS -> S3 API）のスクリプト作成 (`test_scripts/oidc_sts_test.sh`)。
 - [ ] **Audit Logging (Security Event Trail)**
     - [ ] 認証・認可・IAM管理操作の監査ログをRocksDBに記録。
     - [ ] 保持期間（TTL）ベースの自動ローテーション。

@@ -1,0 +1,36 @@
+{
+  "Roles": [
+    {
+      "RoleName": "spark-job-role",
+      "Arn": "arn:dfs:iam:::role/spark-job-role",
+      "AssumeRolePolicyDocument": {
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": { "Federated": "http://mock-oidc:8080" },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+              "ForAnyValue:StringEquals": {
+                "OIDC_ISSUER:groups": ["data-engineer"]
+              }
+            }
+          }
+        ]
+      },
+      "Policies": [
+        {
+          "PolicyName": "SparkFullAccess",
+          "PolicyDocument": {
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["s3:*"],
+                "Resource": ["arn:dfs:s3:::*"]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
