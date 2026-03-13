@@ -10,13 +10,17 @@ echo "============================================="
 # Cleanup function
 cleanup() {
     echo "Cleaning up..."
-    docker compose -f docker-compose-oidc.yml logs s3-server | tail -30
+    # Best-effort log collection before tearing down
+    docker compose -f docker-compose-oidc.yml logs s3-server --tail=50 2>/dev/null || true
+    docker compose -f docker-compose-oidc.yml down -v --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "Step 1: Restarting cluster with OIDC enabled..."
-# docker compose -f docker-compose-oidc.yml down -v 2>/dev/null || true
+# Ensure a clean start by tearing down any previous run
+docker compose -f docker-compose-oidc.yml down -v --remove-orphans 2>/dev/null || true
 docker compose -f docker-compose-oidc.yml up -d --build
+
 
 echo "Waiting for S3 server and Mock OIDC..."
 sleep 10
@@ -168,9 +172,5 @@ except Exception as e:
 "
 fi
 
-# Cleanup: Stop and remove all containers to prevent conflicts with other tests
-echo ""
-echo "Cleaning up docker-compose containers..."
-docker compose -f docker-compose-oidc.yml down -v
-
+# Exit with the capture code; the trap will handle cleanup
 exit $EXIT_CODE

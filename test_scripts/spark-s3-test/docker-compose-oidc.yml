@@ -155,10 +155,14 @@ services:
   # Mock OIDC Provider
   mock-oidc:
     image: python:3.9-slim
+    environment:
+      - OIDC_ISSUER=http://mock-oidc:8080
+      - OIDC_SUB=user-spark
+      - OIDC_GROUPS=data-engineer
     command: >
-      bash -c "pip install pyjwt cryptography && python3 /app/mock_oidc_server.py"
+      bash -c "pip install pyjwt cryptography && python3 /app/mock_oidc.py"
     volumes:
-      - ./mock_oidc_server.py:/app/mock_oidc_server.py:ro
+      - ../mock_oidc.py:/app/mock_oidc.py:ro
     ports:
       - "8080:8080"
     networks:

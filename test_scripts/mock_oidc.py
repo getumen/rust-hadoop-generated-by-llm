@@ -2,13 +2,15 @@ import http.server
 import json
 import base64
 import time
+import os
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt # pip install pyjwt cryptography
 
-PORT = 8080
-CLIENT_ID = "test-client"
-ISSUER = f"http://localhost:{PORT}"
+PORT = int(os.environ.get("OIDC_PORT", 8080))
+CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "test-client")
+# Use environment variable for issuer, default to localhost for local testing
+ISSUER = os.environ.get("OIDC_ISSUER", f"http://localhost:{PORT}")
 
 # Generate RSA key for the mock OIDC provider
 private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -50,11 +52,17 @@ class MockOidcHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(get_jwks()).encode())
         elif self.path == "/token":
             # Generate token endpoint for automated tests
-            token = generate_token("user-123", ["tenant-a"])
+            sub = os.environ.get("OIDC_SUB", "user-123")
+            groups = os.environ.get("OIDC_GROUPS", "tenant-a").split(',')
+            token = generate_token(sub, groups)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(token.encode())
+            # jwt.encode returns bytes in some versions, str in others
+            if isinstance(token, str):
+                self.wfile.write(token.encode())
+            else:
+                self.wfile.write(token)
         else:
             self.send_response(404)
             self.end_headers()
@@ -76,9 +84,15 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "token":
         # Generate token and print it
-        print(generate_token("user-123", ["tenant-a"]))
+        sub = os.environ.get("OIDC_SUB", "user-123")
+        groups = os.environ.get("OIDC_GROUPS", "tenant-a").split(',')
+        token = generate_token(sub, groups)
+        if isinstance(token, bytes):
+            token = token.decode('utf-8')
+        print(token)
         sys.exit(0)
 
-    server = http.server.HTTPServer(('localhost', PORT), MockOidcHandler)
-    print(f"Mock OIDC server started on {ISSUER}")
+    # Listen on 0.0.0.0 to be accessible within Docker networks
+    server = http.server.HTTPServer(('0.0.0.0', PORT), MockOidcHandler)
+    print(f"Mock OIDC server started on {ISSUER} (listening on 0.0.0.0:{PORT})")
     server.serve_forever()

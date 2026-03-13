@@ -20,8 +20,17 @@ trap cleanup EXIT
 echo "=== OIDC & STS E2E Test ==="
 
 # 1. Install dependencies (Python for mock server and token generation)
-echo "Installing Python dependencies (PyJWT, cryptography)..."
-pip3 install --break-system-packages pyjwt cryptography boto3 2>&1 | grep -v "already satisfied" || true
+echo "Installing Python dependencies (PyJWT, cryptography, boto3)..."
+# Capture output and status to handle errors properly without being too noisy
+PIP_OUTPUT=$(pip3 install --break-system-packages pyjwt cryptography boto3 2>&1)
+PIP_STATUS=$?
+echo "$PIP_OUTPUT" | grep -v "already satisfied" || true
+
+if [ $PIP_STATUS -ne 0 ]; then
+    echo "Error: pip3 install failed with status $PIP_STATUS"
+    exit $PIP_STATUS
+fi
+
 
 # 2. Start Mock OIDC Server
 echo "Starting Mock OIDC Server..."
