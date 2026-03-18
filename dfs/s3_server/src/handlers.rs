@@ -57,15 +57,15 @@ fn empty_response(status: StatusCode) -> Response {
 
 pub async fn handle_root(
     State(state): State<S3AppState>,
+    connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     method: Method,
     Query(params): Query<S3Query>,
-    // Re-extract Query for STS if needed, but we can't easily do it inside.
-    // Let's just use a more manual approach or a nested match.
     full_query: Query<sts_handler::StsQueryParams>,
 ) -> Response {
     if let Some(action) = &params.action {
         if action == "AssumeRoleWithWebIdentity" {
-            return sts_handler::handle_sts(State(state), full_query).await;
+            return sts_handler::handle_sts(State(state), connect_info, headers, full_query).await;
         }
     }
 

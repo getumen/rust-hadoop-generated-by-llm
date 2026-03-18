@@ -6,10 +6,6 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tracing::{error, info, warn};
 
-/// Maximum number of keys to delete in a single WriteBatch during cleanup
-/// to avoid unbounded memory growth.
-const CLEANUP_BATCH_LIMIT: usize = 10_000;
-
 pub struct AuditLogger {
     tx: mpsc::Sender<AuditRecord>,
     _db: Arc<DB>,
@@ -79,6 +75,9 @@ impl AuditLogger {
         let db_cleanup = db.clone();
         tokio::spawn(async move {
             let mut cleanup_interval = time::interval(Duration::from_secs(3600)); // Every hour
+                                                                                  // Skip the first immediate tick to avoid heavy I/O on startup
+            cleanup_interval.tick().await;
+
             loop {
                 cleanup_interval.tick().await;
                 let db_ref = db_cleanup.clone();
@@ -111,13 +110,9 @@ impl AuditLogger {
     fn flush_batch(db: &DB, records: Vec<AuditRecord>) -> anyhow::Result<()> {
         let mut batch = WriteBatch::default();
         for record in &records {
-            let ts = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
-
             let mut key = Vec::with_capacity(32);
             key.extend_from_slice(b"audit:");
-            key.extend_from_slice(&ts.to_be_bytes());
+            key.extend_from_slice(&record.timestamp_ms.to_be_bytes());
             key.extend_from_slice(b":");
             key.extend_from_slice(record.request_id.as_bytes());
 
@@ -129,42 +124,27 @@ impl AuditLogger {
     }
 
     /// Delete audit logs older than `retention_days`.
-    /// Deletes in chunks of `CLEANUP_BATCH_LIMIT` to avoid unbounded memory usage.
+    /// Uses RocksDB's `delete_range` for maximum efficiency.
     fn cleanup_old_logs(db: &DB, retention_days: u32) -> anyhow::Result<()> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
         let cutoff_ms = cutoff.timestamp_millis();
 
+        // RocksDB keys are ordered lexicographically.
+        // Audit keys are "audit:<be_bytes_ms>:<request_id>"
+        // Range: ["audit:", "audit:<cutoff_ms>"]
+        let start_key = b"audit:";
         let mut end_key = Vec::with_capacity(32);
         end_key.extend_from_slice(b"audit:");
         end_key.extend_from_slice(&cutoff_ms.to_be_bytes());
 
-        let iter = db.prefix_iterator(b"audit:");
-        let mut batch = WriteBatch::default();
-        let mut count: usize = 0;
-        let mut total: usize = 0;
-        for result in iter {
-            let (key, _) = result?;
-            if key[..] >= end_key[..] {
-                break;
-            }
-            batch.delete(&key);
-            count += 1;
+        // Note: delete_range is [start, end).
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(start_key.as_slice(), end_key.as_slice());
+        db.write(batch)?;
 
-            // Flush in chunks to bound memory usage
-            if count >= CLEANUP_BATCH_LIMIT {
-                db.write(batch)?;
-                total += count;
-                batch = WriteBatch::default();
-                count = 0;
-            }
-        }
-        if count > 0 {
-            db.write(batch)?;
-            total += count;
-        }
         info!(
-            "Cleaned up {} audit logs older than {} days",
-            total, retention_days
+            "Cleaned up audit logs older than {} days (cutoff: {})",
+            retention_days, cutoff
         );
         Ok(())
     }
@@ -176,8 +156,12 @@ mod tests {
     use chrono::Utc;
 
     fn make_record(timestamp: &str, request_id: &str) -> AuditRecord {
+        let ts_ms = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map(|dt| dt.timestamp_millis() as u64)
+            .unwrap_or(0);
         AuditRecord {
             timestamp: timestamp.to_string(),
+            timestamp_ms: ts_ms,
             request_id: request_id.to_string(),
             remote_ip: "127.0.0.1".to_string(),
             user_id: "test-user".to_string(),

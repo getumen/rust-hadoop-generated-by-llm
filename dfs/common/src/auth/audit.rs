@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub timestamp: String,  // ISO8601 (e.g. 2024-03-13T10:00:00Z)
+    pub timestamp_ms: u64,  // Epoch milliseconds for fast indexing/ordered keys
     pub request_id: String, // Request UUID
     pub remote_ip: String,
     pub user_id: String, // Access Key ID or OIDC Sub

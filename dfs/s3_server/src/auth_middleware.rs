@@ -27,10 +27,15 @@ pub async fn auth_middleware(
     // When neither is present, use a placeholder. For accurate peer address without
     // a proxy, Axum's ConnectInfo<SocketAddr> extractor should be configured.
     let remote_ip = req
-        .headers()
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
+        .or_else(|| {
+            req.headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
         .or_else(|| {
             req.headers()
                 .get("x-forwarded-for")
@@ -69,9 +74,12 @@ pub async fn auth_middleware(
         if !is_tls {
             let res = s3_error_response(AuthError::InsecureTransport);
             if let Some(logger) = &state.audit_logger {
-                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (action, resource) =
+                    resolve_s3_action_and_resource_from_parts(&method, &path, &BTreeMap::new());
+                let now = Utc::now();
                 logger.log(AuditRecord {
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp: now.to_rfc3339(),
+                    timestamp_ms: now.timestamp_millis() as u64,
                     request_id,
                     remote_ip,
                     user_id: "anonymous".to_string(),
@@ -123,10 +131,13 @@ pub async fn auth_middleware(
         Err(e) => {
             let res = s3_error_response(e.clone());
             if let Some(logger) = &state.audit_logger {
-                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (action, resource) =
+                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                let now = Utc::now();
                 let (err_code, _) = e.to_s3_error();
                 logger.log(AuditRecord {
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp: now.to_rfc3339(),
+                    timestamp_ms: now.timestamp_millis() as u64,
                     request_id,
                     remote_ip,
                     user_id: "anonymous".to_string(),
@@ -155,10 +166,13 @@ pub async fn auth_middleware(
             };
             let res = s3_error_response(err.clone());
             if let Some(logger) = &state.audit_logger {
-                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (action, resource) =
+                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                let now = Utc::now();
                 let (err_code, _) = err.to_s3_error();
                 logger.log(AuditRecord {
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp: now.to_rfc3339(),
+                    timestamp_ms: now.timestamp_millis() as u64,
                     request_id,
                     remote_ip,
                     user_id: credentials.access_key,
@@ -188,10 +202,13 @@ pub async fn auth_middleware(
         };
         let res = s3_error_response(err.clone());
         if let Some(logger) = &state.audit_logger {
-            let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+            let (action, resource) =
+                resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+            let now = Utc::now();
             let (err_code, _) = err.to_s3_error();
             logger.log(AuditRecord {
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: now.to_rfc3339(),
+                timestamp_ms: now.timestamp_millis() as u64,
                 request_id,
                 remote_ip,
                 user_id: credentials.access_key,
@@ -233,10 +250,12 @@ pub async fn auth_middleware(
                 let res = s3_error_response(e.clone());
                 if let Some(logger) = &state.audit_logger {
                     let (action, resource) =
-                        resolve_s3_action_and_resource_from_parts(&method, &path);
+                        resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                    let now = Utc::now();
                     let (err_code, _) = e.to_s3_error();
                     logger.log(AuditRecord {
-                        timestamp: Utc::now().to_rfc3339(),
+                        timestamp: now.to_rfc3339(),
+                        timestamp_ms: now.timestamp_millis() as u64,
                         request_id,
                         remote_ip,
                         user_id: credentials.access_key,
@@ -257,9 +276,12 @@ pub async fn auth_middleware(
         if session_data.expiration < now {
             let res = s3_error_response(AuthError::ExpiredToken);
             if let Some(logger) = &state.audit_logger {
-                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (action, resource) =
+                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                let now = Utc::now();
                 logger.log(AuditRecord {
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp: now.to_rfc3339(),
+                    timestamp_ms: now.timestamp_millis() as u64,
                     request_id,
                     remote_ip,
                     user_id: credentials.access_key,
@@ -290,10 +312,12 @@ pub async fn auth_middleware(
                 let res = s3_error_response(err.clone());
                 if let Some(logger) = &state.audit_logger {
                     let (action, resource) =
-                        resolve_s3_action_and_resource_from_parts(&method, &path);
+                        resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                    let now = Utc::now();
                     let (err_code, _) = err.to_s3_error();
                     logger.log(AuditRecord {
-                        timestamp: Utc::now().to_rfc3339(),
+                        timestamp: now.to_rfc3339(),
+                        timestamp_ms: now.timestamp_millis() as u64,
                         request_id,
                         remote_ip,
                         user_id: credentials.access_key,
@@ -362,9 +386,12 @@ pub async fn auth_middleware(
     if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload {
         let res = s3_error_response(AuthError::MissingAuth);
         if let Some(logger) = &state.audit_logger {
-            let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+            let (action, resource) =
+                resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+            let now = Utc::now();
             logger.log(AuditRecord {
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: now.to_rfc3339(),
+                timestamp_ms: now.timestamp_millis() as u64,
                 request_id,
                 remote_ip,
                 user_id: credentials.access_key,
@@ -403,8 +430,10 @@ pub async fn auth_middleware(
                         );
                         let res = s3_error_response(AuthError::MissingAuth);
                         if let Some(logger) = &state.audit_logger {
+                            let now = Utc::now();
                             logger.log(AuditRecord {
-                                timestamp: Utc::now().to_rfc3339(),
+                                timestamp: now.to_rfc3339(),
+                                timestamp_ms: now.timestamp_millis() as u64,
                                 request_id,
                                 remote_ip,
                                 user_id: credentials.access_key,
@@ -429,9 +458,11 @@ pub async fn auth_middleware(
 
             if let Some(logger) = &state.audit_logger {
                 let (s3_action, s3_resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path);
+                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                let now = Utc::now();
                 logger.log(AuditRecord {
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp: now.to_rfc3339(),
+                    timestamp_ms: now.timestamp_millis() as u64,
                     request_id,
                     remote_ip,
                     user_id: credentials.access_key,
@@ -459,10 +490,13 @@ pub async fn auth_middleware(
             }
             let res = s3_error_response(e.clone());
             if let Some(logger) = &state.audit_logger {
-                let (action, resource) = resolve_s3_action_and_resource_from_parts(&method, &path);
+                let (action, resource) =
+                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
+                let now = Utc::now();
                 let (err_code, _) = e.to_s3_error();
                 logger.log(AuditRecord {
-                    timestamp: Utc::now().to_rfc3339(),
+                    timestamp: now.to_rfc3339(),
+                    timestamp_ms: now.timestamp_millis() as u64,
                     request_id,
                     remote_ip,
                     user_id: credentials.access_key,
@@ -507,12 +541,15 @@ fn s3_error_response(err: AuthError) -> Response {
 }
 
 fn resolve_s3_action_and_resource(req: &Request<Body>) -> (String, String) {
-    resolve_s3_action_and_resource_from_parts(req.method(), req.uri().path())
+    let query_params: BTreeMap<String, String> =
+        serde_urlencoded::from_str(req.uri().query().unwrap_or("")).unwrap_or_default();
+    resolve_s3_action_and_resource_from_parts(req.method(), req.uri().path(), &query_params)
 }
 
 fn resolve_s3_action_and_resource_from_parts(
     method: &axum::http::Method,
     path: &str,
+    query_params: &BTreeMap<String, String>,
 ) -> (String, String) {
     // Path format: /bucket or /bucket/key
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -520,29 +557,83 @@ fn resolve_s3_action_and_resource_from_parts(
     let (action, resource) = match (method, parts.as_slice()) {
         (&axum::http::Method::GET, []) => ("s3:ListAllMyBuckets", "arn:dfs:s3:::*".to_string()),
         (&axum::http::Method::GET, [_bucket]) => {
-            ("s3:ListBucket", format!("arn:dfs:s3:::{}", parts[0]))
+            let action = if query_params.contains_key("acl") {
+                "s3:GetBucketAcl"
+            } else if query_params.contains_key("tagging") {
+                "s3:GetBucketTagging"
+            } else if query_params.contains_key("policy") {
+                "s3:GetBucketPolicy"
+            } else if query_params.contains_key("location") {
+                "s3:GetBucketLocation"
+            } else {
+                "s3:ListBucket"
+            };
+            (action, format!("arn:dfs:s3:::{}", _bucket))
         }
         (&axum::http::Method::GET, [_bucket, ..]) => {
-            ("s3:GetObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+            let action = if query_params.contains_key("acl") {
+                "s3:GetObjectAcl"
+            } else if query_params.contains_key("tagging") {
+                "s3:GetObjectTagging"
+            } else {
+                "s3:GetObject"
+            };
+            (action, format!("arn:dfs:s3:::{}", parts.join("/")))
         }
         (&axum::http::Method::PUT, [_bucket]) => {
-            ("s3:CreateBucket", format!("arn:dfs:s3:::{}", parts[0]))
+            let action = if query_params.contains_key("acl") {
+                "s3:PutBucketAcl"
+            } else if query_params.contains_key("tagging") {
+                "s3:PutBucketTagging"
+            } else if query_params.contains_key("policy") {
+                "s3:PutBucketPolicy"
+            } else {
+                "s3:CreateBucket"
+            };
+            (action, format!("arn:dfs:s3:::{}", _bucket))
         }
         (&axum::http::Method::PUT, [_bucket, ..]) => {
-            ("s3:PutObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+            let action = if query_params.contains_key("acl") {
+                "s3:PutObjectAcl"
+            } else if query_params.contains_key("tagging") {
+                "s3:PutObjectTagging"
+            } else {
+                "s3:PutObject"
+            };
+            (action, format!("arn:dfs:s3:::{}", parts.join("/")))
         }
         (&axum::http::Method::DELETE, [_bucket]) => {
-            ("s3:DeleteBucket", format!("arn:dfs:s3:::{}", parts[0]))
+            let action = if query_params.contains_key("tagging") {
+                "s3:DeleteBucketTagging"
+            } else if query_params.contains_key("policy") {
+                "s3:DeleteBucketPolicy"
+            } else {
+                "s3:DeleteBucket"
+            };
+            (action, format!("arn:dfs:s3:::{}", _bucket))
         }
-        (&axum::http::Method::DELETE, [_bucket, ..]) => (
-            "s3:DeleteObject",
-            format!("arn:dfs:s3:::{}", parts.join("/")),
-        ),
+        (&axum::http::Method::DELETE, [_bucket, ..]) => {
+            let action = if query_params.contains_key("tagging") {
+                "s3:DeleteObjectTagging"
+            } else {
+                "s3:DeleteObject"
+            };
+            (action, format!("arn:dfs:s3:::{}", parts.join("/")))
+        }
         (&axum::http::Method::HEAD, [_bucket]) => {
-            ("s3:HeadBucket", format!("arn:dfs:s3:::{}", parts[0]))
+            ("s3:HeadBucket", format!("arn:dfs:s3:::{}", _bucket))
         }
         (&axum::http::Method::HEAD, [_bucket, ..]) => {
-            ("s3:GetObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+            ("s3:HeadObject", format!("arn:dfs:s3:::{}", parts.join("/")))
+        }
+        (&axum::http::Method::POST, [_bucket, ..]) => {
+            let action =
+                if query_params.contains_key("uploads") || query_params.contains_key("uploadId") {
+                    "s3:PutObject" // Multipart upload actions
+                } else {
+                    "s3:Unknown"
+                };
+            (action, format!("arn:dfs:s3:::{}", parts.join("/")))
         }
         _ => ("s3:Unknown", "arn:dfs:s3:::*".to_string()),
     };
