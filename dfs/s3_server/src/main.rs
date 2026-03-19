@@ -1,3 +1,4 @@
+mod audit;
 mod auth_middleware;
 #[cfg(test)]
 mod handler_tests;
@@ -139,6 +140,30 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let audit_logger =
+        if std::env::var("AUDIT_LOG_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true" {
+            let log_dir =
+                std::env::var("AUDIT_LOG_DIR").unwrap_or_else(|_| "/tmp/s3_audit_log".to_string());
+            let retention = std::env::var("AUDIT_LOG_RETENTION_DAYS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(30);
+            let batch_size = std::env::var("AUDIT_LOG_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100);
+
+            match crate::audit::AuditLogger::new(log_dir, retention, batch_size) {
+                Ok(logger) => Some(Arc::new(logger)),
+                Err(e) => {
+                    tracing::error!("Failed to initialize AuditLogger: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let state = S3AppState {
         client,
         auth_enabled,
@@ -150,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         oidc_validator,
         sts_token_manager,
         policy_evaluator,
+        audit_logger,
     };
 
     let authed_routes = Router::new()
@@ -180,11 +206,15 @@ async fn main() -> anyhow::Result<()> {
     if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
         let config = dfs_common::security::get_axum_tls_config(&cert, &key).await?;
         axum_server::bind_rustls(addr, config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
     }
 
     Ok(())
@@ -200,6 +230,26 @@ async fn handle_metrics() -> Result<String, InternalError> {
         .register(Box::new(S3_REQUESTS.clone()))
         .map_err(|e| {
             tracing::error!("Failed to register S3 metrics: {}", e);
+            InternalError
+        })?;
+
+    // Register Audit Logger metrics
+    registry
+        .register(Box::new(crate::audit::AUDIT_LOG_TOTAL.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register audit_log_total: {}", e);
+            InternalError
+        })?;
+    registry
+        .register(Box::new(crate::audit::AUDIT_LOG_DROPPED.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register audit_log_dropped: {}", e);
+            InternalError
+        })?;
+    registry
+        .register(Box::new(crate::audit::AUDIT_LOG_FLUSH_ERRORS.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register audit_log_flush_errors: {}", e);
             InternalError
         })?;
 

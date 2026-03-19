@@ -33,9 +33,16 @@ S3互換サービスとしての信頼確保。
         - [x] ドキュメント更新（`S3_COMPATIBILITY.md` への STS 対応状況反映、および実装後のフィードバックを反映した詳細設計書の最終クリーンアップ）。
         - [x] HelmChartの環境変数追加（`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` 等）。
         - [x] E2Eテスト（OIDC Login -> STS -> S3 API）のスクリプト作成 (`test_scripts/oidc_sts_test.sh`)。
-- [ ] **Audit Logging (Security Event Trail)**
-    - [ ] 認証・認可・IAM管理操作の監査ログをRocksDBに記録。
-    - [ ] 保持期間（TTL）ベースの自動ローテーション。
+- [x] **Audit Logging (Security Event Trail)** ✅
+    - [x] 認証・認可・IAM管理操作の監査ログをRocksDBに記録。
+    - [x] 保持期間（TTL）ベースの自動ローテーション。
+    - [x] ユーザー別セカンダリインデックス（高速検索）。
+    - [x] Graceful Shutdown 時のリスク回避（バッファ全量書き出し）。
+    - [x] Prometheus メトリクスによる監視（ドロップ・エラー数）。
+- [ ] **Advanced Audit Capabilities**
+    - [ ] **Tamper-evident Logging**: ハッシュチェーン（Hash Chaining）によるログの改ざん検知の実装。
+    - [ ] **Resource-based Indexing**: バケットやオブジェクト単位でのアクセス履歴検索用インデックス（`index:resource:...`）。
+    - [ ] **Audit Log Compression**: RocksDB の ZSTD/LZ4 圧縮有効化とストレージ効率の最適化。
 - [ ] **IAM Observability**
     - [ ] IAM メトリクス（認証成功/失敗率、ポリシー評価レイテンシ等）の Prometheus エクスポート。
     - [ ] 既存 Grafana ダッシュボードへのIAMパネル追加。
@@ -138,5 +145,5 @@ S3互換サービスとしての信頼確保。
 - [x] **Clippy Compliance**: Fixed all clippy warnings across meta-server, chunk-server, and test suites.
 - [x] **Large Result Types**: Resolved large `Result` variant warnings by boxing large error types or adding allows.
 
-**Last Updated**: 2026-02-27
+**Last Updated**: 2026-03-19
 **Maintainer**: Development Team

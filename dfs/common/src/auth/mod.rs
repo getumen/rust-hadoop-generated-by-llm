@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod audit;
 pub mod cache;
 pub mod chunked;
 pub mod credentials;
@@ -31,7 +32,7 @@ pub struct SigningInput {
     pub payload_hash: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AuthError {
     #[error("Missing or malformed Authorization header or query parameters")]
     MissingAuth,
