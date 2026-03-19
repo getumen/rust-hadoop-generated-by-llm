@@ -3,8 +3,8 @@ use prometheus::{IntCounter, Registry};
 use rocksdb::{WriteBatch, DB};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::mpsc;
-use tokio::time::{self, Duration};
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
 
 // Prometheus metrics for Audit Logging
@@ -47,6 +47,9 @@ impl AuditLogger {
         let db = Arc::new(DB::open(&opts, db_path)?);
         let (tx, mut rx) = mpsc::channel::<AuditRecord>(10000);
 
+        // Limit concurrent flushes to avoid overwhelming RocksDB during heavy load
+        let flush_semaphore = Arc::new(Semaphore::new(5));
+
         let db_clone = db.clone();
         tokio::spawn(async move {
             let mut batch_buffer = Vec::with_capacity(batch_size);
@@ -64,12 +67,39 @@ impl AuditLogger {
                                         Vec::with_capacity(batch_size),
                                     );
                                     let db_ref = db_clone.clone();
+                                    let sem = flush_semaphore.clone();
                                     tokio::spawn(async move {
-                                        if let Err(e) = tokio::task::spawn_blocking(move || {
-                                            Self::flush_batch(&db_ref, records)
-                                        }).await {
-                                            error!("Flush task panicked: {}", e);
-                                            AUDIT_LOG_FLUSH_ERRORS.inc();
+                                        let _permit = match sem.acquire().await {
+                                            Ok(p) => p,
+                                            Err(_) => return, // Runtime shutting down
+                                        };
+
+                                        // Retry flush up to 3 times to prevent data loss on transient DB issues
+                                        let records_arc = Arc::new(records);
+                                        let mut success = false;
+                                        for attempt in 1..=3 {
+                                            let db_inner = db_ref.clone();
+                                            let recs_inner = records_arc.clone();
+                                            match tokio::task::spawn_blocking(move || {
+                                                Self::flush_batch(&db_inner, &recs_inner)
+                                            }).await {
+                                                Ok(Ok(_)) => {
+                                                    success = true;
+                                                    break;
+                                                },
+                                                Ok(Err(e)) => {
+                                                    error!("Failed to flush audit logs (attempt {}): {}", attempt, e);
+                                                    AUDIT_LOG_FLUSH_ERRORS.inc();
+                                                }
+                                                Err(e) => {
+                                                    error!("Flush task panicked (attempt {}): {}", attempt, e);
+                                                    AUDIT_LOG_FLUSH_ERRORS.inc();
+                                                }
+                                            }
+                                            time::sleep(Duration::from_millis(500 * attempt)).await;
+                                        }
+                                        if !success {
+                                            error!("Critical: Failed to flush audit logs after 3 attempts. Data lost.");
                                         }
                                     });
                                 }
@@ -84,12 +114,37 @@ impl AuditLogger {
                                 Vec::with_capacity(batch_size),
                             );
                             let db_ref = db_clone.clone();
+                            let sem = flush_semaphore.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = tokio::task::spawn_blocking(move || {
-                                    Self::flush_batch(&db_ref, records)
-                                }).await {
-                                    error!("Flush task panicked: {}", e);
-                                    AUDIT_LOG_FLUSH_ERRORS.inc();
+                                let _permit = match sem.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => return,
+                                };
+                                let records_arc = Arc::new(records);
+                                let mut success = false;
+                                for attempt in 1..=3 {
+                                    let db_inner = db_ref.clone();
+                                    let recs_inner = records_arc.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        Self::flush_batch(&db_inner, &recs_inner)
+                                    }).await {
+                                        Ok(Ok(_)) => {
+                                            success = true;
+                                            break;
+                                        },
+                                        Ok(Err(e)) => {
+                                            error!("Failed to flush audit logs (interval, attempt {}): {}", attempt, e);
+                                            AUDIT_LOG_FLUSH_ERRORS.inc();
+                                        }
+                                        Err(e) => {
+                                            error!("Flush task panicked (interval, attempt {}): {}", attempt, e);
+                                            AUDIT_LOG_FLUSH_ERRORS.inc();
+                                        }
+                                    }
+                                    time::sleep(Duration::from_millis(500 * attempt)).await;
+                                }
+                                if !success {
+                                    error!("Critical: Failed to flush audit logs after 3 attempts (interval). Data lost.");
                                 }
                             });
                         }
@@ -98,7 +153,6 @@ impl AuditLogger {
             }
 
             // --- Graceful Shutdown ---
-            // Drain remaining records from the channel
             info!("S3 AuditLogger shutting down, draining remaining records...");
             while let Ok(record) = rx.try_recv() {
                 batch_buffer.push(record);
@@ -106,31 +160,38 @@ impl AuditLogger {
 
             if !batch_buffer.is_empty() {
                 let db_ref = db_clone.clone();
-                // Final flush (blocking here is okay as the task is ending)
-                match tokio::task::spawn_blocking(move || Self::flush_batch(&db_ref, batch_buffer))
+                // Final flush
+                match tokio::task::spawn_blocking(move || Self::flush_batch(&db_ref, &batch_buffer))
                     .await
                 {
+                    Ok(Ok(_)) => info!("Final audit log flush completed."),
                     Ok(Err(e)) => error!("Failed to perform final audit log flush: {}", e),
                     Err(e) => error!("Final flush task panicked: {}", e),
-                    _ => info!("Final audit log flush completed."),
                 }
             }
         });
 
-        // TTL cleanup task (unchanged but using db_clone for clarity)
+        // TTL cleanup task with delayed startup to avoid I/O spike
         let db_cleanup = db.clone();
         tokio::spawn(async move {
-            let mut cleanup_interval = time::interval(Duration::from_secs(3600)); // Every hour
-            cleanup_interval.tick().await; // Skip first
+            // First tick after 1 hour to allow server to warm up
+            let start = Instant::now() + Duration::from_secs(3600);
+            let mut cleanup_interval = time::interval_at(start, Duration::from_secs(3600));
 
             loop {
                 cleanup_interval.tick().await;
                 let db_ref = db_cleanup.clone();
                 let days = retention_days;
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || Self::cleanup_old_logs(&db_ref, days)).await
+                match tokio::task::spawn_blocking(move || Self::cleanup_old_logs(&db_ref, days))
+                    .await
                 {
-                    error!("Cleanup task panicked: {}", e);
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        error!("Failed to cleanup old audit logs: {}", e);
+                    }
+                    Err(e) => {
+                        error!("Cleanup task panicked: {}", e);
+                    }
                 }
             }
         });
@@ -162,9 +223,9 @@ impl AuditLogger {
 
     /// Write a batch of records to RocksDB including secondary indexes.
     /// Index pattern: index:user:<user_id>:<timestamp_ms>:<request_id>
-    fn flush_batch(db: &DB, records: Vec<AuditRecord>) -> anyhow::Result<()> {
+    fn flush_batch(db: &DB, records: &[AuditRecord]) -> anyhow::Result<()> {
         let mut batch = WriteBatch::default();
-        for record in &records {
+        for record in records {
             let ts_bytes = record.timestamp_ms.to_be_bytes();
             let req_id_bytes = record.request_id.as_bytes();
 
@@ -179,7 +240,6 @@ impl AuditLogger {
             batch.put(&key, val);
 
             // 2. Secondary Index (User): index:user:<user_id>:<ts_be>:<req_id>
-            // Value is the primary key to allow lookup.
             let mut user_idx_key = Vec::with_capacity(64);
             user_idx_key.extend_from_slice(b"index:user:");
             user_idx_key.extend_from_slice(record.user_id.as_bytes());
@@ -214,18 +274,6 @@ impl AuditLogger {
         batch.delete_range(start_key.as_slice(), end_key.as_slice());
 
         // 2. Cleanup User Secondary Indexes
-        // Note: delete_range on secondary indexes is more complex because user_id comes before timestamp.
-        // For simplicity in this implementation, we will only use TTL or prefix delete if we had a
-        // user-agnostic index. Since we have index:user:<user_id>:<ts>, we can't delete all users
-        // before <ts> with a single range delete without a different key layout.
-        //
-        // Correct approach for multi-tenant index cleanup:
-        // Use a separate prefix for time-oriented index: index:time:<ts>:<user_id>
-        // and scan/delete that, OR just accept that secondary indexes might linger
-        // (they are small empty or near-empty keys).
-        //
-        // Advanced: Use RocksDB Column Families for different indexes to make cleanup easier.
-        // For now, we'll implement a scan-based cleanup for secondary indexes if retention is triggered.
         let idx_start = b"index:user:";
         let idx_end = b"index:user;"; // ';' is ':' + 1 in ASCII
 
@@ -238,23 +286,21 @@ impl AuditLogger {
 
         for result in iter {
             let (key, _) = result?;
-            // Key format: index:user:<user_id>:<ts_be>:<req_id>
-            // The ts_be is at the end (8 bytes ts + 36 bytes uuid + some prefix).
-            // Actually, it's index:user:<user_id>:<ts_be>:<req_id>
-            // We can split from the end.
-            if key.len() > 44 {
-                let ts_pos = key.len() - 45; // 36 (uuid) + 1 (:) + 8 (ts) = 45
-                let mut ts_bytes = [0u8; 8];
-                ts_bytes.copy_from_slice(&key[ts_pos..ts_pos + 8]);
-                let ts = u64::from_be_bytes(ts_bytes);
-                if ts < cutoff_ms as u64 {
-                    batch.delete(key);
+            // Robust parsing of combined key: index:user:<user_id>:<ts_be>:<req_id>
+            if let Some(last_colon_pos) = key.iter().rposition(|&b| b == b':') {
+                if last_colon_pos >= 8 {
+                    let ts_pos = last_colon_pos - 8;
+                    let mut ts_bytes = [0u8; 8];
+                    ts_bytes.copy_from_slice(&key[ts_pos..last_colon_pos]);
+                    let ts = u64::from_be_bytes(ts_bytes);
+                    if ts < cutoff_ms as u64 {
+                        batch.delete(key);
+                    }
                 }
             }
         }
 
         db.write(batch)?;
-
         info!(
             "Cleaned up audit logs and indexes older than {} days (cutoff: {})",
             retention_days, cutoff
@@ -266,7 +312,6 @@ impl AuditLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn make_record(timestamp: &str, request_id: &str, user_id: &str) -> AuditRecord {
         let ts_ms = chrono::DateTime::parse_from_rfc3339(timestamp)
@@ -301,7 +346,7 @@ mod tests {
             make_record("2026-03-13T12:00:00+00:00", "req3", "user-a"),
         ];
 
-        AuditLogger::flush_batch(&db, records).unwrap();
+        AuditLogger::flush_batch(&db, &records).unwrap();
 
         // Search for user-a
         let prefix = b"index:user:user-a:";

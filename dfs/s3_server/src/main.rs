@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
     if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
         let config = dfs_common::security::get_axum_tls_config(&cert, &key).await?;
         axum_server::bind_rustls(addr, config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;

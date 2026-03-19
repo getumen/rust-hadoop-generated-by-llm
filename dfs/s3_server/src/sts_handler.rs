@@ -273,11 +273,18 @@ pub async fn handle_sts(
     let session_token = match sts_mgr.generate_token(&session_data) {
         Ok(t) => t,
         Err(e) => {
+            log_audit(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("InternalError"),
+                action,
+                &claims.sub,
+                Some(role_arn),
+            );
             return sts_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
                 &e.to_string(),
-            )
+            );
         }
     };
 
@@ -319,7 +326,17 @@ pub async fn handle_sts(
             .header("Content-Type", "application/xml")
             .body(axum::body::Body::from(xml))
             .unwrap(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            tracing::error!("Failed to serialize STS response: {}", e);
+            log_audit(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("InternalError"),
+                action,
+                &claims.sub,
+                Some(role_arn),
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
