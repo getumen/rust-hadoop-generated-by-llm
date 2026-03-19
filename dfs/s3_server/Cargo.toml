@@ -37,5 +37,7 @@ percent-encoding = "2.3"
 prometheus = "0.14"
 rand = "0.10.0"
 serde_urlencoded = "0.7"
-rocksdb = "0.24"
+rocksdb = { version = "0.24", features = ["zstd"] }
 clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
+sha2 = "0.10"

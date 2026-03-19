@@ -14,4 +14,6 @@ pub struct AuditRecord {
     pub error_code: Option<String>, // S3 Error Code (e.g. AccessDenied)
     pub user_agent: Option<String>,
     pub duration_ms: Option<u64>, // Duration of the whole request in milliseconds
+    pub previous_hash: Option<String>, // HMAC-SHA256 of the previous record
+    pub record_hash: Option<String>, // HMAC-SHA256 of this record
 }

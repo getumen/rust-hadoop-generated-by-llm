@@ -152,8 +152,10 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(100);
+            let hmac_secret = std::env::var("AUDIT_HMAC_SECRET")
+                .unwrap_or_else(|_| "default_audit_hmac_secret".to_string());
 
-            match crate::audit::AuditLogger::new(log_dir, retention, batch_size) {
+            match crate::audit::AuditLogger::new(log_dir, retention, batch_size, hmac_secret) {
                 Ok(logger) => Some(Arc::new(logger)),
                 Err(e) => {
                     tracing::error!("Failed to initialize AuditLogger: {}", e);

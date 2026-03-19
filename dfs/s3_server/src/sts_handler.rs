@@ -96,6 +96,8 @@ pub async fn handle_sts(
                 error_code: error_code.map(|s| s.to_string()),
                 user_agent: user_agent.clone(),
                 duration_ms: Some(duration),
+                previous_hash: None,
+                record_hash: None,
             });
         }
     };

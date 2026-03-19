@@ -1,7 +1,11 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use dfs_common::auth::audit::AuditRecord;
-use rocksdb::DB;
+use hmac::{Hmac, Mac};
+use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, Options, DB};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "CLI tool to read and filter S3 server audit logs", long_about = None)]
@@ -15,6 +19,13 @@ struct Args {
         help = "Filter by User ID (Access Key or Sub). Using this flag enables optimized index lookup."
     )]
     user: Option<String>,
+
+    #[arg(
+        short,
+        long,
+        help = "Filter by Resource Bucket name. Using this flag enables optimized index lookup."
+    )]
+    resource: Option<String>,
 
     #[arg(short, long, help = "Filter by S3 Action (e.g. s3:GetObject)")]
     action: Option<String>,
@@ -38,13 +49,50 @@ struct Args {
         help = "Limit the number of records"
     )]
     limit: usize,
+
+    #[arg(long, help = "Verify Hash Chain using the provided HMAC secret")]
+    verify_chain: Option<String>,
+}
+
+fn compute_hmac(record: &AuditRecord, secret: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    let payload = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        record.previous_hash.as_deref().unwrap_or(""),
+        record.timestamp_ms,
+        record.request_id,
+        record.user_id,
+        record.action,
+        record.resource,
+        record.status_code
+    );
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let opts = rocksdb::Options::default();
-    let db = DB::open_for_read_only(&opts, &args.db_path, false)?;
+    let mut opts = Options::default();
+    opts.set_compression_type(DBCompressionType::Zstd);
+
+    let cf_logs = ColumnFamilyDescriptor::new("logs", opts.clone());
+    let cf_idx_user = ColumnFamilyDescriptor::new("idx_user", opts.clone());
+    let cf_idx_resource = ColumnFamilyDescriptor::new("idx_resource", opts.clone());
+
+    let cfs = vec![
+        ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone()),
+        cf_logs,
+        cf_idx_user,
+        cf_idx_resource,
+    ];
+
+    let db = DB::open_cf_descriptors_read_only(&opts, &args.db_path, cfs, false)?;
+
+    if let Some(secret) = &args.verify_chain {
+        return verify_chain(&db, secret);
+    }
 
     let start_ms = if let Some(s) = &args.start {
         DateTime::parse_from_rfc3339(s)?
@@ -73,79 +121,87 @@ fn main() -> anyhow::Result<()> {
     let mut count = 0;
 
     if let Some(user_id) = &args.user {
-        // Optimized path: Use secondary index: index:user:<user_id>:<ts_be>:<req_id>
-        let mut user_prefix = Vec::with_capacity(32);
-        user_prefix.extend_from_slice(b"index:user:");
-        user_prefix.extend_from_slice(user_id.as_bytes());
-        user_prefix.extend_from_slice(b":");
+        // Optimized path: Use user secondary index
+        let cf = db.cf_handle("idx_user").unwrap();
+        let mut start_key = Vec::with_capacity(32);
+        start_key.extend_from_slice(user_id.as_bytes());
+        start_key.extend_from_slice(b":");
 
-        let mut start_key = user_prefix.clone();
+        let iter = db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+
+        for result in iter {
+            let (key, primary_key) = result?;
+            if !key.starts_with(&start_key) {
+                break;
+            }
+            if process_primary_key(&db, &primary_key, start_ms, end_ms, &args)? {
+                count += 1;
+                if count >= args.limit {
+                    break;
+                }
+            }
+        }
+    } else if let Some(resource_id) = &args.resource {
+        // Optimized path: Use resource secondary index
+        let cf = db.cf_handle("idx_resource").unwrap();
+        let mut start_key = Vec::with_capacity(32);
+        start_key.extend_from_slice(resource_id.as_bytes());
+        start_key.extend_from_slice(b":");
+
+        let iter = db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+
+        for result in iter {
+            let (key, primary_key) = result?;
+            if !key.starts_with(&start_key) {
+                break;
+            }
+            if process_primary_key(&db, &primary_key, start_ms, end_ms, &args)? {
+                count += 1;
+                if count >= args.limit {
+                    break;
+                }
+            }
+        }
+    } else {
+        // Standard path: Scan by time from primary index in CF_LOGS
+        let cf = db.cf_handle("logs").unwrap();
+        let mut start_key = Vec::with_capacity(16);
+        start_key.extend_from_slice(b":"); // Primary keys start with ":"
         if start_ms > 0 {
             start_key.extend_from_slice(&start_ms.to_be_bytes());
         }
 
-        let iter = db.iterator(rocksdb::IteratorMode::From(
-            &start_key,
-            rocksdb::Direction::Forward,
-        ));
-
-        for result in iter {
-            let (key, primary_key) = result?;
-            if !key.starts_with(&user_prefix) {
-                break;
-            }
-
-            // Extract timestamp from index key to check end_ms filter Before reading primary
-            let ts_pos = key.len() - 45; // 36 (uuid) + 1 (:) + 8 (ts) = 45
-            let mut ts_bytes = [0u8; 8];
-            ts_bytes.copy_from_slice(&key[ts_pos..ts_pos + 8]);
-            let ts = u64::from_be_bytes(ts_bytes);
-            if ts > end_ms {
-                break;
-            }
-
-            // Fetch actual record from primary key
-            if let Some(val) = db.get(&primary_key)? {
-                let record: AuditRecord = serde_json::from_slice(&val)?;
-                if filter_record(&record, &args) {
-                    print_record(&record, &args)?;
-                    count += 1;
-                }
-            }
-
-            if count >= args.limit {
-                break;
-            }
-        }
-    } else {
-        // Standard path: Scan by time from primary index: audit:<ts_be>:<req_id>
-        let mut start_key = Vec::with_capacity(16);
-        start_key.extend_from_slice(b"audit:");
-        start_key.extend_from_slice(&start_ms.to_be_bytes());
-
-        let iter = db.iterator(rocksdb::IteratorMode::From(
-            &start_key,
-            rocksdb::Direction::Forward,
-        ));
+        let iter = db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
 
         for result in iter {
             let (key, val) = result?;
-            if !key.starts_with(b"audit:") {
-                break;
+            if !key.starts_with(b":") {
+                break; // Should always start with ":"
             }
 
             let record: AuditRecord = serde_json::from_slice(&val)?;
             if record.timestamp_ms > end_ms {
                 break;
             }
+            if record.timestamp_ms < start_ms {
+                continue;
+            }
 
             if filter_record(&record, &args) {
                 print_record(&record, &args)?;
                 count += 1;
-            }
-
-            if count >= args.limit {
-                break;
+                if count >= args.limit {
+                    break;
+                }
             }
         }
     }
@@ -157,8 +213,82 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn process_primary_key(
+    db: &DB,
+    primary_key: &[u8],
+    start_ms: u64,
+    end_ms: u64,
+    args: &Args,
+) -> anyhow::Result<bool> {
+    // Key format is :ts_be:req_id
+    if primary_key.len() > 9 && primary_key[0] == b':' {
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&primary_key[1..9]);
+        let ts = u64::from_be_bytes(ts_bytes);
+
+        if ts < start_ms || ts > end_ms {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false);
+    }
+
+    let cf_logs = db.cf_handle("logs").unwrap();
+    if let Some(val) = db.get_cf(cf_logs, primary_key)? {
+        let record: AuditRecord = serde_json::from_slice(&val)?;
+        if filter_record(&record, args) {
+            print_record(&record, args)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_chain(db: &DB, secret: &str) -> anyhow::Result<()> {
+    println!("Verifying Hash Chain...");
+    let cf_logs = db.cf_handle("logs").unwrap();
+    let iter = db.iterator_cf(cf_logs, rocksdb::IteratorMode::Start);
+
+    let mut last_hash: Option<String> = None;
+    let mut verified_count = 0;
+
+    for result in iter {
+        let (_, val) = result?;
+        let record: AuditRecord = serde_json::from_slice(&val)?;
+
+        if verified_count > 0 && record.previous_hash != last_hash {
+            println!(
+                "❌ Chain Mismatch Discovered at Request ID: {}",
+                record.request_id
+            );
+            println!("  Expected previous_hash: {:?}", last_hash);
+            println!("  Found previous_hash:    {:?}", record.previous_hash);
+            return Err(anyhow::anyhow!("Audit log hash chain is broken!"));
+        }
+
+        // Verify current record hash
+        let expected_hash = compute_hmac(&record, secret);
+        if record.record_hash.as_deref() != Some(&expected_hash) {
+            println!(
+                "❌ Record Hash Mismatch Discovered at Request ID: {}",
+                record.request_id
+            );
+            println!("  Computed hash: {:?}", expected_hash);
+            println!("  Found hash:    {:?}", record.record_hash);
+            return Err(anyhow::anyhow!("Audit log record is tampered!"));
+        }
+
+        last_hash = record.record_hash;
+        verified_count += 1;
+    }
+
+    println!("✅ Hash Chain Verification Successful!");
+    println!("✅ Total {} records verified.", verified_count);
+
+    Ok(())
+}
+
 fn filter_record(record: &AuditRecord, args: &Args) -> bool {
-    // User filter is already handled by index if provided, but we check again for safety
     if let Some(u) = &args.user {
         if &record.user_id != u {
             return false;
@@ -171,6 +301,18 @@ fn filter_record(record: &AuditRecord, args: &Args) -> bool {
     }
     if let Some(s) = args.status {
         if record.status_code != s {
+            return false;
+        }
+    }
+    if let Some(r) = &args.resource {
+        let resource_parts: Vec<&str> = record.resource.split(':').collect();
+        let bucket_id = if let Some(&part) = resource_parts.get(5) {
+            part
+        } else {
+            record.resource.as_str()
+        };
+        let bucket_name = bucket_id.split('/').next().unwrap_or(bucket_id);
+        if bucket_name != r {
             return false;
         }
     }

@@ -39,10 +39,10 @@ S3互換サービスとしての信頼確保。
     - [x] ユーザー別セカンダリインデックス（高速検索）。
     - [x] Graceful Shutdown 時のリスク回避（バッファ全量書き出し）。
     - [x] Prometheus メトリクスによる監視（ドロップ・エラー数）。
-- [ ] **Advanced Audit Capabilities**
-    - [ ] **Tamper-evident Logging**: ハッシュチェーン（Hash Chaining）によるログの改ざん検知の実装。
-    - [ ] **Resource-based Indexing**: バケットやオブジェクト単位でのアクセス履歴検索用インデックス（`index:resource:...`）。
-    - [ ] **Audit Log Compression**: RocksDB の ZSTD/LZ4 圧縮有効化とストレージ効率の最適化。
+- [x] **Advanced Audit Capabilities** ✅
+    - [x] **Tamper-evident Logging**: ハッシュチェーン（Hash Chaining）とHMAC-SHA256によるログの改ざん検知の実装。
+    - [x] **Resource-based Indexing**: Column Families を活用したバケットやオブジェクト単位でのアクセス履歴検索用インデックス（`CF: idx_resource`）。
+    - [x] **Audit Log Compression**: RocksDB の ZSTD 圧縮有効化とストレージ効率の最適化。
 - [ ] **IAM Observability**
     - [ ] IAM メトリクス（認証成功/失敗率、ポリシー評価レイテンシ等）の Prometheus エクスポート。
     - [ ] 既存 Grafana ダッシュボードへのIAMパネル追加。
