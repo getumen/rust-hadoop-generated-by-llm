@@ -490,6 +490,8 @@ impl AuditContext {
                 error_code,
                 user_agent: self.user_agent.clone(),
                 duration_ms: Some(duration),
+                previous_hash: None,
+                record_hash: None,
             });
         }
     }

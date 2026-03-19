@@ -140,20 +140,33 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let audit_logger =
-        if std::env::var("AUDIT_LOG_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true" {
-            let log_dir =
-                std::env::var("AUDIT_LOG_DIR").unwrap_or_else(|_| "/tmp/s3_audit_log".to_string());
-            let retention = std::env::var("AUDIT_LOG_RETENTION_DAYS")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(30);
-            let batch_size = std::env::var("AUDIT_LOG_BATCH_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(100);
+    let audit_logger = if std::env::var("AUDIT_LOG_ENABLED").unwrap_or_else(|_| "true".to_string())
+        == "true"
+    {
+        let log_dir =
+            std::env::var("AUDIT_LOG_DIR").unwrap_or_else(|_| "/tmp/s3_audit_log".to_string());
+        let retention = std::env::var("AUDIT_LOG_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(30);
+        let batch_size = std::env::var("AUDIT_LOG_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100);
+        let hmac_secret = match std::env::var("AUDIT_HMAC_SECRET") {
+            Ok(s) if s.len() >= 16 => Some(s),
+            Ok(_) => {
+                tracing::error!("AUDIT_HMAC_SECRET must be at least 16 bytes for secure tamper-evidence. Disabling AuditLogger.");
+                None
+            }
+            Err(_) => {
+                tracing::error!("AUDIT_HMAC_SECRET must be set when AUDIT_LOG_ENABLED=true. Disabling AuditLogger.");
+                None
+            }
+        };
 
-            match crate::audit::AuditLogger::new(log_dir, retention, batch_size) {
+        if let Some(secret) = hmac_secret {
+            match crate::audit::AuditLogger::new(log_dir, retention, batch_size, secret) {
                 Ok(logger) => Some(Arc::new(logger)),
                 Err(e) => {
                     tracing::error!("Failed to initialize AuditLogger: {}", e);
@@ -162,7 +175,10 @@ async fn main() -> anyhow::Result<()> {
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     let state = S3AppState {
         client,

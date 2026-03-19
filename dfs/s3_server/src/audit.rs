@@ -1,11 +1,20 @@
 use dfs_common::auth::audit::AuditRecord;
+use hmac::{Hmac, Mac};
 use prometheus::{IntCounter, Registry};
-use rocksdb::{WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, Options, WriteBatch, DB};
+use sha2::Sha256;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant};
 use tracing::{error, info, warn};
+
+// Use HMAC-SHA256
+type HmacSha256 = Hmac<Sha256>;
+
+pub const CF_LOGS: &str = "logs";
+pub const CF_IDX_USER: &str = "idx_user";
+pub const CF_IDX_RESOURCE: &str = "idx_resource";
 
 // Prometheus metrics for Audit Logging
 pub static AUDIT_LOG_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -41,19 +50,48 @@ impl AuditLogger {
         db_path: P,
         retention_days: u32,
         batch_size: usize,
+        hmac_secret: String,
     ) -> anyhow::Result<Self> {
-        let mut opts = rocksdb::Options::default();
+        let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = Arc::new(DB::open(&opts, db_path)?);
+        opts.create_missing_column_families(true);
+        // Use Zstd compression for high efficiency with JSON logs
+        opts.set_compression_type(DBCompressionType::Zstd);
+
+        let cf_logs = ColumnFamilyDescriptor::new(CF_LOGS, opts.clone());
+        let cf_idx_user = ColumnFamilyDescriptor::new(CF_IDX_USER, opts.clone());
+        let cf_idx_resource = ColumnFamilyDescriptor::new(CF_IDX_RESOURCE, opts.clone());
+
+        let cfs = vec![
+            ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone()),
+            cf_logs,
+            cf_idx_user,
+            cf_idx_resource,
+        ];
+
+        let db = Arc::new(DB::open_cf_descriptors(&opts, db_path, cfs)?);
         let (tx, mut rx) = mpsc::channel::<AuditRecord>(10000);
 
-        // Limit concurrent flushes to avoid overwhelming RocksDB during heavy load
-        let flush_semaphore = Arc::new(Semaphore::new(5));
-
         let db_clone = db.clone();
+
+        // Single Worker Task for sequential write and HMAC chaining
         tokio::spawn(async move {
             let mut batch_buffer = Vec::with_capacity(batch_size);
             let mut interval = time::interval(Duration::from_secs(5));
+            let mut committed_last_hash: Option<String> = None;
+            let mut global_last_ts_ms: u64 = 0;
+
+            // Recover the last hash & timestamp from DB on startup
+            if let Some(cf) = db_clone.cf_handle(CF_LOGS) {
+                let mut iter = db_clone.iterator_cf(cf, rocksdb::IteratorMode::End);
+                if let Some(Ok((_, val))) = iter.next() {
+                    if let Ok(last_rec) = serde_json::from_slice::<AuditRecord>(&val) {
+                        committed_last_hash = last_rec.record_hash;
+                        global_last_ts_ms = last_rec.timestamp_ms;
+                        info!("Recovered last audit log hash for chaining ({}). Sequence starting at TS: {}", committed_last_hash.as_deref().unwrap_or("None"), global_last_ts_ms);
+                    }
+                }
+            }
 
             loop {
                 tokio::select! {
@@ -62,46 +100,58 @@ impl AuditLogger {
                             Some(record) => {
                                 batch_buffer.push(record);
                                 if batch_buffer.len() >= batch_size {
-                                    let records = std::mem::replace(
+                                    let mut records = std::mem::replace(
                                         &mut batch_buffer,
                                         Vec::with_capacity(batch_size),
                                     );
-                                    let db_ref = db_clone.clone();
-                                    let sem = flush_semaphore.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = match sem.acquire().await {
-                                            Ok(p) => p,
-                                            Err(_) => return, // Runtime shutting down
-                                        };
 
-                                        // Retry flush up to 3 times to prevent data loss on transient DB issues
-                                        let records_arc = Arc::new(records);
-                                        let mut success = false;
-                                        for attempt in 1..=3 {
-                                            let db_inner = db_ref.clone();
-                                            let recs_inner = records_arc.clone();
-                                            match tokio::task::spawn_blocking(move || {
-                                                Self::flush_batch(&db_inner, &recs_inner)
-                                            }).await {
-                                                Ok(Ok(_)) => {
-                                                    success = true;
-                                                    break;
-                                                },
-                                                Ok(Err(e)) => {
-                                                    error!("Failed to flush audit logs (attempt {}): {}", attempt, e);
-                                                    AUDIT_LOG_FLUSH_ERRORS.inc();
-                                                }
-                                                Err(e) => {
-                                                    error!("Flush task panicked (attempt {}): {}", attempt, e);
-                                                    AUDIT_LOG_FLUSH_ERRORS.inc();
-                                                }
-                                            }
-                                            time::sleep(Duration::from_millis(500 * attempt)).await;
-                                        }
-                                        if !success {
-                                            error!("Critical: Failed to flush audit logs after 3 attempts. Data lost.");
-                                        }
+                                    // Keep original timestamp immutable, compute monotonic key_ts for DB sorting
+                                    records.sort_by(|a, b| {
+                                        a.timestamp_ms.cmp(&b.timestamp_ms).then_with(|| a.request_id.cmp(&b.request_id))
                                     });
+                                    let mut keyed_records = Vec::with_capacity(records.len());
+
+                                    // Compute HMAC chaining correctly across the batch
+                                    let mut temp_hash = committed_last_hash.clone();
+                                    for mut rec in records.into_iter() {
+                                        let key_ts = std::cmp::max(rec.timestamp_ms, global_last_ts_ms);
+                                        global_last_ts_ms = key_ts;
+                                        rec.previous_hash = temp_hash.clone();
+                                        temp_hash = Some(Self::compute_hmac(&rec, &hmac_secret));
+                                        rec.record_hash = temp_hash.clone();
+                                        keyed_records.push((key_ts, rec));
+                                    }
+
+                                    let db_ref = db_clone.clone();
+
+                                    // Serialize DB writes in the same worker to guarantee order
+                                    let mut success = false;
+                                    for attempt in 1..=3 {
+                                        let recs_inner = keyed_records.clone();
+                                        match tokio::task::spawn_blocking({
+                                            let db_inner = db_ref.clone();
+                                            move || Self::flush_batch(&db_inner, &recs_inner)
+                                        }).await {
+                                            Ok(Ok(_)) => {
+                                                success = true;
+                                                break;
+                                            },
+                                            Ok(Err(e)) => {
+                                                error!("Failed to flush audit logs (attempt {}): {}", attempt, e);
+                                                AUDIT_LOG_FLUSH_ERRORS.inc();
+                                            }
+                                            Err(e) => {
+                                                error!("Flush task panicked (attempt {}): {}", attempt, e);
+                                                AUDIT_LOG_FLUSH_ERRORS.inc();
+                                            }
+                                        }
+                                        time::sleep(Duration::from_millis(500 * attempt)).await;
+                                    }
+                                    if success {
+                                        committed_last_hash = temp_hash; // Advance only on persistance
+                                    } else {
+                                        error!("Critical: Failed to flush audit logs after 3 attempts. Data lost.");
+                                    }
                                 }
                             }
                             None => break, // Channel closed (Logger dropped)
@@ -109,44 +159,56 @@ impl AuditLogger {
                     }
                     _ = interval.tick() => {
                         if !batch_buffer.is_empty() {
-                            let records = std::mem::replace(
+                            let mut records = std::mem::replace(
                                 &mut batch_buffer,
                                 Vec::with_capacity(batch_size),
                             );
-                            let db_ref = db_clone.clone();
-                            let sem = flush_semaphore.clone();
-                            tokio::spawn(async move {
-                                let _permit = match sem.acquire().await {
-                                    Ok(p) => p,
-                                    Err(_) => return,
-                                };
-                                let records_arc = Arc::new(records);
-                                let mut success = false;
-                                for attempt in 1..=3 {
-                                    let db_inner = db_ref.clone();
-                                    let recs_inner = records_arc.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        Self::flush_batch(&db_inner, &recs_inner)
-                                    }).await {
-                                        Ok(Ok(_)) => {
-                                            success = true;
-                                            break;
-                                        },
-                                        Ok(Err(e)) => {
-                                            error!("Failed to flush audit logs (interval, attempt {}): {}", attempt, e);
-                                            AUDIT_LOG_FLUSH_ERRORS.inc();
-                                        }
-                                        Err(e) => {
-                                            error!("Flush task panicked (interval, attempt {}): {}", attempt, e);
-                                            AUDIT_LOG_FLUSH_ERRORS.inc();
-                                        }
-                                    }
-                                    time::sleep(Duration::from_millis(500 * attempt)).await;
-                                }
-                                if !success {
-                                    error!("Critical: Failed to flush audit logs after 3 attempts (interval). Data lost.");
-                                }
+
+                            // Keep original timestamp immutable, compute monotonic key_ts for DB sorting
+                            records.sort_by(|a, b| {
+                                a.timestamp_ms.cmp(&b.timestamp_ms).then_with(|| a.request_id.cmp(&b.request_id))
                             });
+                            let mut keyed_records = Vec::with_capacity(records.len());
+
+                            // Compute HMAC chaining correctly across the batch
+                            let mut temp_hash = committed_last_hash.clone();
+                            for mut rec in records.into_iter() {
+                                let key_ts = std::cmp::max(rec.timestamp_ms, global_last_ts_ms);
+                                global_last_ts_ms = key_ts;
+                                rec.previous_hash = temp_hash.clone();
+                                temp_hash = Some(Self::compute_hmac(&rec, &hmac_secret));
+                                rec.record_hash = temp_hash.clone();
+                                keyed_records.push((key_ts, rec));
+                            }
+
+                            let db_ref = db_clone.clone();
+                            let mut success = false;
+                            for attempt in 1..=3 {
+                                let recs_inner = keyed_records.clone();
+                                match tokio::task::spawn_blocking({
+                                    let db_inner = db_ref.clone();
+                                    move || Self::flush_batch(&db_inner, &recs_inner)
+                                }).await {
+                                    Ok(Ok(_)) => {
+                                        success = true;
+                                        break;
+                                    },
+                                    Ok(Err(e)) => {
+                                        error!("Failed to flush audit logs (interval, attempt {}): {}", attempt, e);
+                                        AUDIT_LOG_FLUSH_ERRORS.inc();
+                                    }
+                                    Err(e) => {
+                                        error!("Flush task panicked (interval, attempt {}): {}", attempt, e);
+                                        AUDIT_LOG_FLUSH_ERRORS.inc();
+                                    }
+                                }
+                                time::sleep(Duration::from_millis(500 * attempt)).await;
+                            }
+                            if success {
+                                committed_last_hash = temp_hash;
+                            } else {
+                                error!("Critical: Failed to flush audit logs after 3 attempts (interval). Data lost.");
+                            }
                         }
                     }
                 }
@@ -159,10 +221,30 @@ impl AuditLogger {
             }
 
             if !batch_buffer.is_empty() {
+                // Keep original timestamp immutable, compute monotonic key_ts
+                batch_buffer.sort_by(|a, b| {
+                    a.timestamp_ms
+                        .cmp(&b.timestamp_ms)
+                        .then_with(|| a.request_id.cmp(&b.request_id))
+                });
+
+                let mut keyed_records = Vec::with_capacity(batch_buffer.len());
+                // Determine final chain
+                let mut temp_hash = committed_last_hash.clone();
+                for mut rec in batch_buffer.into_iter() {
+                    let key_ts = std::cmp::max(rec.timestamp_ms, global_last_ts_ms);
+                    global_last_ts_ms = key_ts;
+                    rec.previous_hash = temp_hash.clone();
+                    temp_hash = Some(Self::compute_hmac(&rec, &hmac_secret));
+                    rec.record_hash = temp_hash.clone();
+                    keyed_records.push((key_ts, rec));
+                }
+
                 let db_ref = db_clone.clone();
-                // Final flush
-                match tokio::task::spawn_blocking(move || Self::flush_batch(&db_ref, &batch_buffer))
-                    .await
+                match tokio::task::spawn_blocking(move || {
+                    Self::flush_batch(&db_ref, &keyed_records)
+                })
+                .await
                 {
                     Ok(Ok(_)) => info!("Final audit log flush completed."),
                     Ok(Err(e)) => error!("Failed to perform final audit log flush: {}", e),
@@ -171,10 +253,9 @@ impl AuditLogger {
             }
         });
 
-        // TTL cleanup task with delayed startup to avoid I/O spike
+        // TTL cleanup task
         let db_cleanup = db.clone();
         tokio::spawn(async move {
-            // First tick after 1 hour to allow server to warm up
             let start = Instant::now() + Duration::from_secs(3600);
             let mut cleanup_interval = time::interval_at(start, Duration::from_secs(3600));
 
@@ -199,7 +280,6 @@ impl AuditLogger {
         Ok(Self { tx, db })
     }
 
-    /// Register audit log metrics with a Prometheus registry
     #[allow(dead_code)]
     pub fn register_metrics(registry: &Registry) -> anyhow::Result<()> {
         registry.register(Box::new(AUDIT_LOG_TOTAL.clone()))?;
@@ -221,34 +301,70 @@ impl AuditLogger {
         &self.db
     }
 
-    /// Write a batch of records to RocksDB including secondary indexes.
-    /// Index pattern: index:user:<user_id>:<timestamp_ms>:<request_id>
-    fn flush_batch(db: &DB, records: &[AuditRecord]) -> anyhow::Result<()> {
+    pub fn compute_hmac(record: &AuditRecord, secret: &str) -> String {
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+
+        // Canonical JSON serialization excluding hashes for tamper-evidence
+        let mut rec_clone = record.clone();
+        rec_clone.record_hash = None; // record_hash must not be tied into its own computation
+        let payload = serde_json::to_string(&rec_clone).unwrap_or_default();
+
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn extract_bucket_name(resource: &str) -> &str {
+        let parts: Vec<&str> = resource.split(':').collect();
+        let bucket_id = if let Some(&part) = parts.get(5) {
+            part
+        } else {
+            resource
+        };
+        bucket_id.split('/').next().unwrap_or(bucket_id)
+    }
+
+    fn flush_batch(db: &DB, records: &[(u64, AuditRecord)]) -> anyhow::Result<()> {
         let mut batch = WriteBatch::default();
-        for record in records {
-            let ts_bytes = record.timestamp_ms.to_be_bytes();
+        let cf_logs = db
+            .cf_handle(CF_LOGS)
+            .ok_or_else(|| anyhow::anyhow!("Missing CF logs"))?;
+        let cf_user = db
+            .cf_handle(CF_IDX_USER)
+            .ok_or_else(|| anyhow::anyhow!("Missing CF idx_user"))?;
+        let cf_resource = db
+            .cf_handle(CF_IDX_RESOURCE)
+            .ok_or_else(|| anyhow::anyhow!("Missing CF idx_resource"))?;
+
+        for (key_ts, record) in records {
+            let ts_bytes = key_ts.to_be_bytes();
             let req_id_bytes = record.request_id.as_bytes();
 
-            // 1. Primary Record: audit:<ts_be>:<req_id>
-            let mut key = Vec::with_capacity(32);
-            key.extend_from_slice(b"audit:");
+            // 1. Primary Record Key (logs CF): :<ts_be>:<req_id>
+            let mut key = Vec::with_capacity(1 + 8 + 1 + req_id_bytes.len());
+            key.extend_from_slice(b":");
             key.extend_from_slice(&ts_bytes);
             key.extend_from_slice(b":");
             key.extend_from_slice(req_id_bytes);
 
             let val = serde_json::to_vec(record)?;
-            batch.put(&key, val);
+            batch.put_cf(cf_logs, &key, val);
 
-            // 2. Secondary Index (User): index:user:<user_id>:<ts_be>:<req_id>
-            let mut user_idx_key = Vec::with_capacity(64);
-            user_idx_key.extend_from_slice(b"index:user:");
+            // 2. User Index: <user_id>:<ts_be>:<req_id> -> key
+            let mut user_idx_key = Vec::with_capacity(32);
             user_idx_key.extend_from_slice(record.user_id.as_bytes());
             user_idx_key.extend_from_slice(b":");
-            user_idx_key.extend_from_slice(&ts_bytes);
-            user_idx_key.extend_from_slice(b":");
-            user_idx_key.extend_from_slice(req_id_bytes);
+            user_idx_key.extend_from_slice(&key);
+            batch.put_cf(cf_user, user_idx_key, &key);
 
-            batch.put(user_idx_key, key);
+            // 3. Resource Index (bucket level): <bucket_name>:<ts_be>:<req_id> -> key
+            let bucket_name = Self::extract_bucket_name(&record.resource);
+
+            let mut res_idx_key = Vec::with_capacity(64);
+            res_idx_key.extend_from_slice(bucket_name.as_bytes());
+            res_idx_key.extend_from_slice(b":");
+            res_idx_key.extend_from_slice(&key);
+            batch.put_cf(cf_resource, res_idx_key, &key);
         }
 
         if let Err(e) = db.write(batch) {
@@ -263,44 +379,54 @@ impl AuditLogger {
         let cutoff_ms = cutoff.timestamp_millis();
         let ts_cutoff_bytes = cutoff_ms.to_be_bytes();
 
-        let mut batch = rocksdb::WriteBatch::default();
-
-        // 1. Cleanup Primary Records
-        let start_key = b"audit:";
         let mut end_key = Vec::with_capacity(16);
-        end_key.extend_from_slice(b"audit:");
+        end_key.extend_from_slice(b":");
         end_key.extend_from_slice(&ts_cutoff_bytes);
 
-        batch.delete_range(start_key.as_slice(), end_key.as_slice());
+        let cf_logs = db.cf_handle(CF_LOGS).unwrap();
+        let cf_user = db.cf_handle(CF_IDX_USER).unwrap();
+        let cf_resource = db.cf_handle(CF_IDX_RESOURCE).unwrap();
 
-        // 2. Cleanup User Secondary Indexes
-        let idx_start = b"index:user:";
-        let idx_end = b"index:user;"; // ';' is ':' + 1 in ASCII
+        let mut batch = rocksdb::WriteBatch::default();
 
         let mut iter_opts = rocksdb::ReadOptions::default();
-        iter_opts.set_iterate_upper_bound(idx_end.to_vec());
-        let iter = db.iterator_opt(
-            rocksdb::IteratorMode::From(idx_start, rocksdb::Direction::Forward),
-            iter_opts,
-        );
+        iter_opts.set_iterate_upper_bound(end_key.as_slice());
+        let iter = db.iterator_cf_opt(cf_logs, iter_opts, rocksdb::IteratorMode::Start);
 
+        let mut deleted_count = 0;
         for result in iter {
-            let (key, _) = result?;
-            // Robust parsing of combined key: index:user:<user_id>:<ts_be>:<req_id>
-            if let Some(last_colon_pos) = key.iter().rposition(|&b| b == b':') {
-                if last_colon_pos >= 8 {
-                    let ts_pos = last_colon_pos - 8;
-                    let mut ts_bytes = [0u8; 8];
-                    ts_bytes.copy_from_slice(&key[ts_pos..last_colon_pos]);
-                    let ts = u64::from_be_bytes(ts_bytes);
-                    if ts < cutoff_ms as u64 {
-                        batch.delete(key);
-                    }
+            let (key, val) = result?;
+
+            if let Ok(record) = serde_json::from_slice::<AuditRecord>(&val) {
+                // Delete user index
+                let mut user_idx_key = Vec::with_capacity(32);
+                user_idx_key.extend_from_slice(record.user_id.as_bytes());
+                user_idx_key.extend_from_slice(b":");
+                user_idx_key.extend_from_slice(&key);
+                batch.delete_cf(cf_user, user_idx_key);
+
+                // Delete resource index
+                let bucket_name = Self::extract_bucket_name(&record.resource);
+
+                let mut res_idx_key = Vec::with_capacity(64);
+                res_idx_key.extend_from_slice(bucket_name.as_bytes());
+                res_idx_key.extend_from_slice(b":");
+                res_idx_key.extend_from_slice(&key);
+                batch.delete_cf(cf_resource, res_idx_key);
+
+                deleted_count += 1;
+
+                // Avoid too large batches: Execute intermediate chunks if huge
+                if deleted_count % 10000 == 0 {
+                    db.write(std::mem::take(&mut batch))?;
                 }
             }
         }
 
+        // Finally range delete from the primary CF
+        batch.delete_range_cf(cf_logs, b":".as_slice(), end_key.as_slice());
         db.write(batch)?;
+
         info!(
             "Cleaned up audit logs and indexes older than {} days (cutoff: {})",
             retention_days, cutoff
@@ -330,37 +456,59 @@ mod tests {
             error_code: None,
             user_agent: Some("test-agent".to_string()),
             duration_ms: Some(10),
+            previous_hash: None,
+            record_hash: None,
         }
     }
 
-    #[test]
-    fn test_secondary_index_lookup() {
+    #[tokio::test]
+    async fn test_cf_write_and_secondary_index() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        let db = DB::open(&opts, tmp.path()).unwrap();
+        let db = AuditLogger::new(tmp.path(), 30, 10, "secret".to_string())
+            .unwrap()
+            .db;
+
+        let record_1 = make_record("2026-03-13T10:00:00+00:00", "req1", "user-a");
+        let record_2 = make_record("2026-03-13T11:00:00+00:00", "req2", "user-b");
+        let record_3 = make_record("2026-03-13T12:00:00+00:00", "req3", "user-a");
 
         let records = vec![
-            make_record("2026-03-13T10:00:00+00:00", "req1", "user-a"),
-            make_record("2026-03-13T11:00:00+00:00", "req2", "user-b"),
-            make_record("2026-03-13T12:00:00+00:00", "req3", "user-a"),
+            (record_1.timestamp_ms, record_1),
+            (record_2.timestamp_ms, record_2),
+            (record_3.timestamp_ms, record_3),
         ];
 
         AuditLogger::flush_batch(&db, &records).unwrap();
 
-        // Search for user-a
-        let prefix = b"index:user:user-a:";
-        let iter = db.prefix_iterator(prefix);
+        let cf_user = db.cf_handle(CF_IDX_USER).unwrap();
+        let cf_logs = db.cf_handle(CF_LOGS).unwrap();
+
+        let prefix = b"user-a:";
+        let iter = db.prefix_iterator_cf(cf_user, prefix);
         let mut found = Vec::new();
         for result in iter {
             let (key, primary_key) = result.unwrap();
             if !key.starts_with(prefix) {
                 break;
             }
-            let val = db.get(primary_key).unwrap().unwrap();
+            let val = db.get_cf(cf_logs, primary_key).unwrap().unwrap();
             let record: AuditRecord = serde_json::from_slice(&val).unwrap();
             found.push(record.request_id);
         }
         assert_eq!(found, vec!["req1", "req3"]);
+
+        let cf_resource = db.cf_handle(CF_IDX_RESOURCE).unwrap();
+        let res_prefix = b"test-bucket:";
+        let mut res_found = 0;
+        let iter_res = db.prefix_iterator_cf(cf_resource, res_prefix);
+        for result in iter_res {
+            let (key, _) = result.unwrap();
+            if key.starts_with(res_prefix) {
+                res_found += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(res_found, 3);
     }
 }
