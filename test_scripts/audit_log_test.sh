@@ -24,8 +24,14 @@ cargo build -p s3-server --bin s3-server --bin audit_reader
 ./target/debug/s3-server &
 S3_PID=$!
 
-# Cleanup on exit
-trap "kill $S3_PID 2>/dev/null || true; rm -rf \"$AUDIT_DB_PATH\"" EXIT
+cleanup() {
+    echo "🧹 Cleaning up..."
+    [ -n "$S3_PID" ] && kill $S3_PID 2>/dev/null || true
+    pkill -f "target/debug/s3-server" || true
+    rm -rf "$AUDIT_DB_PATH"
+}
+
+trap cleanup EXIT
 
 # Wait for server readiness by polling /health
 echo "Waiting for S3 Server to start..."

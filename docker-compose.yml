@@ -137,6 +137,7 @@ services:
       - MASTER_ADDR=http://dfs-master1-shard1:50051
       - CONFIG_SERVERS=http://config-server:50050
       - SHARD_CONFIG=/app/shard_config.json
+      - AUDIT_HMAC_SECRET=chaos_test_audit_secret_key_16bytes
     volumes:
       - ./shard_config.json:/app/shard_config.json:ro
     ports:

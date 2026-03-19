@@ -7,9 +7,18 @@ NC='\033[0m' # No Color
 
 echo -e "${GREEN}Starting Chaos Monkey Test for Sharded Cluster...${NC}"
 
+cleanup() {
+    echo "Cleaning up..."
+    docker compose -f docker-compose.yml down -v || true
+    rm -f test_sharded.bin downloaded_normal.bin downloaded_degraded.bin downloaded_recovery.bin
+    echo "Cleanup complete!"
+}
+
+trap cleanup EXIT
+
 # Clean up any previous state
 echo "Cleaning up previous state..."
-docker compose -f docker-compose.yml down -v || true
+cleanup
 
 # Start cluster
 echo "Starting cluster..."
@@ -115,8 +124,6 @@ docker exec $MASTER_CONTAINER /app/dfs_cli --master http://localhost:50051 get /
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}Download failed after recovery!${NC}"
-    docker compose -f docker-compose.yml down -v
-    rm -f test_sharded.bin downloaded_normal.bin downloaded_degraded.bin
     exit 1
 fi
 
@@ -128,15 +135,9 @@ if [ "$MD5_ORIG" == "$MD5_RECOVERY" ]; then
     echo -e "${GREEN}Data integrity verified after recovery!${NC}"
 else
     echo -e "${RED}Data corruption detected after recovery!${NC}"
-    docker compose -f docker-compose.yml down -v
-    rm -f test_sharded.bin downloaded_normal.bin downloaded_degraded.bin downloaded_recovery.bin
     exit 1
 fi
 
 echo -e "${GREEN}Chaos Test Passed!${NC}"
 
-# Cleanup
-echo "Cleaning up..."
-docker compose -f docker-compose.yml down -v
-rm -f test_sharded.bin downloaded_normal.bin downloaded_degraded.bin downloaded_recovery.bin
-echo "Cleanup complete!"
+# No manual cleanup needed, trap handles it

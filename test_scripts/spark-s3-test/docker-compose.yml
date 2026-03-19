@@ -84,6 +84,7 @@ services:
       - MASTER_ADDR=http://dfs-master1-shard1:50051
       - SHARD_CONFIG=/app/shard_config.json
       - RUST_LOG=dfs_client=debug,s3_server=debug,tower_http=debug
+      - AUDIT_HMAC_SECRET=spark_test_audit_secret_key_16bytes
     volumes:
       - ../../shard_config.json:/app/shard_config.json:ro
     ports:

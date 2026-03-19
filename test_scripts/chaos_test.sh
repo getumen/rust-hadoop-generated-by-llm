@@ -48,8 +48,8 @@ upload_file() {
 download_file() {
     local output_file=$1
     echo "📥 Downloading file from DFS..."
-    docker exec $MASTER_CONTAINER /app/dfs_cli --config-servers http://config-server:50050 get $DFS_PATH /tmp/$output_file
-    docker cp $MASTER_CONTAINER:/tmp/$output_file ./$output_file
+    docker exec $MASTER_CONTAINER /app/dfs_cli --config-servers http://config-server:50050 get $DFS_PATH /tmp/$output_file || return 1
+    docker cp $MASTER_CONTAINER:/tmp/$output_file ./$output_file || return 1
     echo "✓ File downloaded to $output_file"
 }
 
@@ -118,6 +118,16 @@ cluster_status() {
     fi
     echo ""
 }
+
+cleanup() {
+    echo ""
+    echo "🧹 Cleaning up..."
+    docker compose -f $COMPOSE_FILE down -v || true
+    rm -f $TEST_FILE download*.txt final_download.txt
+    echo "✓ Cleanup complete"
+}
+
+trap cleanup EXIT
 
 # Main test sequence
 main() {
@@ -209,13 +219,6 @@ main() {
     echo "  - Tested ChunkServer failures on both shards"
     echo "  - Tested Master failure and recovery"
     echo "  - System handled failures gracefully"
-
-    # Cleanup
-    echo ""
-    echo "🧹 Cleaning up..."
-    docker compose -f $COMPOSE_FILE down -v
-    rm -f $TEST_FILE download*.txt final_download.txt
-    echo "✓ Cleanup complete"
 }
 
 # Store original MD5 globally

@@ -10,18 +10,22 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+cleanup() {
+    echo "🧹 Cleaning up..."
+    docker compose -f docker-compose.auto-scaling.yml down -v || true
+    pkill -f "target/release/master" || true
+}
+
+trap cleanup EXIT
+
 pass() { echo -e "${GREEN}✓ $1${NC}"; }
 fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 
 echo "🧪 Shard Auto-scaling Test"
 echo "=========================="
 
-# Cleanup
-echo "🚀 Cleaning up..."
-# Kill any local processes that might be using ports 8090-8092
-pkill -f "target/release/master" || true
-sleep 2
-docker compose -f docker-compose.auto-scaling.yml down -v || true
+# Cleanup initially
+cleanup
 
 # Start cluster
 echo "🚀 Starting cluster..."
@@ -33,8 +37,15 @@ sleep 20
 
 # 1. Initial State: 1 Shard
 echo "Checking initial shard count..."
-SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length')
-if [ "$SHARD_COUNT" -eq 1 ]; then
+for i in $(seq 1 30); do
+    SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length' 2>/dev/null || echo 0)
+    if [ "${SHARD_COUNT:-0}" -eq 1 ]; then
+        break
+    fi
+    sleep 1
+done
+
+if [ "${SHARD_COUNT:-0}" -eq 1 ]; then
     pass "Initial shard count is 1"
 else
     fail "Expected 1 shard, found $SHARD_COUNT"
@@ -65,10 +76,16 @@ echo "Generating load for 20 seconds..."
 GENERATE_LOAD 20 10
 
 echo "Checking for shard split..."
-# It might take a few seconds to commit and refresh
-sleep 15
-SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length')
-if [ "$SHARD_COUNT" -gt 1 ]; then
+# Wait up to 30 seconds for split and propagation
+for i in $(seq 1 30); do
+    SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length' 2>/dev/null || echo 0)
+    if [ "${SHARD_COUNT:-0}" -gt 1 ]; then
+        break
+    fi
+    sleep 1
+done
+
+if [ "${SHARD_COUNT:-0}" -gt 1 ]; then
     pass "Shard split triggered! New shard count: $SHARD_COUNT"
 else
     # Check logs if failed
@@ -78,12 +95,17 @@ fi
 
 # 3. Stop Load and Wait for Merge
 echo "Stopping load to trigger merge (< 1 RPS)..."
-echo "Waiting for merge (20s)..."
-# Merge also happens every 5s
-sleep 60
+echo "Wait for merge (up to 30s)..."
 
-SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length')
-if [ "$SHARD_COUNT" -eq 1 ]; then
+for i in $(seq 1 30); do
+    SHARD_COUNT=$(curl -s http://localhost:8090/shards | jq '.shards | length' 2>/dev/null || echo 0)
+    if [ "${SHARD_COUNT:-0}" -eq 1 ]; then
+        break
+    fi
+    sleep 2 # Merge threshold check might be slower
+done
+
+if [ "${SHARD_COUNT:-0}" -eq 1 ]; then
     pass "Shard merge triggered! Shard count returned to 1"
 else
     docker logs dfs-master-test | grep "underutilized" || echo "No 'underutilized' in logs"
@@ -94,9 +116,7 @@ else
     fail "Shard merge not triggered. Shard count: $SHARD_COUNT"
 fi
 
-# Cleanup
-echo "🧹 Cleaning up..."
-docker compose -f docker-compose.auto-scaling.yml down -v
+# No manual cleanup needed here, trap handles it.
 
 echo ""
 echo "============================================"
