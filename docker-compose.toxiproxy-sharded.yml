@@ -7,10 +7,10 @@ services:
     container_name: toxiproxy
     ports:
       - "8474:8474" # API port
-      - "60051:60051" # Proxy for master1-shard1
-      - "60061:60061" # Proxy for master1-shard2
-      - "60050:60050" # Proxy for config-server
-      - "60052:60052" # Proxy for chunkserver1-shard1
+      - "60151:60051" # Proxy for master1-shard1
+      - "60161:60061" # Proxy for master1-shard2
+      - "60150:60050" # Proxy for config-server
+      - "60152:60052" # Proxy for chunkserver1-shard1
     networks:
       - dfs-sharded-network
     healthcheck:
@@ -23,7 +23,7 @@ services:
   config-server:
     build: .
     container_name: dfs-config-server
-    command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://toxiproxy:60050
+    command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://toxiproxy:60150
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
@@ -38,7 +38,7 @@ services:
   master1-shard1:
     build: .
     container_name: dfs-master1-shard1
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60051 --shard-id shard-1 --config-servers http://toxiproxy:60050 --merge-threshold-rps=-1.0
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60151 --shard-id shard-1 --config-servers http://toxiproxy:60150 --merge-threshold-rps=-1.0
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
@@ -60,7 +60,7 @@ services:
   master1-shard2:
     build: .
     container_name: dfs-master1-shard2
-    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60061 --shard-id shard-2 --config-servers http://toxiproxy:60050 --merge-threshold-rps=-1.0
+    command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60161 --shard-id shard-2 --config-servers http://toxiproxy:60150 --merge-threshold-rps=-1.0
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
@@ -82,7 +82,7 @@ services:
   chunkserver1-shard1:
     build: .
     container_name: dfs-chunkserver1-shard1
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60050 --storage-dir /data/cs1 --advertise-addr http://toxiproxy:60052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs1 --advertise-addr http://toxiproxy:60152
     ports:
       - "50052:50052"
     networks:
@@ -100,7 +100,7 @@ services:
   chunkserver-extra:
     build: .
     container_name: dfs-chunkserver-extra
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60050 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
     ports:
       - "50072:50052"
     networks:
@@ -116,7 +116,7 @@ services:
   chunkserver-extra2:
     build: .
     container_name: dfs-chunkserver-extra2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60050 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
     ports:
       - "50082:50052"
     networks:

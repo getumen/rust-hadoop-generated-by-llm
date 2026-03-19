@@ -89,6 +89,7 @@ STS_SIGNING_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 IAM_CONFIG_PATH=/tmp/iam_config.json \
 S3_REGION=us-east-1 \
 MASTER_ADDR=http://localhost:50051 \
+AUDIT_HMAC_SECRET=test_audit_hmac_secret_key_16bytes \
 cargo run -p s3-server &
 S3_PID=$!
 
