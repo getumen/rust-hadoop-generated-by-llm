@@ -57,16 +57,12 @@ struct Args {
 fn compute_hmac(record: &AuditRecord, secret: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-    let payload = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        record.previous_hash.as_deref().unwrap_or(""),
-        record.timestamp_ms,
-        record.request_id,
-        record.user_id,
-        record.action,
-        record.resource,
-        record.status_code
-    );
+
+    // Canonical JSON serialization excluding hashes for tamper-evidence
+    let mut rec_clone = record.clone();
+    rec_clone.record_hash = None; // record_hash must not be tied into its own computation
+    let payload = serde_json::to_string(&rec_clone).unwrap_or_default();
+
     mac.update(payload.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }

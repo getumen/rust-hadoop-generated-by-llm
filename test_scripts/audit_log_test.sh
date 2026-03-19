@@ -13,13 +13,14 @@ export S3_AUTH_ENABLED="true"
 export S3_REGION="us-east-1"
 export PORT="9005"
 export MASTER_ADDR="http://localhost:50051"
+export AUDIT_HMAC_SECRET="test_audit_hmac_secret_key_16bytes"
 
 echo "=== Audit Log Test ==="
 
 # Start s3-server
 echo "Starting S3 Server..."
 cd "$PROJECT_ROOT"
-cargo build -p s3-server
+cargo build -p s3-server --bin s3-server --bin audit_reader
 ./target/debug/s3-server &
 S3_PID=$!
 
@@ -63,6 +64,10 @@ wait $S3_PID 2>/dev/null || true
 echo "Reading Audit Logs..."
 OUTPUT=$(./target/debug/audit_reader "$AUDIT_DB_PATH" --json)
 echo "$OUTPUT"
+
+echo "Verifying Audit Hash Chain..."
+./target/debug/audit_reader "$AUDIT_DB_PATH" --verify-chain "$AUDIT_HMAC_SECRET" | grep -q "Hash Chain Verification Successful!"
+echo "✓ Audit Log Chain verified"
 
 # Verify that audit records were actually written
 RECORD_COUNT=$(echo "$OUTPUT" | wc -l | xargs)
