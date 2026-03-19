@@ -67,6 +67,7 @@ pub async fn handle_sts(
     headers: axum::http::HeaderMap,
     Query(params): Query<StsQueryParams>,
 ) -> Response {
+    let start_time = chrono::Utc::now();
     let request_id = Uuid::new_v4().to_string();
     let remote_ip = connect_info.ip().to_string();
     let user_agent = headers
@@ -81,6 +82,7 @@ pub async fn handle_sts(
                      role_arn: Option<&str>| {
         if let Some(logger) = &state.audit_logger {
             let now = chrono::Utc::now();
+            let duration = now.signed_duration_since(start_time).num_milliseconds() as u64;
             logger.log(AuditRecord {
                 timestamp: now.to_rfc3339(),
                 timestamp_ms: now.timestamp_millis() as u64,
@@ -93,6 +95,7 @@ pub async fn handle_sts(
                 status_code: status_code.as_u16(),
                 error_code: error_code.map(|s| s.to_string()),
                 user_agent: user_agent.clone(),
+                duration_ms: Some(duration),
             });
         }
     };

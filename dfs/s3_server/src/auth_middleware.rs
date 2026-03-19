@@ -22,28 +22,9 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    let start_time = Utc::now();
     let request_id = Uuid::new_v4().to_string();
-    // Prefer x-real-ip (set by trusted proxy), fall back to x-forwarded-for first entry.
-    // When neither is present, use a placeholder. For accurate peer address without
-    // a proxy, Axum's ConnectInfo<SocketAddr> extractor should be configured.
-    let remote_ip = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
-        .or_else(|| {
-            req.headers()
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-        })
-        .or_else(|| {
-            req.headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let remote_ip = extract_remote_ip(&req);
     let user_agent = req
         .headers()
         .get(axum::http::header::USER_AGENT)
@@ -52,6 +33,17 @@ pub async fn auth_middleware(
 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    let mut audit_ctx = AuditContext {
+        request_id,
+        remote_ip,
+        user_agent,
+        method: method.clone(),
+        path: path.clone(),
+        start_time,
+        user_id: "anonymous".to_string(),
+        role_arn: None,
+    };
 
     // 1.5 Skip auth for STS requests (they authenticate via OIDC JWT internally)
     if let Some(query) = req.uri().query() {
@@ -62,8 +54,6 @@ pub async fn auth_middleware(
 
     // 2. TLS check
     if state.require_tls {
-        // In this environment, we can check if the request was made via TLS.
-        // If we are behind a proxy, we might check X-Forwarded-Proto.
         let is_tls = req.uri().scheme_str() == Some("https")
             || req
                 .headers()
@@ -73,87 +63,38 @@ pub async fn auth_middleware(
 
         if !is_tls {
             let res = s3_error_response(AuthError::InsecureTransport);
-            if let Some(logger) = &state.audit_logger {
-                let (action, resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path, &BTreeMap::new());
-                let now = Utc::now();
-                logger.log(AuditRecord {
-                    timestamp: now.to_rfc3339(),
-                    timestamp_ms: now.timestamp_millis() as u64,
-                    request_id,
-                    remote_ip,
-                    user_id: "anonymous".to_string(),
-                    role_arn: None,
-                    action,
-                    resource,
-                    status_code: res.status().as_u16(),
-                    error_code: Some("AccessDenied".to_string()),
-                    user_agent,
-                });
-            }
+            audit_ctx.log(
+                &state,
+                res.status().as_u16(),
+                Some("AccessDenied".to_string()),
+                &BTreeMap::new(),
+            );
             return res;
         }
     }
 
-    // 3. Extract Query parameters for cred parsing and normalization
+    // 3. Extract Query parameters
     let query_string_raw = req.uri().query().unwrap_or("");
-
-    // Canonical Query String: derive from raw query without re-encoding to
-    // avoid mismatches with the client's signature calculation.
-    let mut raw_query_pairs: Vec<(&str, &str)> = query_string_raw
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .map(|pair| {
-            let mut split = pair.splitn(2, '=');
-            let k = split.next().unwrap_or("");
-            let v = split.next().unwrap_or("");
-            (k, v)
-        })
-        .collect();
-
-    raw_query_pairs.sort_by(|(k1, v1), (k2, v2)| match k1.cmp(k2) {
-        std::cmp::Ordering::Equal => v1.cmp(v2),
-        other => other,
-    });
-
-    let mut normalized_query_parts = Vec::new();
-    for (k, v) in raw_query_pairs {
-        normalized_query_parts.push(format!("{}={}", k, v));
-    }
-    let normalized_query_string = normalized_query_parts.join("&");
-
-    // 4. Parse credentials
-    // We still need a map for cred parsing
     let query_params: BTreeMap<String, String> =
         serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
+
+    let normalized_query_string = normalize_query_string(query_string_raw);
+
+    // 4. Parse credentials
     let credentials = match parse_credentials(req.headers(), &query_params) {
-        Ok(c) => c,
+        Ok(c) => {
+            audit_ctx.user_id = c.access_key.clone();
+            c
+        }
         Err(e) => {
             let res = s3_error_response(e.clone());
-            if let Some(logger) = &state.audit_logger {
-                let (action, resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                let now = Utc::now();
-                let (err_code, _) = e.to_s3_error();
-                logger.log(AuditRecord {
-                    timestamp: now.to_rfc3339(),
-                    timestamp_ms: now.timestamp_millis() as u64,
-                    request_id,
-                    remote_ip,
-                    user_id: "anonymous".to_string(),
-                    role_arn: None,
-                    action,
-                    resource,
-                    status_code: res.status().as_u16(),
-                    error_code: Some(err_code),
-                    user_agent,
-                });
-            }
+            let (err_code, _) = e.to_s3_error();
+            audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
             return res;
         }
     };
 
-    // 5. Clock Skew Validation (Security requirement)
+    // 5. Clock Skew Validation
     if let Ok(req_time) = DateTime::parse_from_rfc3339(&credentials.timestamp)
         .or_else(|_| DateTime::parse_from_str(&credentials.timestamp, "%Y%m%dT%H%M%SZ"))
     {
@@ -165,25 +106,8 @@ pub async fn auth_middleware(
                 request_time: req_time.to_rfc3339(),
             };
             let res = s3_error_response(err.clone());
-            if let Some(logger) = &state.audit_logger {
-                let (action, resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                let now = Utc::now();
-                let (err_code, _) = err.to_s3_error();
-                logger.log(AuditRecord {
-                    timestamp: now.to_rfc3339(),
-                    timestamp_ms: now.timestamp_millis() as u64,
-                    request_id,
-                    remote_ip,
-                    user_id: credentials.access_key,
-                    role_arn: None,
-                    action,
-                    resource,
-                    status_code: res.status().as_u16(),
-                    error_code: Some(err_code),
-                    user_agent,
-                });
-            }
+            let (err_code, _) = err.to_s3_error();
+            audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
             return res;
         }
     }
@@ -201,25 +125,8 @@ pub async fn auth_middleware(
             ),
         };
         let res = s3_error_response(err.clone());
-        if let Some(logger) = &state.audit_logger {
-            let (action, resource) =
-                resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-            let now = Utc::now();
-            let (err_code, _) = err.to_s3_error();
-            logger.log(AuditRecord {
-                timestamp: now.to_rfc3339(),
-                timestamp_ms: now.timestamp_millis() as u64,
-                request_id,
-                remote_ip,
-                user_id: credentials.access_key,
-                role_arn: None,
-                action,
-                resource,
-                status_code: res.status().as_u16(),
-                error_code: Some(err_code),
-                user_agent,
-            });
-        }
+        let (err_code, _) = err.to_s3_error();
+        audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
         return res;
     }
 
@@ -248,25 +155,8 @@ pub async fn auth_middleware(
             Ok(data) => data,
             Err(e) => {
                 let res = s3_error_response(e.clone());
-                if let Some(logger) = &state.audit_logger {
-                    let (action, resource) =
-                        resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                    let now = Utc::now();
-                    let (err_code, _) = e.to_s3_error();
-                    logger.log(AuditRecord {
-                        timestamp: now.to_rfc3339(),
-                        timestamp_ms: now.timestamp_millis() as u64,
-                        request_id,
-                        remote_ip,
-                        user_id: credentials.access_key,
-                        role_arn: None,
-                        action,
-                        resource,
-                        status_code: res.status().as_u16(),
-                        error_code: Some(err_code),
-                        user_agent,
-                    });
-                }
+                let (err_code, _) = e.to_s3_error();
+                audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
                 return res;
             }
         };
@@ -275,24 +165,13 @@ pub async fn auth_middleware(
         let now = Utc::now().timestamp() as u64;
         if session_data.expiration < now {
             let res = s3_error_response(AuthError::ExpiredToken);
-            if let Some(logger) = &state.audit_logger {
-                let (action, resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                let now = Utc::now();
-                logger.log(AuditRecord {
-                    timestamp: now.to_rfc3339(),
-                    timestamp_ms: now.timestamp_millis() as u64,
-                    request_id,
-                    remote_ip,
-                    user_id: credentials.access_key,
-                    role_arn: Some(session_data.role_arn),
-                    action,
-                    resource,
-                    status_code: res.status().as_u16(),
-                    error_code: Some("ExpiredToken".to_string()),
-                    user_agent,
-                });
-            }
+            audit_ctx.role_arn = Some(session_data.role_arn.clone());
+            audit_ctx.log(
+                &state,
+                res.status().as_u16(),
+                Some("ExpiredToken".to_string()),
+                &query_params,
+            );
             return res;
         }
 
@@ -310,25 +189,8 @@ pub async fn auth_middleware(
                     access_key: credentials.access_key.clone(),
                 };
                 let res = s3_error_response(err.clone());
-                if let Some(logger) = &state.audit_logger {
-                    let (action, resource) =
-                        resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                    let now = Utc::now();
-                    let (err_code, _) = err.to_s3_error();
-                    logger.log(AuditRecord {
-                        timestamp: now.to_rfc3339(),
-                        timestamp_ms: now.timestamp_millis() as u64,
-                        request_id,
-                        remote_ip,
-                        user_id: credentials.access_key,
-                        role_arn: None,
-                        action,
-                        resource,
-                        status_code: res.status().as_u16(),
-                        error_code: Some(err_code),
-                        user_agent,
-                    });
-                }
+                let (err_code, _) = err.to_s3_error();
+                audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
                 return res;
             }
         }
@@ -385,24 +247,13 @@ pub async fn auth_middleware(
 
     if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload {
         let res = s3_error_response(AuthError::MissingAuth);
-        if let Some(logger) = &state.audit_logger {
-            let (action, resource) =
-                resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-            let now = Utc::now();
-            logger.log(AuditRecord {
-                timestamp: now.to_rfc3339(),
-                timestamp_ms: now.timestamp_millis() as u64,
-                request_id,
-                remote_ip,
-                user_id: credentials.access_key,
-                role_arn: role_arn_from_token,
-                action,
-                resource,
-                status_code: res.status().as_u16(),
-                error_code: Some("AccessDenied".to_string()),
-                user_agent,
-            });
-        }
+        audit_ctx.role_arn = role_arn_from_token;
+        audit_ctx.log(
+            &state,
+            res.status().as_u16(),
+            Some("AccessDenied".to_string()),
+            &query_params,
+        );
         return res;
     }
 
@@ -429,22 +280,13 @@ pub async fn auth_middleware(
                             s3_resource
                         );
                         let res = s3_error_response(AuthError::MissingAuth);
-                        if let Some(logger) = &state.audit_logger {
-                            let now = Utc::now();
-                            logger.log(AuditRecord {
-                                timestamp: now.to_rfc3339(),
-                                timestamp_ms: now.timestamp_millis() as u64,
-                                request_id,
-                                remote_ip,
-                                user_id: credentials.access_key,
-                                role_arn: Some(role_arn.clone()),
-                                action: s3_action.clone(),
-                                resource: s3_resource.clone(),
-                                status_code: res.status().as_u16(),
-                                error_code: Some("AccessDenied".to_string()),
-                                user_agent,
-                            });
-                        }
+                        audit_ctx.role_arn = Some(role_arn.clone());
+                        audit_ctx.log(
+                            &state,
+                            res.status().as_u16(),
+                            Some("AccessDenied".to_string()),
+                            &query_params,
+                        );
                         return res;
                     }
                 }
@@ -456,24 +298,8 @@ pub async fn auth_middleware(
             }
             let res = next.run(req).await;
 
-            if let Some(logger) = &state.audit_logger {
-                let (s3_action, s3_resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                let now = Utc::now();
-                logger.log(AuditRecord {
-                    timestamp: now.to_rfc3339(),
-                    timestamp_ms: now.timestamp_millis() as u64,
-                    request_id,
-                    remote_ip,
-                    user_id: credentials.access_key,
-                    role_arn: role_arn_from_token,
-                    action: s3_action,
-                    resource: s3_resource,
-                    status_code: res.status().as_u16(),
-                    error_code: None,
-                    user_agent,
-                });
-            }
+            audit_ctx.role_arn = role_arn_from_token;
+            audit_ctx.log(&state, res.status().as_u16(), None, &query_params);
             res
         }
         Err(e) => {
@@ -489,25 +315,9 @@ pub async fn auth_middleware(
                 );
             }
             let res = s3_error_response(e.clone());
-            if let Some(logger) = &state.audit_logger {
-                let (action, resource) =
-                    resolve_s3_action_and_resource_from_parts(&method, &path, &query_params);
-                let now = Utc::now();
-                let (err_code, _) = e.to_s3_error();
-                logger.log(AuditRecord {
-                    timestamp: now.to_rfc3339(),
-                    timestamp_ms: now.timestamp_millis() as u64,
-                    request_id,
-                    remote_ip,
-                    user_id: credentials.access_key,
-                    role_arn: role_arn_from_token,
-                    action,
-                    resource,
-                    status_code: res.status().as_u16(),
-                    error_code: Some(err_code),
-                    user_agent,
-                });
-            }
+            let (err_code, _) = e.to_s3_error();
+            audit_ctx.role_arn = role_arn_from_token;
+            audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
             res
         }
     }
@@ -639,4 +449,92 @@ fn resolve_s3_action_and_resource_from_parts(
     };
 
     (action.to_string(), resource.to_string())
+}
+
+struct AuditContext {
+    request_id: String,
+    remote_ip: String,
+    user_agent: Option<String>,
+    method: axum::http::Method,
+    path: String,
+    start_time: DateTime<Utc>,
+    user_id: String,
+    role_arn: Option<String>,
+}
+
+impl AuditContext {
+    fn log(
+        &self,
+        state: &AppState,
+        status_code: u16,
+        error_code: Option<String>,
+        query_params: &BTreeMap<String, String>,
+    ) {
+        if let Some(logger) = &state.audit_logger {
+            let (action, resource) =
+                resolve_s3_action_and_resource_from_parts(&self.method, &self.path, query_params);
+            let now = Utc::now();
+            let duration = now
+                .signed_duration_since(self.start_time)
+                .num_milliseconds() as u64;
+            logger.log(AuditRecord {
+                timestamp: now.to_rfc3339(),
+                timestamp_ms: now.timestamp_millis() as u64,
+                request_id: self.request_id.clone(),
+                remote_ip: self.remote_ip.clone(),
+                user_id: self.user_id.clone(),
+                role_arn: self.role_arn.clone(),
+                action,
+                resource,
+                status_code,
+                error_code,
+                user_agent: self.user_agent.clone(),
+                duration_ms: Some(duration),
+            });
+        }
+    }
+}
+
+fn extract_remote_ip(req: &Request<Body>) -> String {
+    req.extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
+        .or_else(|| {
+            req.headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
+        .or_else(|| {
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn normalize_query_string(query_string_raw: &str) -> String {
+    let mut raw_query_pairs: Vec<(&str, &str)> = query_string_raw
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let mut split = pair.splitn(2, '=');
+            let k = split.next().unwrap_or("");
+            let v = split.next().unwrap_or("");
+            (k, v)
+        })
+        .collect();
+
+    raw_query_pairs.sort_by(|(k1, v1), (k2, v2)| match k1.cmp(k2) {
+        std::cmp::Ordering::Equal => v1.cmp(v2),
+        other => other,
+    });
+
+    let mut normalized_query_parts = Vec::new();
+    for (k, v) in raw_query_pairs {
+        normalized_query_parts.push(format!("{}={}", k, v));
+    }
+    normalized_query_parts.join("&")
 }

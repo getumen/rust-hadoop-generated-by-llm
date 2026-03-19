@@ -38,3 +38,4 @@ prometheus = "0.14"
 rand = "0.10.0"
 serde_urlencoded = "0.7"
 rocksdb = "0.24"
+clap = { version = "4", features = ["derive"] }

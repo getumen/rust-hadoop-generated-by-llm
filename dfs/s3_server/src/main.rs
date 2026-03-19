@@ -233,6 +233,26 @@ async fn handle_metrics() -> Result<String, InternalError> {
             InternalError
         })?;
 
+    // Register Audit Logger metrics
+    registry
+        .register(Box::new(crate::audit::AUDIT_LOG_TOTAL.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register audit_log_total: {}", e);
+            InternalError
+        })?;
+    registry
+        .register(Box::new(crate::audit::AUDIT_LOG_DROPPED.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register audit_log_dropped: {}", e);
+            InternalError
+        })?;
+    registry
+        .register(Box::new(crate::audit::AUDIT_LOG_FLUSH_ERRORS.clone()))
+        .map_err(|e| {
+            tracing::error!("Failed to register audit_log_flush_errors: {}", e);
+            InternalError
+        })?;
+
     let mut buffer = vec![];
     let encoder = TextEncoder::new();
     encoder

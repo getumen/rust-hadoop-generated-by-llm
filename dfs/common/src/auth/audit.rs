@@ -13,4 +13,5 @@ pub struct AuditRecord {
     pub status_code: u16,           // HTTP Status
     pub error_code: Option<String>, // S3 Error Code (e.g. AccessDenied)
     pub user_agent: Option<String>,
+    pub duration_ms: Option<u64>, // Duration of the whole request in milliseconds
 }

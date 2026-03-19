@@ -61,11 +61,11 @@ kill $S3_PID
 wait $S3_PID 2>/dev/null || true
 
 echo "Reading Audit Logs..."
-OUTPUT=$(./target/debug/audit_reader "$AUDIT_DB_PATH")
+OUTPUT=$(./target/debug/audit_reader "$AUDIT_DB_PATH" --json)
 echo "$OUTPUT"
 
 # Verify that audit records were actually written
-RECORD_COUNT=$(echo "$OUTPUT" | grep -c "AuditRecord" || true)
+RECORD_COUNT=$(echo "$OUTPUT" | wc -l | xargs)
 if [ "$RECORD_COUNT" -lt 2 ]; then
     echo "Error: Expected at least 2 audit records, got $RECORD_COUNT"
     exit 1

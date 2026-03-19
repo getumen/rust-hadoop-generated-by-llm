@@ -2736,6 +2736,7 @@ dependencies = [
  "axum-server",
  "bytes",
  "chrono",
+ "clap",
  "dfs-client",
  "dfs-common",
  "headers",
