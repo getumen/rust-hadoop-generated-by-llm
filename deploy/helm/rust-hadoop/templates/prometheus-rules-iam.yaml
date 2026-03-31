@@ -1,0 +1,106 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "rust-hadoop.fullname" . }}-iam-alerts
+  labels:
+    {{- include "rust-hadoop.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.prometheusRelease }}
+spec:
+  groups:
+    - name: iam.rules
+      rules:
+        # Auth success rate drops below 95%
+        - alert: IAMAuthSuccessRateLow
+          expr: |
+            (
+              sum(rate(iam_auth_requests_total{result="success"}[5m]))
+              /
+              sum(rate(iam_auth_requests_total[5m]))
+            ) < 0.95
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "IAM authentication success rate is below 95%"
+            description: >
+              The IAM authentication success rate is {{ "{{ $value | humanizePercentage }}" }}
+              over the last 5 minutes. This may indicate credential misconfiguration.
+
+        # Auth success rate critically low (< 90%)
+        - alert: IAMAuthSuccessRateCritical
+          expr: |
+            (
+              sum(rate(iam_auth_requests_total{result="success"}[5m]))
+              /
+              sum(rate(iam_auth_requests_total[5m]))
+            ) < 0.90
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "IAM authentication success rate is critically low (< 90%)"
+            description: >
+              The IAM auth success rate has dropped to {{ "{{ $value | humanizePercentage }}" }}.
+              This may indicate a credential misconfiguration or an attack.
+
+        # Auth p99 latency exceeds 100ms
+        - alert: IAMAuthLatencyHigh
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(iam_auth_duration_seconds_bucket[5m])) by (le)
+            ) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "IAM authentication p99 latency exceeds 100ms"
+            description: >
+              Authentication verification p99 latency is {{ "{{ $value }}" }}s.
+
+        # Policy deny rate exceeds 50%
+        - alert: IAMPolicyDenyRateHigh
+          expr: |
+            (
+              sum(rate(iam_policy_evaluations_total{result="deny"}[5m]))
+              /
+              sum(rate(iam_policy_evaluations_total[5m]))
+            ) > 0.50
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "IAM policy deny rate exceeds 50%"
+            description: >
+              Over 50% of policy evaluations are being denied.
+              This may indicate misconfigured policies or unauthorized access attempts.
+
+        # JWKS not refreshed for over 6 hours
+        - alert: IAMOidcJwksStale
+          expr: |
+            (time() - iam_oidc_jwks_last_fetch_timestamp) > 21600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "OIDC JWKS has not been refreshed for over 6 hours"
+            description: >
+              The JWKS cache may be stale. New tokens with rotated keys
+              will fail validation.
+
+        # STS failure rate exceeds 20%
+        - alert: IAMStsFailureRateHigh
+          expr: |
+            (
+              sum(rate(iam_sts_requests_total{result="failure"}[5m]))
+              /
+              sum(rate(iam_sts_requests_total[5m]))
+            ) > 0.20
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "STS token issuance failure rate exceeds 20%"
+            description: >
+              {{ "{{ $value | humanizePercentage }}" }} of STS requests are failing.
+{{- end }}

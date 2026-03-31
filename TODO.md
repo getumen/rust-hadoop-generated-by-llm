@@ -43,9 +43,9 @@ S3互換サービスとしての信頼確保。
     - [x] **Tamper-evident Logging**: ハッシュチェーン（Hash Chaining）とHMAC-SHA256によるログの改ざん検知の実装。
     - [x] **Resource-based Indexing**: Column Families を活用したバケットやオブジェクト単位でのアクセス履歴検索用インデックス（`CF: idx_resource`）。
     - [x] **Audit Log Compression**: RocksDB の ZSTD 圧縮有効化とストレージ効率の最適化。
-- [ ] **IAM Observability**
-    - [ ] IAM メトリクス（認証成功/失敗率、ポリシー評価レイテンシ等）の Prometheus エクスポート。
-    - [ ] 既存 Grafana ダッシュボードへのIAMパネル追加。
+- [x] **IAM Observability** ✅ — [詳細設計書](docs/iam_observability_design.md)
+    - [x] IAM メトリクス（認証成功/失敗率、ポリシー評価レイテンシ等）の Prometheus エクスポート。
+    - [x] 既存 Grafana ダッシュボードへのIAMパネル追加。
 
 ### 2. Data Reliability (データ保護)
 データの欠損や静かな破損を許さないための仕組み。

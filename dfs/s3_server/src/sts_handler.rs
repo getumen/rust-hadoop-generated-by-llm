@@ -1,3 +1,4 @@
+use crate::iam_metrics::*;
 use crate::state::AppState as S3AppState;
 use axum::{
     extract::{Query, State},
@@ -8,7 +9,7 @@ use dfs_common::auth::audit::AuditRecord;
 use dfs_common::auth::sts::StsSessionData;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -68,6 +69,7 @@ pub async fn handle_sts(
     Query(params): Query<StsQueryParams>,
 ) -> Response {
     let start_time = chrono::Utc::now();
+    let sts_timer = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let remote_ip = connect_info.ip().to_string();
     let user_agent = headers
@@ -112,6 +114,9 @@ pub async fn handle_sts(
             "anonymous",
             None,
         );
+        IAM_STS_REQUESTS
+            .with_label_values(&["failure", "invalid_action"])
+            .inc();
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -125,6 +130,9 @@ pub async fn handle_sts(
                 "anonymous",
                 None,
             );
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "oidc_not_enabled"])
+                .inc();
             return sts_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "OIDC_NOT_ENABLED",
@@ -143,6 +151,9 @@ pub async fn handle_sts(
                 "anonymous",
                 None,
             );
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "sts_not_enabled"])
+                .inc();
             return sts_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "STS_NOT_ENABLED",
@@ -161,6 +172,9 @@ pub async fn handle_sts(
                 "anonymous",
                 None,
             );
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "iam_not_enabled"])
+                .inc();
             return sts_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "IAM_NOT_ENABLED",
@@ -179,6 +193,9 @@ pub async fn handle_sts(
                 "anonymous",
                 None,
             );
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "missing_token"])
+                .inc();
             return sts_error(
                 StatusCode::BAD_REQUEST,
                 "MissingToken",
@@ -197,6 +214,9 @@ pub async fn handle_sts(
                 "anonymous",
                 None,
             );
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "missing_role"])
+                .inc();
             return sts_error(
                 StatusCode::BAD_REQUEST,
                 "MissingRole",
@@ -207,9 +227,16 @@ pub async fn handle_sts(
 
     // 1. Validate OIDC Token
     let claims = match oidc.validate_token(web_identity_token).await {
-        Ok(c) => c,
+        Ok(c) => {
+            IAM_OIDC_VALIDATIONS.with_label_values(&["success"]).inc();
+            c
+        }
         Err(e) => {
             tracing::error!("OIDC validation failed: {}", e);
+            IAM_OIDC_VALIDATIONS.with_label_values(&["failure"]).inc();
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "invalid_identity_token"])
+                .inc();
             log_audit(
                 StatusCode::FORBIDDEN,
                 Some("InvalidIdentityToken"),
@@ -228,6 +255,9 @@ pub async fn handle_sts(
     // 2. Check Role Trust Policy
     let context = claims.to_policy_context();
     if !policy_eval.can_assume_role(role_arn, &context) {
+        IAM_STS_REQUESTS
+            .with_label_values(&["failure", "access_denied"])
+            .inc();
         log_audit(
             StatusCode::FORBIDDEN,
             Some("AccessDenied"),
@@ -275,6 +305,9 @@ pub async fn handle_sts(
     let session_token = match sts_mgr.generate_token(&session_data) {
         Ok(t) => t,
         Err(e) => {
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "internal_error"])
+                .inc();
             log_audit(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Some("InternalError"),
@@ -322,6 +355,22 @@ pub async fn handle_sts(
 
     log_audit(StatusCode::OK, None, action, &claims.sub, Some(role_arn));
 
+    // Record STS success metrics
+    IAM_STS_REQUESTS
+        .with_label_values(&["success", "none"])
+        .inc();
+    IAM_STS_DURATION
+        .with_label_values(&[] as &[&str])
+        .observe(sts_timer.elapsed().as_secs_f64());
+    IAM_STS_ACTIVE_SESSIONS.inc();
+
+    // Schedule a delayed decrement for the active sessions gauge
+    let session_duration = duration;
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(session_duration)).await;
+        IAM_STS_ACTIVE_SESSIONS.dec();
+    });
+
     match quick_xml::se::to_string(&result) {
         Ok(xml) => Response::builder()
             .status(StatusCode::OK)
@@ -330,6 +379,9 @@ pub async fn handle_sts(
             .unwrap(),
         Err(e) => {
             tracing::error!("Failed to serialize STS response: {}", e);
+            IAM_STS_REQUESTS
+                .with_label_values(&["failure", "internal_error"])
+                .inc();
             log_audit(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Some("InternalError"),

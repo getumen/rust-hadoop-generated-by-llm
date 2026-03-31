@@ -1,3 +1,4 @@
+use crate::iam_metrics::*;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -10,6 +11,7 @@ use chrono::{DateTime, Utc};
 use dfs_common::auth::audit::AuditRecord;
 use dfs_common::auth::{parse_credentials, AuthError, SigningInput};
 use std::collections::BTreeMap;
+use std::time::Instant;
 use uuid::Uuid;
 
 pub async fn auth_middleware(
@@ -23,6 +25,7 @@ pub async fn auth_middleware(
     }
 
     let start_time = Utc::now();
+    let auth_timer = Instant::now();
     let request_id = Uuid::new_v4().to_string();
     let remote_ip = extract_remote_ip(&req);
     let user_agent = req
@@ -63,6 +66,12 @@ pub async fn auth_middleware(
 
         if !is_tls {
             let res = s3_error_response(AuthError::InsecureTransport);
+            IAM_AUTH_REQUESTS
+                .with_label_values(&["failure", "insecure_transport"])
+                .inc();
+            IAM_AUTH_DURATION
+                .with_label_values(&["failure"])
+                .observe(auth_timer.elapsed().as_secs_f64());
             audit_ctx.log(
                 &state,
                 res.status().as_u16(),
@@ -87,6 +96,13 @@ pub async fn auth_middleware(
             c
         }
         Err(e) => {
+            let error_type = classify_auth_error(&e);
+            IAM_AUTH_REQUESTS
+                .with_label_values(&["failure", &error_type])
+                .inc();
+            IAM_AUTH_DURATION
+                .with_label_values(&["failure"])
+                .observe(auth_timer.elapsed().as_secs_f64());
             let res = s3_error_response(e.clone());
             let (err_code, _) = e.to_s3_error();
             audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
@@ -105,6 +121,12 @@ pub async fn auth_middleware(
                 server_time: now.to_rfc3339(),
                 request_time: req_time.to_rfc3339(),
             };
+            IAM_AUTH_REQUESTS
+                .with_label_values(&["failure", "clock_skew"])
+                .inc();
+            IAM_AUTH_DURATION
+                .with_label_values(&["failure"])
+                .observe(auth_timer.elapsed().as_secs_f64());
             let res = s3_error_response(err.clone());
             let (err_code, _) = err.to_s3_error();
             audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
@@ -124,6 +146,12 @@ pub async fn auth_middleware(
                 credentials.date, credentials.region, credentials.service, "aws4_request"
             ),
         };
+        IAM_AUTH_REQUESTS
+            .with_label_values(&["failure", "invalid_credential_scope"])
+            .inc();
+        IAM_AUTH_DURATION
+            .with_label_values(&["failure"])
+            .observe(auth_timer.elapsed().as_secs_f64());
         let res = s3_error_response(err.clone());
         let (err_code, _) = err.to_s3_error();
         audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
@@ -154,6 +182,13 @@ pub async fn auth_middleware(
         let session_data = match sts_mgr.decrypt_token(token) {
             Ok(data) => data,
             Err(e) => {
+                let error_type = classify_auth_error(&e);
+                IAM_AUTH_REQUESTS
+                    .with_label_values(&["failure", &error_type])
+                    .inc();
+                IAM_AUTH_DURATION
+                    .with_label_values(&["failure"])
+                    .observe(auth_timer.elapsed().as_secs_f64());
                 let res = s3_error_response(e.clone());
                 let (err_code, _) = e.to_s3_error();
                 audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
@@ -164,6 +199,12 @@ pub async fn auth_middleware(
         // Check session expiration
         let now = Utc::now().timestamp() as u64;
         if session_data.expiration < now {
+            IAM_AUTH_REQUESTS
+                .with_label_values(&["failure", "expired_token"])
+                .inc();
+            IAM_AUTH_DURATION
+                .with_label_values(&["failure"])
+                .observe(auth_timer.elapsed().as_secs_f64());
             let res = s3_error_response(AuthError::ExpiredToken);
             audit_ctx.role_arn = Some(session_data.role_arn.clone());
             audit_ctx.log(
@@ -188,6 +229,12 @@ pub async fn auth_middleware(
                 let err = AuthError::InvalidAccessKey {
                     access_key: credentials.access_key.clone(),
                 };
+                IAM_AUTH_REQUESTS
+                    .with_label_values(&["failure", "invalid_access_key"])
+                    .inc();
+                IAM_AUTH_DURATION
+                    .with_label_values(&["failure"])
+                    .observe(auth_timer.elapsed().as_secs_f64());
                 let res = s3_error_response(err.clone());
                 let (err_code, _) = err.to_s3_error();
                 audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
@@ -246,6 +293,12 @@ pub async fn auth_middleware(
         .unwrap_or_else(|| "UNSIGNED-PAYLOAD".to_string());
 
     if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload {
+        IAM_AUTH_REQUESTS
+            .with_label_values(&["failure", "missing_auth"])
+            .inc();
+        IAM_AUTH_DURATION
+            .with_label_values(&["failure"])
+            .observe(auth_timer.elapsed().as_secs_f64());
         let res = s3_error_response(AuthError::MissingAuth);
         audit_ctx.role_arn = role_arn_from_token;
         audit_ctx.log(
@@ -269,11 +322,33 @@ pub async fn auth_middleware(
     // 9. Verify Signature
     match dfs_common::auth::signing::verify_signature_with_key(&input, &credentials, &signing_key) {
         Ok(_) => {
+            // Record authentication success
+            IAM_AUTH_REQUESTS
+                .with_label_values(&["success", "none"])
+                .inc();
+            IAM_AUTH_DURATION
+                .with_label_values(&["success"])
+                .observe(auth_timer.elapsed().as_secs_f64());
+
             // 10. Policy Evaluation (Phase 3)
             if let Some(role_arn) = &role_arn_from_token {
                 if let (Some(pe), Some(ctx)) = (&state.policy_evaluator, &evaluation_context) {
+                    let policy_timer = Instant::now();
                     let (s3_action, s3_resource) = resolve_s3_action_and_resource(&req);
-                    if !pe.evaluate(&s3_action, &s3_resource, role_arn, ctx) {
+                    let allowed = pe.evaluate(&s3_action, &s3_resource, role_arn, ctx);
+
+                    IAM_POLICY_EVAL_DURATION
+                        .with_label_values(&[] as &[&str])
+                        .observe(policy_timer.elapsed().as_secs_f64());
+
+                    if allowed {
+                        IAM_POLICY_EVALUATIONS
+                            .with_label_values(&["allow", &s3_action])
+                            .inc();
+                    } else {
+                        IAM_POLICY_EVALUATIONS
+                            .with_label_values(&["deny", &s3_action])
+                            .inc();
                         tracing::warn!(
                             "Policy evaluation failed for {} on {}",
                             s3_action,
@@ -303,6 +378,14 @@ pub async fn auth_middleware(
             res
         }
         Err(e) => {
+            let error_type = classify_auth_error(&e);
+            IAM_AUTH_REQUESTS
+                .with_label_values(&["failure", &error_type])
+                .inc();
+            IAM_AUTH_DURATION
+                .with_label_values(&["failure"])
+                .observe(auth_timer.elapsed().as_secs_f64());
+
             if let AuthError::SignatureDoesNotMatch {
                 canonical_request,
                 string_to_sign,
@@ -539,4 +622,20 @@ fn normalize_query_string(query_string_raw: &str) -> String {
         normalized_query_parts.push(format!("{}={}", k, v));
     }
     normalized_query_parts.join("&")
+}
+
+/// Map AuthError variants to metric-friendly error_type labels.
+fn classify_auth_error(err: &AuthError) -> String {
+    match err {
+        AuthError::MissingAuth => "missing_auth",
+        AuthError::InvalidAccessKey { .. } => "invalid_access_key",
+        AuthError::SignatureDoesNotMatch { .. } => "signature_mismatch",
+        AuthError::RequestTimeTooSkewed { .. } => "clock_skew",
+        AuthError::InvalidCredentialScope { .. } => "invalid_credential_scope",
+        AuthError::ExpiredToken => "expired_token",
+        AuthError::InvalidToken(_) => "invalid_token",
+        AuthError::InsecureTransport => "insecure_transport",
+        AuthError::InternalError(_) => "internal_error",
+    }
+    .to_string()
 }
