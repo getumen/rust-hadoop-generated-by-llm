@@ -97,28 +97,32 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("OIDC_CLIENT_ID"),
     ) {
         let validator = Arc::new(OidcValidator::new(issuer, client_id));
-        // Fetch JWKS in the background during startup with metrics
+        // Fetch JWKS in the background periodically with metrics
         let v_clone = validator.clone();
         tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            match v_clone.fetch_jwks().await {
-                Ok(_) => {
-                    iam_metrics::IAM_OIDC_JWKS_FETCHES
-                        .with_label_values(&["success"])
-                        .inc();
-                    iam_metrics::IAM_OIDC_JWKS_FETCH_DURATION
-                        .with_label_values(&[] as &[&str])
-                        .observe(start.elapsed().as_secs_f64());
-                    iam_metrics::IAM_OIDC_JWKS_LAST_FETCH.set(chrono::Utc::now().timestamp());
-                }
-                Err(e) => {
-                    iam_metrics::IAM_OIDC_JWKS_FETCHES
-                        .with_label_values(&["failure"])
-                        .inc();
-                    iam_metrics::IAM_OIDC_JWKS_FETCH_DURATION
-                        .with_label_values(&[] as &[&str])
-                        .observe(start.elapsed().as_secs_f64());
-                    tracing::error!("Failed to fetch JWKS: {}", e);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let start = std::time::Instant::now();
+                match v_clone.fetch_jwks().await {
+                    Ok(_) => {
+                        iam_metrics::IAM_OIDC_JWKS_FETCHES
+                            .with_label_values(&["success"])
+                            .inc();
+                        iam_metrics::IAM_OIDC_JWKS_FETCH_DURATION
+                            .with_label_values(&[] as &[&str])
+                            .observe(start.elapsed().as_secs_f64());
+                        iam_metrics::IAM_OIDC_JWKS_LAST_FETCH.set(chrono::Utc::now().timestamp());
+                    }
+                    Err(e) => {
+                        iam_metrics::IAM_OIDC_JWKS_FETCHES
+                            .with_label_values(&["failure"])
+                            .inc();
+                        iam_metrics::IAM_OIDC_JWKS_FETCH_DURATION
+                            .with_label_values(&[] as &[&str])
+                            .observe(start.elapsed().as_secs_f64());
+                        tracing::error!("Failed to fetch JWKS: {}", e);
+                    }
                 }
             }
         });
