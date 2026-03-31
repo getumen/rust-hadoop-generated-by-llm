@@ -3,6 +3,7 @@ mod auth_middleware;
 #[cfg(test)]
 mod handler_tests;
 mod handlers;
+mod iam_metrics;
 mod s3_types;
 mod state;
 mod sts_handler;
@@ -96,11 +97,33 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("OIDC_CLIENT_ID"),
     ) {
         let validator = Arc::new(OidcValidator::new(issuer, client_id));
-        // We might want to fetch JWKS in the background or during startup
+        // Fetch JWKS in the background periodically with metrics
         let v_clone = validator.clone();
         tokio::spawn(async move {
-            if let Err(e) = v_clone.fetch_jwks().await {
-                tracing::error!("Failed to fetch JWKS: {}", e);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let start = std::time::Instant::now();
+                match v_clone.fetch_jwks().await {
+                    Ok(_) => {
+                        iam_metrics::IAM_OIDC_JWKS_FETCHES
+                            .with_label_values(&["success"])
+                            .inc();
+                        iam_metrics::IAM_OIDC_JWKS_FETCH_DURATION
+                            .with_label_values(&[] as &[&str])
+                            .observe(start.elapsed().as_secs_f64());
+                        iam_metrics::IAM_OIDC_JWKS_LAST_FETCH.set(chrono::Utc::now().timestamp());
+                    }
+                    Err(e) => {
+                        iam_metrics::IAM_OIDC_JWKS_FETCHES
+                            .with_label_values(&["failure"])
+                            .inc();
+                        iam_metrics::IAM_OIDC_JWKS_FETCH_DURATION
+                            .with_label_values(&[] as &[&str])
+                            .observe(start.elapsed().as_secs_f64());
+                        tracing::error!("Failed to fetch JWKS: {}", e);
+                    }
+                }
             }
         });
         Some(validator)
@@ -268,6 +291,12 @@ async fn handle_metrics() -> Result<String, InternalError> {
             tracing::error!("Failed to register audit_log_flush_errors: {}", e);
             InternalError
         })?;
+
+    // Register IAM metrics
+    crate::iam_metrics::register_iam_metrics(&registry).map_err(|e| {
+        tracing::error!("Failed to register IAM metrics: {}", e);
+        InternalError
+    })?;
 
     let mut buffer = vec![];
     let encoder = TextEncoder::new();
