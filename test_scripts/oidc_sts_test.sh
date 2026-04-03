@@ -11,11 +11,15 @@ cleanup() {
     [ ! -z "$MOCK_PID" ] && kill $MOCK_PID 2>/dev/null || true
     rm -f /tmp/iam_config.json /tmp/hello.txt
     # Kill any remaining processes on our ports
-    lsof -ti:8080 | xargs kill -9 2>/dev/null || true
+    lsof -ti:8085 | xargs kill -9 2>/dev/null || true
     lsof -ti:9000 | xargs kill -9 2>/dev/null || true
 }
 
 trap cleanup EXIT
+
+# Start with a clean slate
+echo "Cleaning up previous state..."
+cleanup
 
 echo "=== OIDC & STS E2E Test ==="
 
@@ -32,9 +36,10 @@ if [ $PIP_STATUS -ne 0 ]; then
 fi
 
 
+OIDC_PORT=8085
 # 2. Start Mock OIDC Server
-echo "Starting Mock OIDC Server..."
-python3 test_scripts/mock_oidc.py &
+echo "Starting Mock OIDC Server on port $OIDC_PORT..."
+OIDC_PORT=$OIDC_PORT python3 test_scripts/mock_oidc.py &
 MOCK_PID=$!
 
 # Wait for mock to start
@@ -51,7 +56,7 @@ cat <<EOF > /tmp/iam_config.json
         "Statement": [
           {
             "Effect": "Allow",
-            "Principal": { "Federated": "http://localhost:8080" },
+            "Principal": { "Federated": "http://localhost:$OIDC_PORT" },
             "Action": "sts:AssumeRoleWithWebIdentity",
             "Condition": {
               "ForAnyValue:StringEquals": {
@@ -83,7 +88,7 @@ EOF
 # 4. Start S3 Server with OIDC/STS enabled
 echo "Starting S3 Server..."
 S3_AUTH_ENABLED=true \
-OIDC_ISSUER_URL=http://localhost:8080 \
+OIDC_ISSUER_URL=http://localhost:$OIDC_PORT \
 OIDC_CLIENT_ID=test-client \
 STS_SIGNING_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff \
 IAM_CONFIG_PATH=/tmp/iam_config.json \
@@ -98,7 +103,7 @@ sleep 15
 
 # 5. Generate JWT Token from the running OIDC server's /token endpoint
 echo "Generating JWT Token from Mock OIDC..."
-TOKEN=$(curl -s http://localhost:8080/token)
+TOKEN=$(curl -s http://localhost:$OIDC_PORT/token)
 echo "Token: ${TOKEN:0:20}..."
 
 # 6. Call AssumeRoleWithWebIdentity (STS)

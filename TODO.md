@@ -49,9 +49,10 @@ S3互換サービスとしての信頼確保。
 
 ### 2. Data Reliability (データ保護)
 データの欠損や静かな破損を許さないための仕組み。
-- [ ] **End-to-End Checksums**
-    - [ ] Clientでの書き込み時チェックサム計算、Metaserverへの保存。
-    - [ ] ChunkServerでの読み取り時・バックグラウンドでの整合性検証。
+- [x] **End-to-End Checksums** ✅ — [詳細設計書](docs/end_to_end_checksums_design.md)
+    - [x] Clientでの書き込み時チェックサム計算、Metaserverへの保存。
+    - [x] ChunkServerでの読み取り時・バックグラウンドでの整合性検証。
+    - [x] S3互換の MPU ETag 合成ロジックとネイティブメタデータの永続化。
 - [ ] **Background Healer (Auto-Repair)**
     - [ ] レプリカ数が不足している、またはチェックサムが不一致なブロックを抽出するスキャナー。
     - [ ] Metaserverによる不足レプリカの自動再配置命令の送出。

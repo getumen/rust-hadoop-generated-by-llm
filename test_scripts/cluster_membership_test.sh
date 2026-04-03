@@ -15,6 +15,9 @@ cleanup() {
     echo ""
     echo "🧹 Cleaning up..."
     docker compose down -v 2>/dev/null || true
+    if [ -f "docker-compose.toxiproxy-sharded.yml" ]; then
+        docker compose -f docker-compose.toxiproxy-sharded.yml down -v 2>/dev/null || true
+    fi
     rm -f /tmp/cluster_test_*.txt 2>/dev/null || true
 }
 
@@ -22,7 +25,16 @@ trap cleanup EXIT
 
 # Start with a clean slate
 echo "Cleaning up previous state..."
-docker compose down -v 2>/dev/null || true
+cleanup
+
+# Port check
+echo "Checking if ports are free..."
+for port in 50050 50051 50052 50061 50062 50072 50082 9000; do
+    if lsof -i :$port >/dev/null 2>&1; then
+        echo "⚠️  Warning: Port $port is in use. Attempting to kill the process..."
+        lsof -ti :$port | xargs kill -9 2>/dev/null || true
+    fi
+done
 
 # Start the cluster
 echo "Starting cluster..."

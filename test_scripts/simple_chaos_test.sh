@@ -10,9 +10,16 @@ echo "==============================="
 COMPOSE_FILE="docker-compose.yml"
 MASTER_CONTAINER="dfs-master1-shard1"
 
+cleanup() {
+    echo "🧹 Cleaning up..."
+    docker compose -f $COMPOSE_FILE down -v 2>/dev/null || true
+    rm -f simple_test.txt downloaded_simple.txt downloaded_recovery.txt
+}
+trap cleanup EXIT
+
 # Clean up any previous state
 echo "Cleaning up previous state..."
-docker compose -f $COMPOSE_FILE down -v || true
+docker compose -f $COMPOSE_FILE down -v 2>/dev/null || true
 
 # Start cluster
 echo "Starting cluster..."
@@ -55,8 +62,6 @@ if docker exec $MASTER_CONTAINER /app/dfs_cli --master http://localhost:50051 ge
         echo "✅ Content matches! Replication works!"
     else
         echo "❌ Content mismatch!"
-        docker compose -f $COMPOSE_FILE down -v
-        rm -f simple_test.txt downloaded_simple.txt
         exit 1
     fi
 else
@@ -80,16 +85,8 @@ if diff simple_test.txt downloaded_recovery.txt > /dev/null; then
     echo "✅ Content verified after recovery!"
 else
     echo "❌ Content mismatch after recovery!"
-    docker compose -f $COMPOSE_FILE down -v
-    rm -f simple_test.txt downloaded_simple.txt downloaded_recovery.txt
     exit 1
 fi
-
-# Cleanup
-echo ""
-echo "🧹 Cleaning up..."
-docker compose -f $COMPOSE_FILE down -v
-rm -f simple_test.txt downloaded_simple.txt downloaded_recovery.txt
 
 echo ""
 echo "🎉 Simple chaos test passed!"
