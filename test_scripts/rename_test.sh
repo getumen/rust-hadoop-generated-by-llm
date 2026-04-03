@@ -23,13 +23,21 @@ fail() {
     exit 1
 }
 
-# Create test file
-echo "Creating test file..."
-echo "Hello from Rust Hadoop DFS! Testing rename operation." > rename_test.txt
+cleanup() {
+    echo "🧹 Cleaning up..."
+    docker compose down -v 2>/dev/null || true
+    rm -f rename_test.txt renamed_downloaded.txt nested_downloaded.txt
+}
+trap cleanup EXIT
 
 # Start cluster
 echo "🚀 Starting cluster..."
+docker compose down -v 2>/dev/null || true
 docker compose up -d --build
+
+# Create test file
+echo "Creating test file..."
+echo "Hello from Rust Hadoop DFS! Testing rename operation." > rename_test.txt
 echo "Waiting for cluster (15s)..."
 sleep 15
 
@@ -128,11 +136,6 @@ fi
 # ============================================================================
 # Cleanup
 # ============================================================================
-echo ""
-echo "🧹 Cleanup..."
-docker compose down -v
-rm -f rename_test.txt renamed_downloaded.txt nested_downloaded.txt
-
 echo ""
 echo "============================================"
 echo -e "${GREEN}🎉 All rename tests passed!${NC}"

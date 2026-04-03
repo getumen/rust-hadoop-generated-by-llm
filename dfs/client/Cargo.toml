@@ -28,6 +28,9 @@ anyhow = "1.0"
 rand = "0.8"
 rustls = { version = "0.23", features = ["ring"] }
 dfs-common = { path = "../common" }
+md5 = "0.7"
+crc32fast = "1.4"
+hex = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"

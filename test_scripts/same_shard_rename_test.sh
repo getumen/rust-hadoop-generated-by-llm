@@ -13,11 +13,19 @@ NC='\033[0m'
 pass() { echo -e "${GREEN}✓ $1${NC}"; }
 fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 
+cleanup() {
+    echo "🧹 Cleaning up..."
+    docker compose -f docker-compose.yml down -v 2>/dev/null || true
+    rm -f file1.txt downloaded.txt
+}
+trap cleanup EXIT
+
 echo "🧪 Same-Shard Rename Test (Sharded)"
 echo "=================================="
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
+docker compose -f docker-compose.yml down -v 2>/dev/null || true
 docker compose -f docker-compose.yml up -d --build
 
 # Wait for cluster
@@ -116,11 +124,6 @@ else
     # If it was on Shard 2, Master 1 should say Redirect (to Shard 2), and Shard 2 should say Not Found.
     pass "Old file access checks..."
 fi
-
-# Cleanup
-echo "🧹 Cleanup..."
-docker compose -f docker-compose.yml down -v
-rm -f file1.txt downloaded.txt
 
 echo ""
 echo "============================================"

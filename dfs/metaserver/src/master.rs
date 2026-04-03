@@ -1455,6 +1455,7 @@ impl MasterService for MyMaster {
                         block_id,
                         size: 0,
                         locations: selected_servers.clone(),
+                        checksum_crc32c: 0,
                     };
                     Ok(Response::new(AllocateBlockResponse {
                         block: Some(block),
@@ -1501,6 +1502,17 @@ impl MasterService for MyMaster {
                     command: Command::Master(MasterCommand::CompleteFile {
                         path: req.path,
                         size: req.size,
+                        etag_md5: if req.etag_md5.is_empty() {
+                            None
+                        } else {
+                            Some(req.etag_md5)
+                        },
+                        created_at_ms: if req.created_at_ms == 0 {
+                            None
+                        } else {
+                            Some(req.created_at_ms)
+                        },
+                        block_checksums: req.block_checksums,
                     }),
                     reply_tx: tx,
                 })
@@ -2601,6 +2613,8 @@ mod tests {
             path: "/source/file.txt".to_string(),
             size: 1024,
             blocks: vec![],
+            etag_md5: "".into(),
+            created_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2638,6 +2652,8 @@ mod tests {
             path: "/source/file.txt".to_string(),
             size: 1024,
             blocks: vec![],
+            etag_md5: "".into(),
+            created_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2659,6 +2675,8 @@ mod tests {
             path: "/source/file.txt".to_string(),
             size: 1024,
             blocks: vec![],
+            etag_md5: "".into(),
+            created_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2683,7 +2701,10 @@ mod tests {
                 block_id: "block-1".to_string(),
                 size: 1024,
                 locations: vec!["chunk1:50052".to_string()],
+                checksum_crc32c: 0,
             }],
+            etag_md5: "".into(),
+            created_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2740,6 +2761,8 @@ mod tests {
             path: "/test.txt".to_string(),
             size: 100,
             blocks: vec![],
+            etag_md5: "".into(),
+            created_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(

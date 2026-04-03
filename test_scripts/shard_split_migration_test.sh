@@ -13,12 +13,19 @@ NC='\033[0m'
 pass() { echo -e "${GREEN}✓ $1${NC}"; }
 fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 
+cleanup() {
+    echo "🧹 Cleaning up..."
+    docker compose -f docker-compose.yml down -v 2>/dev/null || true
+    rm -f test_data.bin downloaded_file.bin
+}
+trap cleanup EXIT
+
 echo "🧪 Shard Split Data Migration Test"
 echo "=================================="
 
 # Start sharded cluster
-echo "🚀 Cleaning up cluster..."
-docker compose down -v || true
+echo "🚀 Cleaning up and starting cluster..."
+docker compose down -v 2>/dev/null || true
 
 echo "🚀 Starting cluster..."
 docker compose up -d --build --force-recreate
@@ -94,11 +101,6 @@ if diff test_data.bin downloaded_file.bin > /dev/null; then
 else
     fail "Data corruption detected!"
 fi
-
-# Cleanup
-echo "🧹 Cleanup..."
-docker compose -f docker-compose.yml down -v
-rm -f test_data.bin downloaded_file.bin
 
 echo ""
 echo "============================================"

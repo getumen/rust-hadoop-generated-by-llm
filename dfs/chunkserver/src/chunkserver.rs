@@ -362,6 +362,7 @@ impl MyChunkServer {
             block_id: block_id.to_string(),
             data,
             next_servers: vec![], // No further forwarding
+            expected_checksum_crc32c: 0,
         });
 
         match client.replicate_block(request).await {
@@ -456,6 +457,28 @@ impl ChunkServerService for MyChunkServer {
             let req = request.into_inner();
             // ...
 
+            // Verify checksum if provided
+            if req.expected_checksum_crc32c != 0 {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&req.data);
+                let actual_checksum = hasher.finalize();
+                if actual_checksum != req.expected_checksum_crc32c {
+                    tracing::error!(
+                        "Checksum mismatch for block {}: expected {}, actual {}",
+                        req.block_id,
+                        req.expected_checksum_crc32c,
+                        actual_checksum
+                    );
+                    return Ok(Response::new(WriteBlockResponse {
+                        success: false,
+                        error_message: format!(
+                            "Checksum mismatch: expected {}, actual {}",
+                            req.expected_checksum_crc32c, actual_checksum
+                        ),
+                    }));
+                }
+            }
+
             // Write block locally with checksums
             if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
                 return Ok(Response::new(WriteBlockResponse {
@@ -478,6 +501,7 @@ impl ChunkServerService for MyChunkServer {
                             block_id: req.block_id.clone(),
                             data: req.data.clone(),
                             next_servers: remaining_servers,
+                            expected_checksum_crc32c: req.expected_checksum_crc32c,
                         };
 
                         if let Err(e) = client.replicate_block(replicate_req).await {
@@ -675,6 +699,28 @@ impl ChunkServerService for MyChunkServer {
         async move {
             let req = request.into_inner();
 
+            // Verify checksum if provided (Phase 3: ChunkServer In-flight Verification)
+            if req.expected_checksum_crc32c != 0 {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&req.data);
+                let actual_checksum = hasher.finalize();
+                if actual_checksum != req.expected_checksum_crc32c {
+                    tracing::error!(
+                        "Checksum mismatch during replication for block {}: expected {}, actual {}",
+                        req.block_id,
+                        req.expected_checksum_crc32c,
+                        actual_checksum
+                    );
+                    return Ok(Response::new(crate::dfs::ReplicateBlockResponse {
+                        success: false,
+                        error_message: format!(
+                            "Replication checksum mismatch: expected {}, actual {}",
+                            req.expected_checksum_crc32c, actual_checksum
+                        ),
+                    }));
+                }
+            }
+
             // Write block locally with checksums
             if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
                 return Ok(Response::new(crate::dfs::ReplicateBlockResponse {
@@ -695,6 +741,7 @@ impl ChunkServerService for MyChunkServer {
                             block_id: req.block_id,
                             data: req.data,
                             next_servers: remaining_servers,
+                            expected_checksum_crc32c: req.expected_checksum_crc32c,
                         };
 
                         if let Err(e) = client.replicate_block(replicate_req).await {

@@ -98,6 +98,7 @@ pub struct InitiateMultipartUploadResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename = "CompleteMultipartUpload")]
+#[allow(dead_code)]
 pub struct CompleteMultipartUpload {
     #[serde(rename = "Part")]
     #[allow(dead_code)]
@@ -105,6 +106,7 @@ pub struct CompleteMultipartUpload {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Part {
     #[serde(rename = "PartNumber")]
     pub part_number: i32,

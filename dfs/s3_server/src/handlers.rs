@@ -252,17 +252,29 @@ async fn upload_part(
     body: Bytes,
 ) -> Response {
     let part_path = format!("/.s3_mpu/{}/{}", upload_id, part_number);
+    let etag = format!("\"{:x}\"", Md5::digest(&body));
+
     let mut temp_file = NamedTempFile::new().unwrap();
     if temp_file.write_all(&body).is_err() {
         return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     match state.client.create_file(temp_file.path(), &part_path).await {
-        Ok(_) => Response::builder()
-            .status(StatusCode::OK)
-            .header("ETag", "\"d41d8cd98f00b204e9800998ecf8427e\"")
-            .body(Body::empty())
-            .unwrap(),
+        Ok(_) => {
+            // Save .etag file for MPU completion
+            let etag_path = format!("{}.etag", part_path);
+            let mut etag_temp = NamedTempFile::new().unwrap();
+            let _ = etag_temp.write_all(etag.as_bytes());
+            if let Err(e) = state.client.create_file(etag_temp.path(), &etag_path).await {
+                tracing::error!("Failed to save .etag for part: {}", e);
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(ETAG, etag)
+                .body(Body::empty())
+                .unwrap()
+        }
         Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -303,28 +315,54 @@ async fn complete_multipart_upload(
     bucket: &str,
     key: &str,
     upload_id: String,
-    body: Bytes,
+    _body: Bytes,
 ) -> Response {
-    // Parse body for part verification (skip actual verification for now, just trust client)
-    if let Ok(str_body) = std::str::from_utf8(&body) {
-        let _parts: Result<CompleteMultipartUpload, _> = from_str(str_body);
+    // 1. Identify parts and calculate MPU ETag
+    let mpu_dir = format!("/.s3_mpu/{}", upload_id);
+    let mut parts_info = Vec::new();
+
+    if let Ok(files) = state.client.list_files(&mpu_dir).await {
+        for f in files {
+            if f.ends_with(".etag") {
+                // Extract part number from filename (format: /.s3_mpu/id/num.etag)
+                let name = f.split('/').next_back().unwrap();
+                let num_str = name.strip_suffix(".etag").unwrap();
+                if let Ok(num) = num_str.parse::<i32>() {
+                    // Read the MD5 hex string from .etag file
+                    if let Ok(content) = state.client.get_file_content(&f).await {
+                        if let Ok(etag_hex) = std::str::from_utf8(&content) {
+                            // Extract raw hex (strip quotes if present)
+                            let raw_hex = etag_hex.trim_matches('"');
+                            if let Ok(binary_md5) = hex::decode(raw_hex) {
+                                parts_info.push((num, binary_md5));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+    parts_info.sort_by_key(|p| p.0);
+
+    let num_parts = parts_info.len();
+    let mut combined_md5 = Vec::new();
+    for (_, bin) in &parts_info {
+        combined_md5.extend_from_slice(bin);
+    }
+
+    let final_etag = format!("\"{:x}-{}\"", Md5::digest(&combined_md5), num_parts);
+    tracing::info!("MPU Complete: upload_id={}, etag={}", upload_id, final_etag);
 
     let dest_dir = format!("/{}/{}", bucket, key);
 
-    // 1. Check if dest exists as file and delete it.
-    // Ideally check if dir exists too? S3 overwrites.
-    // If it's a file, delete_file works. If it's a dir (mpu), we overwrite?
-    // Let's assume we overwrite.
-
-    // Check if dest is a simple file and delete it
+    // 2. Overwrite existing destination if necessary
     if let Ok(files) = state.client.list_files(&dest_dir).await {
         if files.contains(&dest_dir) {
             let _ = state.client.delete_file(&dest_dir).await;
         }
     }
 
-    // 2. Create completion marker in dest to make it a directory
+    // 3. Create completion marker
     let marker_path = format!("{}/.s3_mpu_completed", dest_dir);
     let temp_file = NamedTempFile::new().unwrap();
     if state
@@ -336,16 +374,17 @@ async fn complete_multipart_upload(
         return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // 3. Move parts
-    // We need to list parts in /.s3_mpu/<upload_id> or just assume standard naming?
-    // Better to list.
-    let mpu_dir = format!("/.s3_mpu/{}", upload_id);
+    // 4. Move parts and cleanup .etag files
     if let Ok(files) = state.client.list_files(&mpu_dir).await {
         for f in files {
             if f.ends_with(".s3keep") {
                 continue;
             }
-            // Extract part number from path
+            if f.ends_with(".etag") {
+                let _ = state.client.delete_file(&f).await;
+                continue;
+            }
+
             let parts: Vec<&str> = f.split('/').collect();
             if let Some(filename) = parts.last() {
                 let dest_part_path = format!("{}/{}", dest_dir, filename);
@@ -354,9 +393,6 @@ async fn complete_multipart_upload(
         }
     }
 
-    // 4. Cleanup mpu dir
-    // We should delete the old dir files. They are moved (renamed) so they are gone from source.
-    // Just delete .s3keep
     let _ = state
         .client
         .delete_file(&format!("{}/.s3keep", mpu_dir))
@@ -366,8 +402,19 @@ async fn complete_multipart_upload(
         location: format!("http://localhost:9000/{}/{}", bucket, key),
         bucket: bucket.into(),
         key: key.into(),
-        etag: "\"000-1\"".into(),
+        etag: final_etag.clone(),
     };
+
+    // Save MPU metadata
+    let mut meta_map = std::collections::HashMap::new();
+    meta_map.insert("ETag".to_string(), final_etag);
+    let metadata = Metadata { headers: meta_map };
+    if let Ok(json) = serde_json::to_string(&metadata) {
+        let meta_path = format!("{}.meta", dest_dir);
+        let mut meta_temp = NamedTempFile::new().unwrap();
+        let _ = meta_temp.write_all(json.as_bytes());
+        let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
+    }
 
     match to_string(&result) {
         Ok(xml) => xml_response(StatusCode::OK, xml),
@@ -461,6 +508,12 @@ async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -
         return empty_response(StatusCode::NOT_FOUND);
     }
 
+    // Calculate ETag from downloaded file
+    let mut file = std::fs::File::open(&temp_path).unwrap();
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).unwrap();
+    let etag = format!("\"{:x}\"", Md5::digest(&buffer));
+
     if let Err(e) = state.client.create_file(&temp_path, &dest).await {
         tracing::error!("CopyObject: Failed to upload to {}: {}", dest, e);
         let _ = std::fs::remove_file(temp_path);
@@ -468,23 +521,20 @@ async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -
     }
     let _ = std::fs::remove_file(temp_path);
 
-    // Copy metadata if exists
-    let meta_source = format!("{}.meta", source_path);
-    let meta_dest = format!("{}.meta", dest);
-    let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
-    if state
-        .client
-        .get_file(&meta_source, &meta_temp)
-        .await
-        .is_ok()
-    {
-        let _ = state.client.create_file(&meta_temp, &meta_dest).await;
-        let _ = std::fs::remove_file(meta_temp);
+    // Save metadata for the copy
+    let mut meta_map = std::collections::HashMap::new();
+    meta_map.insert("ETag".to_string(), etag.clone());
+    let metadata = Metadata { headers: meta_map };
+    if let Ok(json) = serde_json::to_string(&metadata) {
+        let meta_path = format!("{}.meta", dest);
+        let mut meta_temp = NamedTempFile::new().unwrap();
+        let _ = meta_temp.write_all(json.as_bytes());
+        let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
     }
 
     let result = CopyObjectResult {
-        last_modified: "2025-01-01T00:00:00.000Z".into(),
-        etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
+        last_modified: chrono::Utc::now().to_rfc3339(),
+        etag: etag.clone(),
     };
 
     match to_string(&result) {
@@ -651,24 +701,25 @@ async fn list_objects(state: S3AppState, bucket: &str, params: S3Query) -> Respo
                 // Fetch actual metadata for size and etag
                 let mut size = 0u64;
                 let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
+                let mut last_modified = "2025-01-01T00:00:00.000Z".to_string();
 
                 if let Ok(Some(info)) = state.client.get_file_info(&f).await {
                     size = info.size;
-                }
-
-                // Try to read .meta file for ETag
-                let meta_path = format!("{}.meta", f);
-                if let Ok(meta_content) = state.client.get_file_content(&meta_path).await {
-                    if let Ok(metadata) = serde_json::from_slice::<Metadata>(&meta_content) {
-                        if let Some(e) = metadata.headers.get("ETag") {
-                            etag = e.clone();
-                        }
+                    if !info.etag_md5.is_empty() {
+                        etag = format!("\"{}\"", info.etag_md5);
+                    }
+                    if info.created_at_ms > 0 {
+                        last_modified =
+                            chrono::DateTime::from_timestamp((info.created_at_ms / 1000) as i64, 0)
+                                .unwrap_or_default()
+                                .format("%Y-%m-%dT%H:%M:%S.000Z")
+                                .to_string();
                     }
                 }
 
                 objects.push(Object {
                     key: key.clone(),
-                    last_modified: "2025-01-01T00:00:00.000Z".into(),
+                    last_modified,
                     etag,
                     size,
                     storage_class: "STANDARD".into(),
@@ -696,11 +747,24 @@ async fn list_objects(state: S3AppState, bucket: &str, params: S3Query) -> Respo
                         }
                     }
 
+                    // Fetch metadata for MPU object if exists
+                    let mut etag = "\"000-MPU\"".to_string();
+                    let meta_path = format!("{}.meta", mpu_path);
+                    if let Ok(content) = state.client.get_file_content(&meta_path).await {
+                        if let Ok(json) = std::str::from_utf8(&content) {
+                            if let Ok(metadata) = serde_json::from_str::<Metadata>(json) {
+                                if let Some(e) = metadata.headers.get("ETag") {
+                                    etag = e.clone();
+                                }
+                            }
+                        }
+                    }
+
                     // Add as object
                     objects.push(Object {
                         key,
                         last_modified: "2025-01-01T00:00:00.000Z".into(),
-                        etag: "\"000-MPU\"".into(),
+                        etag,
                         size: 0, // Calculate size?
                         storage_class: "STANDARD".into(),
                         owner: Owner {
@@ -843,29 +907,44 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
 
     // Prepare metadata headers
     let mut response_headers = HeaderMap::new();
-    let meta_path = format!("{}.meta", full_path);
-    let temp_dir = std::env::temp_dir();
-    let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
-    let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(); // Default ETag
+    let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
+    let mut last_modified = "Wed, 01 Jan 2025 00:00:00 GMT".to_string();
 
-    // Try download meta
-    if state.client.get_file(&meta_path, &meta_temp).await.is_ok() {
-        if let Ok(content) = std::fs::read_to_string(&meta_temp) {
-            if let Ok(metadata) = serde_json::from_str::<Metadata>(&content) {
+    if let Ok(Some(info)) = state.client.get_file_info(&full_path).await {
+        if !info.etag_md5.is_empty() {
+            etag = format!("\"{}\"", info.etag_md5);
+        }
+        if info.created_at_ms > 0 {
+            last_modified = chrono::DateTime::from_timestamp((info.created_at_ms / 1000) as i64, 0)
+                .unwrap_or_else(chrono::Utc::now)
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+        }
+    }
+
+    // Prefer metadata file for ETag if available (Standardized)
+    let meta_path = format!("{}.meta", full_path);
+    if let Ok(content) = state.client.get_file_content(&meta_path).await {
+        if let Ok(json) = std::str::from_utf8(&content) {
+            if let Ok(metadata) = serde_json::from_str::<Metadata>(json) {
                 for (k, v) in metadata.headers {
                     if k == "ETag" {
-                        etag = v.clone();
-                    }
-                    if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
-                        if let Ok(name) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
-                            response_headers.insert(name, val);
+                        etag = v;
+                    } else if k.starts_with("x-amz-meta-") {
+                        if let (Ok(name), Ok(value)) = (
+                            k.parse::<axum::http::HeaderName>(),
+                            v.parse::<axum::http::HeaderValue>(),
+                        ) {
+                            response_headers.insert(name, value);
                         }
                     }
                 }
             }
         }
-        let _ = std::fs::remove_file(meta_temp);
     }
+
+    response_headers.insert(ETAG, etag.parse().unwrap());
+    response_headers.insert("Last-Modified", last_modified.parse().unwrap());
 
     if is_mpu {
         // Stream parts
@@ -1067,57 +1146,110 @@ async fn delete_object(state: S3AppState, bucket: &str, key: &str) -> Response {
 
 async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
     let path = format!("/{}/{}", bucket, key);
-    match state.client.exists(&path).await {
-        Ok(true) => {
-            // Get size for Content-Length
-            let mut size = 0u64;
-            if let Ok(Some(info)) = state.client.get_file_info(&path).await {
-                size = info.size;
-            }
 
-            // Try to get metadata
-            let meta_path = format!("{}.meta", path);
-            let temp_dir = std::env::temp_dir();
-            let meta_temp = temp_dir.join(format!("{}.meta", Uuid::new_v4()));
-            let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(); // Default ETag
+    // MPU Handling
+    let list_res = state.client.list_files(&path).await;
+    let is_mpu = if let Ok(files) = &list_res {
+        files.iter().any(|f| f.ends_with(".s3_mpu_completed"))
+    } else {
+        false
+    };
 
-            if state.client.get_file(&meta_path, &meta_temp).await.is_ok() {
-                if let Ok(content) = std::fs::read_to_string(&meta_temp) {
-                    if let Ok(metadata) = serde_json::from_str::<Metadata>(&content) {
-                        for (k, v) in metadata.headers.clone() {
-                            if k == "ETag" {
-                                etag = v.clone();
+    if is_mpu {
+        let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string(); // Default Fallback
+        let mut extra_headers = HeaderMap::new();
+        let meta_path = format!("{}.meta", path);
+        if let Ok(content) = state.client.get_file_content(&meta_path).await {
+            if let Ok(json) = std::str::from_utf8(&content) {
+                if let Ok(metadata) = serde_json::from_str::<Metadata>(json) {
+                    for (k, v) in metadata.headers {
+                        if k == "ETag" {
+                            etag = v;
+                        } else if k.starts_with("x-amz-meta-") {
+                            if let (Ok(name), Ok(value)) = (
+                                k.parse::<axum::http::HeaderName>(),
+                                v.parse::<axum::http::HeaderValue>(),
+                            ) {
+                                extra_headers.insert(name, value);
                             }
                         }
-                        let mut response = Response::builder()
-                            .status(StatusCode::OK)
-                            .header(ETAG, etag)
-                            .header(CONTENT_LENGTH, size)
-                            .body(Body::empty())
-                            .unwrap();
-                        let headers_map = response.headers_mut();
+                    }
+                }
+            }
+        }
+        let last_modified = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(ETAG, etag)
+            .header(CONTENT_LENGTH, "0")
+            .header("Last-Modified", last_modified)
+            .header("Content-Type", "application/octet-stream");
+
+        for (k, v) in extra_headers {
+            if let Some(k) = k {
+                resp = resp.header(k, v);
+            }
+        }
+        return resp.body(Body::empty()).unwrap();
+    }
+
+    match state.client.get_file_info(&path).await {
+        Ok(Some(info)) => {
+            let mut etag = if info.etag_md5.is_empty() {
+                "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()
+            } else {
+                format!("\"{}\"", info.etag_md5)
+            };
+
+            // Prefer metadata file for ETag if available (Standardized)
+            let mut extra_headers = HeaderMap::new();
+            let meta_path = format!("{}.meta", path);
+            if let Ok(content) = state.client.get_file_content(&meta_path).await {
+                if let Ok(json) = std::str::from_utf8(&content) {
+                    if let Ok(metadata) = serde_json::from_str::<Metadata>(json) {
                         for (k, v) in metadata.headers {
-                            if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
-                                if let Ok(name) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
-                                    headers_map.insert(name, val);
+                            if k == "ETag" {
+                                etag = v;
+                            } else if k.starts_with("x-amz-meta-") {
+                                if let (Ok(name), Ok(value)) = (
+                                    k.parse::<axum::http::HeaderName>(),
+                                    v.parse::<axum::http::HeaderValue>(),
+                                ) {
+                                    extra_headers.insert(name, value);
                                 }
                             }
                         }
-                        let _ = std::fs::remove_file(meta_temp);
-                        return response;
                     }
                 }
-                let _ = std::fs::remove_file(meta_temp);
             }
 
-            Response::builder()
+            let last_modified = if info.created_at_ms > 0 {
+                chrono::DateTime::from_timestamp((info.created_at_ms / 1000) as i64, 0)
+                    .unwrap_or_default()
+                    .format("%a, %d %b %Y %H:%M:%S GMT")
+                    .to_string()
+            } else {
+                "Wed, 01 Jan 2025 00:00:00 GMT".to_string()
+            };
+
+            let mut resp = Response::builder()
                 .status(StatusCode::OK)
                 .header(ETAG, etag)
-                .header(CONTENT_LENGTH, size)
-                .body(Body::empty())
-                .unwrap()
+                .header(CONTENT_LENGTH, info.size)
+                .header("Last-Modified", last_modified)
+                .header("Content-Type", "application/octet-stream");
+
+            for (k, v) in extra_headers {
+                if let Some(k) = k {
+                    resp = resp.header(k, v);
+                }
+            }
+            resp.body(Body::empty()).unwrap()
         }
-        Ok(false) => {
+        Ok(None) => {
             // Only return 200 for "directory" if the path ends with /
             if path.ends_with('/') {
                 match state.client.list_files(&path).await {
@@ -1136,7 +1268,7 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
             }
         }
         Err(e) => {
-            tracing::error!("HeadObject failed: {}", e);
+            tracing::error!("HeadObject failed for {}: {}", path, e);
             empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1253,24 +1385,25 @@ async fn list_objects_v2(state: S3AppState, bucket: &str, params: S3Query) -> Re
                 // Fetch actual metadata for size and etag
                 let mut size = 0u64;
                 let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
+                let mut last_modified = "2025-01-01T00:00:00.000Z".to_string();
 
                 if let Ok(Some(info)) = state.client.get_file_info(f).await {
                     size = info.size;
-                }
-
-                // Try to read .meta file for ETag
-                let meta_path = format!("{}.meta", f);
-                if let Ok(meta_content) = state.client.get_file_content(&meta_path).await {
-                    if let Ok(metadata) = serde_json::from_slice::<Metadata>(&meta_content) {
-                        if let Some(e) = metadata.headers.get("ETag") {
-                            etag = e.clone();
-                        }
+                    if !info.etag_md5.is_empty() {
+                        etag = format!("\"{}\"", info.etag_md5);
+                    }
+                    if info.created_at_ms > 0 {
+                        last_modified =
+                            chrono::DateTime::from_timestamp((info.created_at_ms / 1000) as i64, 0)
+                                .unwrap_or_default()
+                                .format("%Y-%m-%dT%H:%M:%S.000Z")
+                                .to_string();
                     }
                 }
 
                 objects.push(Object {
                     key: key.clone(),
-                    last_modified: "2025-01-01T00:00:00.000Z".into(),
+                    last_modified,
                     etag,
                     size,
                     storage_class: "STANDARD".into(),

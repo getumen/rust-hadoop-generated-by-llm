@@ -314,6 +314,12 @@ pub enum MasterCommand {
     CompleteFile {
         path: String,
         size: u64,
+        #[serde(default)]
+        etag_md5: Option<String>,
+        #[serde(default)]
+        created_at_ms: Option<u64>,
+        #[serde(default)]
+        block_checksums: Vec<crate::dfs::BlockChecksumInfo>,
     },
     /// Stop background data shuffling for a prefix
     StopShuffle {
@@ -2774,6 +2780,8 @@ impl RaftNode {
                                     path: path.clone(),
                                     size: 0,
                                     blocks: vec![],
+                                    etag_md5: "".to_string(),
+                                    created_at_ms: 0,
                                 },
                             );
                             tracing::info!("Created file {}", path);
@@ -2793,6 +2801,7 @@ impl RaftNode {
                                     block_id: block_id.clone(),
                                     size: 0,
                                     locations: locations.clone(),
+                                    checksum_crc32c: 0,
                                 });
                                 tracing::info!("Allocated block {} for file {}", block_id, path);
                             } else {
@@ -2922,36 +2931,65 @@ impl RaftNode {
                             master_state.shuffling_prefixes.insert(prefix.clone());
                             tracing::info!("Triggered background shuffling for prefix: {}", prefix);
                         }
-                        MasterCommand::CompleteFile { path, size } => {
+                        MasterCommand::CompleteFile {
+                            path,
+                            size,
+                            etag_md5,
+                            created_at_ms,
+                            block_checksums,
+                        } => {
                             if let Some(file) = master_state.files.get_mut(path) {
                                 file.size = *size;
+                                if let Some(etag) = etag_md5 {
+                                    file.etag_md5 = etag.clone();
+                                }
+                                if let Some(created) = created_at_ms {
+                                    file.created_at_ms = *created;
+                                }
 
-                                // Update block sizes based on total file size
-                                // Distribute size across blocks: each block gets equal size except last
-                                let num_blocks = file.blocks.len();
-                                if num_blocks > 0 {
-                                    let remaining_size = *size;
-
-                                    // For single block, assign all size to it
-                                    // For multiple blocks, we'll just mark the first block with full size
-                                    // This is a simplified approach - ideally blocks should report their actual size
-                                    if num_blocks == 1 {
-                                        file.blocks[0].size = remaining_size;
-                                    } else {
-                                        // For multiple blocks, distribute evenly
-                                        // This is an approximation since we don't know actual block boundaries
-                                        let block_size = remaining_size / num_blocks as u64;
-                                        let last_block_size =
-                                            remaining_size - (block_size * (num_blocks - 1) as u64);
-
-                                        for i in 0..num_blocks - 1 {
-                                            file.blocks[i].size = block_size;
+                                if !block_checksums.is_empty() {
+                                    // Use reported block checksums and sizes from client/S3 server
+                                    for info in block_checksums {
+                                        if let Some(block) = file
+                                            .blocks
+                                            .iter_mut()
+                                            .find(|b| b.block_id == info.block_id)
+                                        {
+                                            block.checksum_crc32c = info.checksum_crc32c;
+                                            block.size = info.actual_size;
                                         }
-                                        file.blocks[num_blocks - 1].size = last_block_size;
+                                    }
+                                } else {
+                                    // Backward compatibility: Update block sizes based on total file size
+                                    // Distribute size across blocks: each block gets equal size except last
+                                    let num_blocks = file.blocks.len();
+                                    if num_blocks > 0 {
+                                        let remaining_size = *size;
+
+                                        // For single block, assign all size to it
+                                        if num_blocks == 1 {
+                                            file.blocks[0].size = remaining_size;
+                                        } else {
+                                            // For multiple blocks, distribute evenly (approximation)
+                                            let block_size = remaining_size / num_blocks as u64;
+                                            let last_block_size = remaining_size
+                                                - (block_size * (num_blocks - 1) as u64);
+
+                                            for i in 0..num_blocks - 1 {
+                                                file.blocks[i].size = block_size;
+                                            }
+                                            file.blocks[num_blocks - 1].size = last_block_size;
+                                        }
                                     }
                                 }
 
-                                tracing::info!("Completed file {}: size={} bytes", path, size);
+                                tracing::info!(
+                                    "Completed file {}: size={} bytes, etag={:?}, created={:?}",
+                                    path,
+                                    size,
+                                    etag_md5,
+                                    created_at_ms
+                                );
                             }
                         }
                         MasterCommand::StopShuffle { prefix } => {
@@ -3109,6 +3147,8 @@ mod tests {
             path: "/dest.txt".to_string(),
             size: 100,
             blocks: vec![],
+            etag_md5: "".into(),
+            created_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(

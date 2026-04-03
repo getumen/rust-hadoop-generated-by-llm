@@ -108,6 +108,15 @@ message AllocateBlockResponse {
 message CompleteFileRequest {
   string path = 1;
   uint64 size = 2;
+  string etag_md5 = 3;
+  uint64 created_at_ms = 4;
+  repeated BlockChecksumInfo block_checksums = 5;
+}
+
+message BlockChecksumInfo {
+  string block_id = 1;
+  uint32 checksum_crc32c = 2;
+  uint64 actual_size = 3;
 }
 
 message CompleteFileResponse {
@@ -146,6 +155,7 @@ message WriteBlockRequest {
   string block_id = 1;
   bytes data = 2;
   repeated string next_servers = 3; // For replication pipeline
+  uint32 expected_checksum_crc32c = 4;
 }
 
 message WriteBlockResponse {
@@ -169,18 +179,22 @@ message FileMetadata {
   string path = 1;
   uint64 size = 2;
   repeated BlockInfo blocks = 3;
+  string etag_md5 = 4;
+  uint64 created_at_ms = 5;
 }
 
 message BlockInfo {
   string block_id = 1;
   uint64 size = 2;
   repeated string locations = 3;
+  uint32 checksum_crc32c = 4;
 }
 
 message ReplicateBlockRequest {
   string block_id = 1;
   bytes data = 2;
   repeated string next_servers = 3; // Remaining servers in the pipeline
+  uint32 expected_checksum_crc32c = 4;
 }
 
 message ReplicateBlockResponse {

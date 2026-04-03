@@ -304,12 +304,26 @@ impl Client {
             )
             .max_decoding_message_size(100 * 1024 * 1024);
 
+        // Calculate checksums
+        let mut hasher_crc = crc32fast::Hasher::new();
+        hasher_crc.update(&buffer);
+        let checksum_crc32c = hasher_crc.finalize();
+
+        let etag_md5 = format!("{:x}", md5::compute(&buffer));
+
+        let block_checksums = vec![crate::dfs::BlockChecksumInfo {
+            block_id: block.block_id.clone(),
+            checksum_crc32c,
+            actual_size: buffer_len,
+        }];
+
         let next_servers = chunk_servers[1..].to_vec();
 
         let write_req = tonic::Request::new(WriteBlockRequest {
             block_id: block.block_id,
             data: buffer,
             next_servers,
+            expected_checksum_crc32c: checksum_crc32c,
         });
 
         let write_resp = chunk_client.write_block(write_req).await?.into_inner();
@@ -318,13 +332,25 @@ impl Client {
         }
 
         // 5. Complete file
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
         let (complete_resp, _) = self
             .execute_rpc(Some(dest), |mut client| {
                 let dest = dest.to_string();
                 let size = buffer_len;
+                let etag = etag_md5.clone();
+                let blocks = block_checksums.clone();
                 async move {
-                    let complete_req =
-                        tonic::Request::new(CompleteFileRequest { path: dest, size });
+                    let complete_req = tonic::Request::new(CompleteFileRequest {
+                        path: dest,
+                        size,
+                        etag_md5: etag,
+                        created_at_ms: now,
+                        block_checksums: blocks,
+                    });
                     client.complete_file(complete_req).await
                 }
             })
