@@ -67,6 +67,15 @@ struct Args {
 
     #[arg(long)]
     domain_name: Option<String>,
+
+    /// S3 endpoint for snapshot backups (e.g. http://dfs-s3-server:9000).
+    /// If not set, backup is disabled.
+    #[arg(long)]
+    backup_s3_endpoint: Option<String>,
+
+    /// S3 bucket name for snapshot backups.
+    #[arg(long, default_value = "dfs-backups")]
+    backup_bucket: String,
 }
 
 // Axum state for sharing the Raft channel
