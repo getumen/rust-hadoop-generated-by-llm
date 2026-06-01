@@ -71,9 +71,9 @@ S3互換サービスとしての信頼確保。
     - [x] コミット応答を待たずに次のログを先行送信するパイプライニングの実装。
 - [x] **Rack Awareness (Tier 2)** ✅
     - [x] ChunkServerのラック情報をMasterに登録し、ブロックレプリカが異なるラックに配置されるよう `AllocateBlock` を修正。
-- [ ] **Hedged Reads (Tail Latency Mitigation)**
-    - [ ] 1次リクエストの応答が一定時間（例: p95レイテンシ (ms)）来ない場合、別レプリカに投げる並行リクエスト管理。
-    - [ ] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
+- [x] **Hedged Reads (Tail Latency Mitigation)** ✅
+    - [x] 1次リクエストの応答が一定時間（例: p95レイテンシ (ms)）来ない場合、別レプリカに投げる並行リクエスト管理。
+    - [x] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
 
 ### 4. Throughput & Storage Excellence
 - [ ] **io_uring / Zero-Copy Data Path**
