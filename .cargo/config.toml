@@ -3,7 +3,3 @@ rustc-wrapper = "sccache"
 
 [net]
 retry = 3
-
-[http]
-check-revoke = false
-ssl-verify = false

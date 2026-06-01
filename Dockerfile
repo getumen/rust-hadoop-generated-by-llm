@@ -10,10 +10,6 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Inject corporate CA certificates (needed for SSL-inspecting proxies)
-COPY corporate_ca.pem /usr/local/share/ca-certificates/corporate_ca.crt
-RUN update-ca-certificates
-
 # Install sccache for faster incremental builds
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "aarch64" ]; then SCCACHE_ARCH="aarch64-unknown-linux-musl"; else SCCACHE_ARCH="x86_64-unknown-linux-musl"; fi && \
@@ -24,8 +20,6 @@ RUN ARCH=$(uname -m) && \
 ENV RUSTC_WRAPPER=sccache
 ENV SCCACHE_DIR=/sccache
 # Allow cargo to work behind SSL-inspecting corporate proxies
-ENV CARGO_HTTP_SSL_NO_VERIFY=true
-ENV CARGO_UNSTABLE_DISABLE_TLS=0
 
 # Optimize build by caching dependencies
 COPY Cargo.toml Cargo.lock ./
