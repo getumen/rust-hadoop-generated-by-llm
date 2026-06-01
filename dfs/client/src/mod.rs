@@ -678,6 +678,33 @@ impl Client {
         Ok(result)
     }
 
+    /// Read a block range from a single ChunkServer location.
+    /// `length = 0` means read the entire block.
+    async fn read_block_from_location(
+        &self,
+        location: &str,
+        block_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let chunk_server_addr = format!("http://{}", location);
+        let channel = self.connect_endpoint(&chunk_server_addr).await?;
+        let mut client = ChunkServerServiceClient::with_interceptor(
+            channel,
+            dfs_common::telemetry::tracing_interceptor
+                as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+        )
+        .max_decoding_message_size(100 * 1024 * 1024);
+
+        let request = tonic::Request::new(ReadBlockRequest {
+            block_id: block_id.to_string(),
+            offset,
+            length,
+        });
+        let data = client.read_block(request).await?.into_inner().data;
+        Ok(data)
+    }
+
     /// Helper function to fetch a single block from any available location
     pub async fn fetch_single_block(&self, block: &dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
         if block.locations.is_empty() {
@@ -685,47 +712,25 @@ impl Client {
         }
 
         for location in &block.locations {
-            let chunk_server_addr = format!("http://{}", location);
-            match self.connect_endpoint(&chunk_server_addr).await {
-                Ok(channel) => {
-                    let mut client = ChunkServerServiceClient::with_interceptor(
-                        channel,
-                        dfs_common::telemetry::tracing_interceptor
-                            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-                    )
-                    .max_decoding_message_size(100 * 1024 * 1024);
-
-                    let request = tonic::Request::new(ReadBlockRequest {
-                        block_id: block.block_id.clone(),
-                        offset: 0,
-                        length: 0, // Read entire block
-                    });
-
-                    match client.read_block(request).await {
-                        Ok(response) => {
-                            let data = response.into_inner().data;
-                            tracing::debug!(
-                                "Successfully fetched block {} from {}",
-                                block.block_id,
-                                location
-                            );
-                            return Ok(data);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to read block {} from {}: {}",
-                                block.block_id,
-                                location,
-                                e
-                            );
-                            // Try next location
-                            continue;
-                        }
-                    }
+            match self
+                .read_block_from_location(location, &block.block_id, 0, 0)
+                .await
+            {
+                Ok(data) => {
+                    tracing::debug!(
+                        "Successfully fetched block {} from {}",
+                        block.block_id,
+                        location
+                    );
+                    return Ok(data);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to connect to {}: {}", location, e);
-                    continue;
+                    tracing::warn!(
+                        "Failed to read block {} from {}: {}",
+                        block.block_id,
+                        location,
+                        e
+                    );
                 }
             }
         }
@@ -1086,5 +1091,38 @@ impl Client {
             }
         }
         bail!("Failed to refresh ShardMap from any Config server")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_client() -> Client {
+        Client::new(vec!["http://localhost:50051".to_string()], vec![])
+    }
+
+    #[tokio::test]
+    async fn test_read_block_from_location_unreachable_returns_error() {
+        let client = make_client();
+        let result = client
+            .read_block_from_location("localhost:19999", "block-x", 0, 0)
+            .await;
+        assert!(result.is_err(), "Expected error for unreachable server");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_single_block_empty_locations_returns_error() {
+        let client = make_client();
+        let block = crate::dfs::BlockInfo {
+            block_id: "b1".to_string(),
+            size: 0,
+            locations: vec![],
+            checksum_crc32c: 0,
+        };
+        let result = client.fetch_single_block(&block).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no locations"), "Got: {}", msg);
     }
 }
