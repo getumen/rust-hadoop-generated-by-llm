@@ -1660,6 +1660,14 @@ impl RaftNode {
                 // For single-node clusters, this is handled in `become_leader`.
                 // For multi-node, commit_index is advanced in `handle_append_entries_response`.
 
+                // Pipeline: immediately replicate to followers without waiting for next tick.
+                // For multi-node clusters this reduces write latency from up to 100ms to ~0ms.
+                if !self.peers.is_empty() {
+                    if let Err(e) = self.send_heartbeats().await {
+                        tracing::warn!("Immediate replication after ClientRequest failed: {}", e);
+                    }
+                }
+
                 let _ = reply_tx.send(Ok(()));
             }
             Event::GetLeaderInfo { reply_tx } => {
