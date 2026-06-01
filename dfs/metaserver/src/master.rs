@@ -183,6 +183,8 @@ pub struct ChunkServerStatus {
     pub used_space: u64,
     pub available_space: u64,
     pub chunk_count: u64,
+    #[serde(default)]
+    pub rack_id: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1676,6 +1678,7 @@ impl MasterService for MyMaster {
                         used_space: 0,
                         available_space: req.capacity,
                         chunk_count: 0,
+                        rack_id: req.rack_id,
                     },
                 );
             }
@@ -1704,6 +1707,13 @@ impl MasterService for MyMaster {
                 let is_new_chunkserver =
                     !state.chunk_servers.contains_key(&req.chunk_server_address);
 
+                // Preserve existing rack_id (heartbeat doesn't re-send it)
+                let existing_rack_id = state
+                    .chunk_servers
+                    .get(&req.chunk_server_address)
+                    .map(|s| s.rack_id.clone())
+                    .unwrap_or_default();
+
                 state.chunk_servers.insert(
                     req.chunk_server_address.clone(),
                     ChunkServerStatus {
@@ -1711,6 +1721,7 @@ impl MasterService for MyMaster {
                         used_space: req.used_space,
                         available_space: req.available_space,
                         chunk_count: req.chunk_count,
+                        rack_id: existing_rack_id,
                     },
                 );
 
@@ -2905,7 +2916,7 @@ mod tests {
         for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
             state.chunk_servers.insert(
                 addr.to_string(),
-                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1 },
+                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1, rack_id: String::new() },
             );
         }
         state.files.insert(
@@ -2937,7 +2948,7 @@ mod tests {
         for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
             state.chunk_servers.insert(
                 addr.to_string(),
-                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1 },
+                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1, rack_id: String::new() },
             );
         }
         state.files.insert(
@@ -2966,7 +2977,7 @@ mod tests {
         for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
             state.chunk_servers.insert(
                 addr.to_string(),
-                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1 },
+                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1, rack_id: String::new() },
             );
         }
         state.files.insert(
