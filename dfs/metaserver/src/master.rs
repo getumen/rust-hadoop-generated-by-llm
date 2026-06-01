@@ -639,6 +639,22 @@ impl MyMaster {
             }
         });
 
+        // Spawn periodic healer task
+        let state_clone_healer = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
+            loop {
+                interval.tick().await;
+                let mut state_lock = state_clone_healer.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref mut state) = *state_lock {
+                    if !state.is_in_safe_mode() {
+                        tracing::info!("Periodic healer: scanning for under-replicated blocks");
+                        heal_under_replicated_blocks(state);
+                    }
+                }
+            }
+        });
+
         // Spawn transaction cleanup task
         let state_clone_tx = state.clone();
         let raft_tx_clone = raft_tx.clone();
