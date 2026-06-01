@@ -1770,12 +1770,16 @@ impl MasterService for MyMaster {
                 let is_new_chunkserver =
                     !state.chunk_servers.contains_key(&req.chunk_server_address);
 
-                // Preserve existing rack_id (heartbeat doesn't re-send it)
-                let existing_rack_id = state
-                    .chunk_servers
-                    .get(&req.chunk_server_address)
-                    .map(|s| s.rack_id.clone())
-                    .unwrap_or_default();
+                // Use rack_id from heartbeat if provided, otherwise preserve existing
+                let rack_id = if !req.rack_id.is_empty() {
+                    req.rack_id.clone()
+                } else {
+                    state
+                        .chunk_servers
+                        .get(&req.chunk_server_address)
+                        .map(|s| s.rack_id.clone())
+                        .unwrap_or_default()
+                };
 
                 state.chunk_servers.insert(
                     req.chunk_server_address.clone(),
@@ -1784,7 +1788,7 @@ impl MasterService for MyMaster {
                         used_space: req.used_space,
                         available_space: req.available_space,
                         chunk_count: req.chunk_count,
-                        rack_id: existing_rack_id,
+                        rack_id,
                     },
                 );
 

@@ -60,6 +60,11 @@ struct Args {
 
     #[arg(long)]
     domain_name: Option<String>,
+
+    /// Rack identifier for rack-aware replica placement.
+    /// Defaults to empty string (rack unknown).
+    #[arg(long, default_value = "")]
+    rack_id: String,
 }
 
 #[tokio::main]
@@ -234,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
                             available_space,
                             chunk_count,
                             bad_blocks: bad_blocks.clone(),
+                            rack_id: args.rack_id.clone(),
                         });
 
                         match client.heartbeat(request).await {
