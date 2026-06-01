@@ -552,10 +552,17 @@ impl MyMaster {
                         .map(|(addr, _)| addr.clone())
                         .collect();
 
-                    for addr in dead_servers {
+                    for addr in &dead_servers {
                         tracing::warn!("ChunkServer {} is dead (no heartbeat), removing...", addr);
-                        state.chunk_servers.remove(&addr);
-                        state.pending_commands.remove(&addr);
+                        state.chunk_servers.remove(addr);
+                        state.pending_commands.remove(addr);
+                    }
+                    if !dead_servers.is_empty() {
+                        tracing::info!(
+                            "Healer: {} ChunkServer(s) died, scanning for under-replicated blocks",
+                            dead_servers.len()
+                        );
+                        heal_under_replicated_blocks(state);
                     }
                 }
             }
