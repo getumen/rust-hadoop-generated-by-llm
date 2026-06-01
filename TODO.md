@@ -91,7 +91,7 @@ S3互換サービスとしての信頼確保。
 ### 5. Advanced S3 Compatibility
 - [ ] **Object Versioning**: `filename?versionId=...` 形式の履歴管理と削除マーカーの実装。
 - [ ] **Server-Side Encryption (SSE)**: AES-256を用いた保管時暗号化の実装。 *(前提: IAM ポリシー評価の `Condition` キーで暗号化制御を行うため IAM が完了していること)*
-- [ ] **Pre-signed URLs**: 短期間有効な署名付きURLの生成と検証。 *(前提: IAM & STS が完了していること)*
+- [x] **Pre-signed URLs** ✅: 短期間有効な署名付きURLの生成と検証。 *(前提: IAM & STS が完了していること)*
 - [ ] **Bucket Policy**: バケット単位のリソースベースポリシー（`GET/PUT/DELETE /{bucket}?policy`）。 *(前提: IAM ポリシー評価エンジンが完了していること)*
 - [ ] **Virtual-Host Style Routing**: ホスト名ベースのバケット特定とリクエスト正規化。
 - [ ] **Strict Path Normalization**: S3独自のSigV4向けURIエンコード・正規化ルール（RFC 3986をベースにした「S3フレーバー」）への準拠。
