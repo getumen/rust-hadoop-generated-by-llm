@@ -50,6 +50,7 @@ message HeartbeatRequest {
   uint64 used_space = 2;
   uint64 available_space = 3;
   uint64 chunk_count = 4;
+  repeated string bad_blocks = 5;
 }
 
 message HeartbeatResponse {
