@@ -351,6 +351,79 @@ impl MasterState {
     }
 }
 
+/// Select up to `n` chunk servers for replica placement, maximizing rack diversity.
+///
+/// Algorithm:
+/// 1. Sort all candidates by available_space descending (best-first).
+/// 2. Round-robin through racks: in each round, pick the best remaining server
+///    from each rack that hasn't contributed yet in this round.
+/// 3. Stop when `n` servers are selected or candidates exhausted.
+///
+/// Empty rack_id strings are each treated as a unique rack (address-keyed).
+fn select_servers_rack_aware(
+    servers: &[(String, ChunkServerStatus)],
+    n: usize,
+) -> Vec<String> {
+    if n == 0 || servers.is_empty() {
+        return vec![];
+    }
+
+    // Sort candidates by available_space descending
+    let mut candidates: Vec<&(String, ChunkServerStatus)> =
+        servers.iter().collect();
+    candidates.sort_by(|a, b| b.1.available_space.cmp(&a.1.available_space));
+
+    // Group by rack. Empty rack_id → use address as key to avoid grouping them.
+    let mut rack_buckets: HashMap<String, Vec<&(String, ChunkServerStatus)>> =
+        HashMap::new();
+    for s in &candidates {
+        let rack_key = if s.1.rack_id.is_empty() {
+            format!("__addr__{}", s.0)
+        } else {
+            s.1.rack_id.clone()
+        };
+        rack_buckets.entry(rack_key).or_default().push(s);
+    }
+
+    // Collect racks ordered by their best (first) server's available_space.
+    // Tie-breaking between racks with equal best-server space is non-deterministic
+    // (HashMap iteration order), but this is benign — all racks still participate
+    // in the round-robin and any server from a tied rack is equally valid.
+    let racks: Vec<Vec<&(String, ChunkServerStatus)>> = {
+        let mut r: Vec<Vec<&(String, ChunkServerStatus)>> =
+            rack_buckets.into_values().collect();
+        // Sort racks by best server descending
+        r.sort_by(|a, b| {
+            b[0].1.available_space.cmp(&a[0].1.available_space)
+        });
+        r
+    };
+
+    let mut selected: Vec<String> = Vec::with_capacity(n);
+    let mut rack_positions: Vec<usize> = vec![0; racks.len()];
+
+    // Round-robin: each round picks one server per rack
+    'outer: loop {
+        let mut picked_this_round = false;
+        for (rack_idx, rack) in racks.iter().enumerate() {
+            if selected.len() >= n {
+                break 'outer;
+            }
+            let pos = rack_positions[rack_idx];
+            if pos < rack.len() {
+                selected.push(rack[pos].0.clone());
+                rack_positions[rack_idx] += 1;
+                picked_this_round = true;
+            }
+        }
+        if !picked_this_round {
+            break; // All candidates exhausted
+        }
+    }
+
+    selected
+}
+
 /// Schedule replication commands for all blocks with fewer live replicas than REPLICATION_FACTOR.
 /// Considers both dead chunk servers and known-bad block locations.
 fn heal_under_replicated_blocks(state: &mut MasterState) {
@@ -1496,39 +1569,29 @@ impl MasterService for MyMaster {
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
-            let (chunk_servers, block_id) = {
+            let (selected_servers, block_id) = {
                 let state_lock = self.state.lock().expect("Mutex poisoned");
                 if let AppState::Master(ref state) = *state_lock {
                     if !state.files.contains_key(&req.path) {
                         return Err(Status::not_found("File not found"));
                     }
 
-                    // Load balancing: Select chunk servers with most available space
-                    let mut candidates: Vec<(String, u64)> = state
-                        .chunk_servers
-                        .iter()
-                        .map(|(addr, status)| (addr.clone(), status.available_space))
-                        .collect();
-
-                    if candidates.is_empty() {
+                    if state.chunk_servers.is_empty() {
                         return Err(Status::unavailable("No chunk servers available"));
                     }
 
-                    // Sort by available space descending
-                    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                    let candidates: Vec<(String, ChunkServerStatus)> = state
+                        .chunk_servers
+                        .iter()
+                        .map(|(addr, status)| (addr.clone(), status.clone()))
+                        .collect();
 
-                    let chunk_servers: Vec<String> =
-                        candidates.into_iter().map(|(addr, _)| addr).collect();
-                    (chunk_servers, Uuid::new_v4().to_string())
+                    let selected = select_servers_rack_aware(&candidates, REPLICATION_FACTOR);
+                    (selected, Uuid::new_v4().to_string())
                 } else {
                     return Err(Status::internal("Wrong state type"));
                 }
             };
-
-            // Select chunk servers
-            let num_replicas = std::cmp::min(REPLICATION_FACTOR, chunk_servers.len());
-            let selected_servers: Vec<String> =
-                chunk_servers.iter().take(num_replicas).cloned().collect();
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             if self
@@ -3003,5 +3066,101 @@ mod tests {
         // but all 3 servers are already in block.locations so no unused target exists
         heal_under_replicated_blocks(&mut state);
         assert!(state.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn test_rack_aware_selection_spreads_across_racks() {
+        // 3 servers on 3 different racks — should pick one per rack
+        let servers = vec![
+            ("cs1:50051".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 1_000_000, chunk_count: 0,
+                rack_id: "rack-a".to_string(),
+            }),
+            ("cs2:50052".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 900_000, chunk_count: 0,
+                rack_id: "rack-b".to_string(),
+            }),
+            ("cs3:50053".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 800_000, chunk_count: 0,
+                rack_id: "rack-c".to_string(),
+            }),
+        ];
+        let selected = select_servers_rack_aware(&servers, 3);
+        assert_eq!(selected.len(), 3);
+        // All 3 racks represented
+        let racks: std::collections::HashSet<String> = selected.iter()
+            .map(|addr| {
+                servers.iter().find(|(a, _)| a == addr).unwrap().1.rack_id.clone()
+            })
+            .collect();
+        assert_eq!(racks.len(), 3, "All 3 racks should be represented");
+    }
+
+    #[test]
+    fn test_rack_aware_selection_fallback_to_same_rack() {
+        // 3 servers on only 2 racks — need 3 replicas, must pick 2 from one rack
+        let servers = vec![
+            ("cs1:50051".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 1_000_000, chunk_count: 0,
+                rack_id: "rack-a".to_string(),
+            }),
+            ("cs2:50052".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 900_000, chunk_count: 0,
+                rack_id: "rack-a".to_string(),
+            }),
+            ("cs3:50053".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 800_000, chunk_count: 0,
+                rack_id: "rack-b".to_string(),
+            }),
+        ];
+        let selected = select_servers_rack_aware(&servers, 3);
+        assert_eq!(selected.len(), 3);
+        // All 3 servers picked (no duplicates)
+        let unique: std::collections::HashSet<&String> = selected.iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn test_rack_aware_selection_empty_rack_id_treated_as_distinct() {
+        // Servers with empty rack_id should each be treated as their own rack
+        let servers = vec![
+            ("cs1:50051".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 1_000_000, chunk_count: 0,
+                rack_id: "".to_string(),
+            }),
+            ("cs2:50052".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 900_000, chunk_count: 0,
+                rack_id: "".to_string(),
+            }),
+        ];
+        let selected = select_servers_rack_aware(&servers, 2);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn test_rack_aware_selection_fewer_servers_than_replicas() {
+        // Only 2 servers but want 3 replicas — return all 2
+        let servers = vec![
+            ("cs1:50051".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 1_000_000, chunk_count: 0,
+                rack_id: "rack-a".to_string(),
+            }),
+            ("cs2:50052".to_string(), ChunkServerStatus {
+                last_heartbeat: 9_999_999_999_999,
+                used_space: 0, available_space: 900_000, chunk_count: 0,
+                rack_id: "rack-b".to_string(),
+            }),
+        ];
+        let selected = select_servers_rack_aware(&servers, 3);
+        assert_eq!(selected.len(), 2);
     }
 }
