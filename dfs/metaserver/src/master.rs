@@ -1724,6 +1724,23 @@ impl MasterService for MyMaster {
                     state.exit_safe_mode();
                 }
 
+                // Process bad block reports from the ChunkServer's scrubber
+                if !req.bad_blocks.is_empty() {
+                    tracing::warn!(
+                        "Heartbeat: {} bad block(s) reported by {}",
+                        req.bad_blocks.len(),
+                        req.chunk_server_address
+                    );
+                    for block_id in &req.bad_blocks {
+                        state
+                            .bad_block_locations
+                            .entry(block_id.clone())
+                            .or_default()
+                            .insert(req.chunk_server_address.clone());
+                    }
+                    heal_under_replicated_blocks(state);
+                }
+
                 // Retrieve pending commands
                 let commands = state
                     .pending_commands
