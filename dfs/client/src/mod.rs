@@ -31,6 +31,8 @@ pub struct Client {
     initial_backoff_ms: u64,
     ca_cert_path: Option<String>,
     domain_name: Option<String>,
+    /// Hedge delay in milliseconds. None = hedging disabled.
+    hedge_delay_ms: Option<u64>,
 }
 
 impl Client {
@@ -45,6 +47,7 @@ impl Client {
             initial_backoff_ms: INITIAL_BACKOFF_MS,
             ca_cert_path: None,
             domain_name: None,
+            hedge_delay_ms: None,
         }
     }
 
@@ -61,6 +64,14 @@ impl Client {
     pub fn with_retry_config(mut self, max_retries: usize, initial_backoff_ms: u64) -> Self {
         self.max_retries = max_retries;
         self.initial_backoff_ms = initial_backoff_ms;
+        self
+    }
+
+    /// Enable hedged reads: if the primary replica doesn't respond within
+    /// `delay_ms` milliseconds, a second request is launched to the next replica.
+    /// The first successful response wins.
+    pub fn with_hedge_delay(mut self, delay_ms: u64) -> Self {
+        self.hedge_delay_ms = Some(delay_ms);
         self
     }
 
@@ -705,37 +716,126 @@ impl Client {
         Ok(data)
     }
 
+    /// Read a block range from the given locations, applying hedging if configured.
+    /// Tries locations sequentially (or with hedge delay) until one succeeds.
+    async fn read_block_range(
+        &self,
+        locations: &[String],
+        block_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        if locations.is_empty() {
+            bail!("Block {} has no locations", block_id);
+        }
+
+        let hedge_delay = match self.hedge_delay_ms {
+            Some(d) if locations.len() > 1 => tokio::time::Duration::from_millis(d),
+            _ => {
+                for location in locations {
+                    match self
+                        .read_block_from_location(location, block_id, offset, length)
+                        .await
+                    {
+                        Ok(data) => return Ok(data),
+                        Err(e) => tracing::warn!(
+                            "Failed to read block {} from {}: {}", block_id, location, e
+                        ),
+                    }
+                }
+                bail!("Failed to read block {} from any location", block_id);
+            }
+        };
+
+        // Hedged path: spawn primary, race against hedge delay.
+        let self1 = self.clone();
+        let bid1 = block_id.to_string();
+        let loc0 = locations[0].clone();
+        let mut primary = tokio::spawn(async move {
+            self1.read_block_from_location(&loc0, &bid1, offset, length).await
+        });
+
+        tokio::select! {
+            result = &mut primary => {
+                let r = result.unwrap_or_else(|e| Err(anyhow::anyhow!("Task error: {}", e)));
+                if r.is_ok() {
+                    // Primary succeeded before hedge delay — no need to hedge.
+                    return r;
+                }
+                tracing::warn!(
+                    "Primary fast-failed for block {}, launching hedge immediately",
+                    block_id
+                );
+                // Fall through to launch hedge even though deadline hasn't fired.
+            }
+            _ = tokio::time::sleep(hedge_delay) => {
+                tracing::debug!("Hedge triggered for block {} after {:?}", block_id, hedge_delay);
+            }
+        }
+
+        // Primary is slow — launch hedge to the next location.
+        let self2 = self.clone();
+        let bid2 = block_id.to_string();
+        let loc1 = locations[1].clone();
+        let mut hedge = tokio::spawn(async move {
+            self2.read_block_from_location(&loc1, &bid2, offset, length).await
+        });
+
+        // Race primary against hedge — first success wins.
+        // If the first to complete fails, wait for the sibling before giving up.
+        let result = tokio::select! {
+            result = &mut primary => {
+                let r = result.unwrap_or_else(|e| Err(anyhow::anyhow!("Primary task error: {}", e)));
+                if r.is_ok() {
+                    hedge.abort();
+                    return r;
+                }
+                tracing::warn!("Primary hedged read failed for block {}, waiting for hedge", block_id);
+                // Primary failed — give the hedge a chance to finish
+                hedge.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)))
+            }
+            result = &mut hedge => {
+                let r = result.unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)));
+                if r.is_ok() {
+                    primary.abort();
+                    return r;
+                }
+                tracing::warn!("Hedge read failed for block {}, waiting for primary", block_id);
+                // Hedge failed — give the primary a chance to finish
+                primary.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Primary task error: {}", e)))
+            }
+        };
+
+        if result.is_ok() {
+            return result;
+        }
+
+        // Both hedged replicas failed — fall back to remaining replicas sequentially.
+        tracing::warn!(
+            "Hedged read failed for block {} (first 2 replicas), trying remaining",
+            block_id
+        );
+        for location in locations.iter().skip(2) {
+            match self
+                .read_block_from_location(location, block_id, offset, length)
+                .await
+            {
+                Ok(data) => return Ok(data),
+                Err(e) => tracing::warn!(
+                    "Failed to read block {} from {}: {}", block_id, location, e
+                ),
+            }
+        }
+
+        bail!("Failed to read block {} from any location", block_id)
+    }
+
     /// Helper function to fetch a single block from any available location
     pub async fn fetch_single_block(&self, block: &dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
         if block.locations.is_empty() {
             bail!("Block {} has no locations", block.block_id);
         }
-
-        for location in &block.locations {
-            match self
-                .read_block_from_location(location, &block.block_id, 0, 0)
-                .await
-            {
-                Ok(data) => {
-                    tracing::debug!(
-                        "Successfully fetched block {} from {}",
-                        block.block_id,
-                        location
-                    );
-                    return Ok(data);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read block {} from {}: {}",
-                        block.block_id,
-                        location,
-                        e
-                    );
-                }
-            }
-        }
-
-        bail!("Failed to read block {} from any location", block.block_id)
+        self.read_block_range(&block.locations, &block.block_id, 0, 0).await
     }
 
     pub async fn exists(
@@ -1124,5 +1224,49 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("no locations"), "Got: {}", msg);
+    }
+
+    #[test]
+    fn test_client_hedge_delay_default_is_none() {
+        let client = make_client();
+        assert!(client.hedge_delay_ms.is_none());
+    }
+
+    #[test]
+    fn test_client_with_hedge_delay_sets_field() {
+        let client = make_client().with_hedge_delay(50);
+        assert_eq!(client.hedge_delay_ms, Some(50));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_single_block_no_hedge_when_one_location() {
+        // With hedge enabled but only 1 location, should still work (no panic)
+        let client = make_client().with_hedge_delay(1);
+        let block = crate::dfs::BlockInfo {
+            block_id: "b1".to_string(),
+            size: 0,
+            locations: vec!["localhost:19999".to_string()], // unreachable
+            checksum_crc32c: 0,
+        };
+        // Should fail gracefully (not panic) even with hedge enabled
+        let result = client.fetch_single_block(&block).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_single_block_hedge_disabled_with_two_locations() {
+        // Hedge disabled: tries locations sequentially, both unreachable → error
+        let client = make_client(); // no hedge
+        let block = crate::dfs::BlockInfo {
+            block_id: "b2".to_string(),
+            size: 0,
+            locations: vec![
+                "localhost:19997".to_string(),
+                "localhost:19998".to_string(),
+            ],
+            checksum_crc32c: 0,
+        };
+        let result = client.fetch_single_block(&block).await;
+        assert!(result.is_err());
     }
 }
