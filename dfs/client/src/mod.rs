@@ -412,49 +412,10 @@ impl Client {
 
         // 2. Read blocks from ChunkServers
         for block in metadata.blocks {
-            if block.locations.is_empty() {
-                tracing::warn!("Block {} has no locations", block.block_id);
-                continue;
-            }
-
-            let mut success = false;
-            for location in &block.locations {
-                let chunk_server_addr = format!("http://{}", location);
-                match self.connect_endpoint(&chunk_server_addr).await {
-                    Ok(channel) => {
-                        let mut client = ChunkServerServiceClient::with_interceptor(
-                            channel,
-                            dfs_common::telemetry::tracing_interceptor
-                                as fn(
-                                    tonic::Request<()>,
-                                )
-                                    -> Result<tonic::Request<()>, tonic::Status>,
-                        )
-                        .max_decoding_message_size(100 * 1024 * 1024);
-                        let request = tonic::Request::new(ReadBlockRequest {
-                            block_id: block.block_id.clone(),
-                            offset: 0,
-                            length: 0, // 0 means read entire block
-                        });
-                        match client.read_block(request).await {
-                            Ok(response) => {
-                                let data = response.into_inner().data;
-                                file.write_all(&data)?;
-                                success = true;
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to read block from {}: {}", location, e)
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
-                }
-            }
-
-            if !success {
-                bail!("Failed to read block {} from any location", block.block_id);
-            }
+            let data = self
+                .read_block_range(&block.locations, &block.block_id, 0, 0)
+                .await?;
+            file.write_all(&data)?;
         }
 
         Ok(())
@@ -516,11 +477,6 @@ impl Client {
                 block.locations
             );
 
-            if block.locations.is_empty() {
-                tracing::warn!("Block {} has no locations", block.block_id);
-                continue;
-            }
-
             // Calculate this block's position in the file
             let block_start = file_position;
             let block_end = file_position + block.size;
@@ -555,56 +511,10 @@ impl Client {
                 block_length
             );
 
-            let mut success = false;
-            for location in &block.locations {
-                let chunk_server_addr = format!("http://{}", location);
-                match self.connect_endpoint(&chunk_server_addr).await {
-                    Ok(channel) => {
-                        let mut client = ChunkServerServiceClient::with_interceptor(
-                            channel,
-                            dfs_common::telemetry::tracing_interceptor
-                                as fn(
-                                    tonic::Request<()>,
-                                )
-                                    -> Result<tonic::Request<()>, tonic::Status>,
-                        )
-                        .max_decoding_message_size(100 * 1024 * 1024);
-                        let request = tonic::Request::new(ReadBlockRequest {
-                            block_id: block.block_id.clone(),
-                            offset: block_offset,
-                            length: block_length,
-                        });
-                        match client.read_block(request).await {
-                            Ok(response) => {
-                                let resp = response.into_inner();
-                                tracing::debug!(
-                                    "Read {} bytes from block {} (offset={}, length={})",
-                                    resp.bytes_read,
-                                    block.block_id,
-                                    block_offset,
-                                    block_length
-                                );
-                                result.extend_from_slice(&resp.data);
-                                success = true;
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to read block from {}: {}", location, e)
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("Failed to connect to {}: {}", location, e),
-                }
-            }
-
-            if !success {
-                tracing::error!(
-                    "Failed to read block {} from any location (tried {} locations)",
-                    block.block_id,
-                    block.locations.len()
-                );
-                bail!("Failed to read block {} from any location", block.block_id);
-            }
+            let data = self
+                .read_block_range(&block.locations, &block.block_id, block_offset, block_length)
+                .await?;
+            result.extend_from_slice(&data);
         }
 
         tracing::info!(
