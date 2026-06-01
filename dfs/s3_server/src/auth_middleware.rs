@@ -87,6 +87,8 @@ pub async fn auth_middleware(
     let query_params: BTreeMap<String, String> =
         serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
 
+    let is_presigned = query_params.contains_key("X-Amz-Expires");
+
     let normalized_query_string = normalize_query_string(query_string_raw);
 
     // 4. Parse credentials
@@ -110,27 +112,52 @@ pub async fn auth_middleware(
         }
     };
 
-    // 5. Clock Skew Validation
+    // 5. Clock Skew / Expiry Validation
     if let Ok(req_time) = DateTime::parse_from_rfc3339(&credentials.timestamp)
         .or_else(|_| DateTime::parse_from_str(&credentials.timestamp, "%Y%m%dT%H%M%SZ"))
     {
         let now = Utc::now();
-        let skew = (now - req_time.with_timezone(&Utc)).num_minutes().abs();
-        if skew > 15 {
-            let err = AuthError::RequestTimeTooSkewed {
-                server_time: now.to_rfc3339(),
-                request_time: req_time.to_rfc3339(),
-            };
-            IAM_AUTH_REQUESTS
-                .with_label_values(&["failure", "clock_skew"])
-                .inc();
-            IAM_AUTH_DURATION
-                .with_label_values(&["failure"])
-                .observe(auth_timer.elapsed().as_secs_f64());
-            let res = s3_error_response(err.clone());
-            let (err_code, _) = err.to_s3_error();
-            audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-            return res;
+        if is_presigned {
+            let expires_secs: i64 = query_params
+                .get("X-Amz-Expires")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let expiry = req_time.with_timezone(&Utc)
+                + chrono::Duration::seconds(expires_secs);
+            if now > expiry {
+                IAM_AUTH_REQUESTS
+                    .with_label_values(&["failure", "expired_token"])
+                    .inc();
+                IAM_AUTH_DURATION
+                    .with_label_values(&["failure"])
+                    .observe(auth_timer.elapsed().as_secs_f64());
+                let res = s3_error_response(AuthError::ExpiredToken);
+                audit_ctx.log(
+                    &state,
+                    res.status().as_u16(),
+                    Some("ExpiredToken".to_string()),
+                    &query_params,
+                );
+                return res;
+            }
+        } else {
+            let skew = (now - req_time.with_timezone(&Utc)).num_minutes().abs();
+            if skew > 15 {
+                let err = AuthError::RequestTimeTooSkewed {
+                    server_time: now.to_rfc3339(),
+                    request_time: req_time.to_rfc3339(),
+                };
+                IAM_AUTH_REQUESTS
+                    .with_label_values(&["failure", "clock_skew"])
+                    .inc();
+                IAM_AUTH_DURATION
+                    .with_label_values(&["failure"])
+                    .observe(auth_timer.elapsed().as_secs_f64());
+                let res = s3_error_response(err.clone());
+                let (err_code, _) = err.to_s3_error();
+                audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
+                return res;
+            }
         }
     }
 
@@ -292,7 +319,7 @@ pub async fn auth_middleware(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "UNSIGNED-PAYLOAD".to_string());
 
-    if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload {
+    if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload && !is_presigned {
         IAM_AUTH_REQUESTS
             .with_label_values(&["failure", "missing_auth"])
             .inc();
@@ -604,6 +631,7 @@ fn normalize_query_string(query_string_raw: &str) -> String {
     let mut raw_query_pairs: Vec<(&str, &str)> = query_string_raw
         .split('&')
         .filter(|s| !s.is_empty())
+        .filter(|s| !s.starts_with("X-Amz-Signature=") && *s != "X-Amz-Signature")
         .map(|pair| {
             let mut split = pair.splitn(2, '=');
             let k = split.next().unwrap_or("");
@@ -622,6 +650,37 @@ fn normalize_query_string(query_string_raw: &str) -> String {
         normalized_query_parts.push(format!("{}={}", k, v));
     }
     normalized_query_parts.join("&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_query_string_excludes_x_amz_signature() {
+        let raw = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc123&X-Amz-Expires=3600";
+        let normalized = normalize_query_string(raw);
+        assert!(!normalized.contains("X-Amz-Signature"), "Got: {}", normalized);
+        assert!(normalized.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "Got: {}", normalized);
+        assert!(normalized.contains("X-Amz-Expires=3600"), "Got: {}", normalized);
+    }
+
+    #[test]
+    fn test_normalize_query_string_sorts_params() {
+        let raw = "Z-Param=z&A-Param=a";
+        let normalized = normalize_query_string(raw);
+        let a_idx = normalized.find("A-Param").unwrap();
+        let z_idx = normalized.find("Z-Param").unwrap();
+        assert!(a_idx < z_idx, "A should come before Z, got: {}", normalized);
+    }
+
+    #[test]
+    fn test_normalize_query_string_without_signature_unchanged() {
+        let raw = "list-type=2&prefix=foo";
+        let normalized = normalize_query_string(raw);
+        assert!(normalized.contains("list-type=2"), "Got: {}", normalized);
+        assert!(normalized.contains("prefix=foo"), "Got: {}", normalized);
+    }
 }
 
 /// Map AuthError variants to metric-friendly error_type labels.
