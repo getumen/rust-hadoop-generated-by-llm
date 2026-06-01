@@ -145,6 +145,8 @@ async fn main() -> anyhow::Result<()> {
         inbox: raft_rx,
         self_tx: raft_tx_for_node,
         ca_cert_path: args.ca_cert.clone(),
+        backup_s3_endpoint: args.backup_s3_endpoint.clone(),
+        backup_bucket: args.backup_bucket.clone(),
     });
 
     // Start Raft Node

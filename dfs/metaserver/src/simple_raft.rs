@@ -614,6 +614,11 @@ pub struct RaftNode {
     pub last_committed_config_index: usize,
     /// Monotonic time counter (for tracking timeouts and progress).
     pub monotonic_time: u64,
+
+    /// S3 endpoint for snapshot backups (None = disabled).
+    pub backup_s3_endpoint: Option<String>,
+    /// S3 bucket name for snapshot backups.
+    pub backup_bucket: String,
 }
 
 pub struct RaftNodeConfig {
@@ -625,6 +630,8 @@ pub struct RaftNodeConfig {
     pub inbox: mpsc::Receiver<Event>,
     pub self_tx: mpsc::Sender<Event>,
     pub ca_cert_path: Option<String>,
+    pub backup_s3_endpoint: Option<String>,
+    pub backup_bucket: String,
 }
 
 impl RaftNode {
@@ -638,6 +645,8 @@ impl RaftNode {
             inbox,
             self_tx,
             ca_cert_path,
+            backup_s3_endpoint,
+            backup_bucket,
         } = config;
         let path = format!("{}/raft_node_{}", storage_dir, id);
         let db = DB::open_default(&path).expect("Failed to open RocksDB");
@@ -734,6 +743,8 @@ impl RaftNode {
             catch_up_progress: HashMap::new(),
             last_committed_config_index: 0,
             monotonic_time: 0,
+            backup_s3_endpoint,
+            backup_bucket,
         }
     }
 
@@ -1144,6 +1155,62 @@ impl RaftNode {
         const SNAPSHOT_THRESHOLD: usize = 100;
         if self.log.len() > SNAPSHOT_THRESHOLD && self.last_applied > self.last_included_index {
             self.create_snapshot()?;
+            // Upload snapshot to S3 if this is the leader and backup is configured
+            if self.role == Role::Leader && self.backup_s3_endpoint.is_some() {
+                let db = self.db.clone();
+                let endpoint = self.backup_s3_endpoint.clone().unwrap();
+                let bucket = self.backup_bucket.clone();
+                let id = self.id;
+                let last_included_index = self.last_included_index;
+                tokio::spawn(async move {
+                    let snapshot_data = match db.get(b"snapshot_data") {
+                        Ok(Some(data)) => data,
+                        Ok(None) => {
+                            tracing::debug!("Backup: no snapshot_data found after snapshot creation");
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Backup: failed to read snapshot_data: {}", e);
+                            return;
+                        }
+                    };
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let key = format!(
+                        "master-snapshots/node-{}/{}--idx{}.bin",
+                        id, timestamp, last_included_index
+                    );
+                    let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
+                    tracing::info!("Backup: uploading snapshot to {}", url);
+                    match reqwest::Client::new()
+                        .put(&url)
+                        .header("Content-Type", "application/octet-stream")
+                        .body(snapshot_data)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            tracing::info!(
+                                "Backup: snapshot uploaded successfully (node={}, idx={})",
+                                id,
+                                last_included_index
+                            );
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                "Backup: S3 upload returned status {} for {}",
+                                resp.status(),
+                                url
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Backup: S3 upload failed: {}", e);
+                        }
+                    }
+                });
+            }
         }
         Ok(())
     }
