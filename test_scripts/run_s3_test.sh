@@ -91,6 +91,10 @@ if [ ! -f "$DFS_CLI" ]; then
     echo "Building dfs_cli..."
     cargo build -p dfs-client --release 2>/dev/null || cargo build --release 2>/dev/null
 fi
+if [ ! -f "$DFS_CLI" ]; then
+    echo "✗ Failed to build dfs_cli binary at $DFS_CLI" >&2
+    exit 1
+fi
 
 # 5a. Create bucket and upload test object using aws CLI (or curl if aws not available)
 echo "Creating bucket '$PRESIGN_BUCKET'..."
@@ -104,18 +108,26 @@ else
         -H "Authorization: AWS dummy:dummy" \
         -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
         -o /dev/null || true
-    echo "$PRESIGN_CONTENT" | curl -s -X PUT "$S3_ENDPOINT/$PRESIGN_BUCKET/$PRESIGN_KEY" \
+    UPLOAD_STATUS=$(echo "$PRESIGN_CONTENT" | curl -s -o /dev/null -w '%{http_code}' -X PUT \
         -H "Authorization: AWS dummy:dummy" \
         -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+        -H "Content-Type: text/plain" \
         --data-binary @- \
-        -o /dev/null
-    presign_pass "Object uploaded (curl fallback) to s3://$PRESIGN_BUCKET/$PRESIGN_KEY"
+        "$S3_ENDPOINT/$PRESIGN_BUCKET/$PRESIGN_KEY")
+    if [ "$UPLOAD_STATUS" = "200" ] || [ "$UPLOAD_STATUS" = "204" ] || [ "$UPLOAD_STATUS" = "201" ]; then
+        presign_pass "Object uploaded (curl fallback) to s3://$PRESIGN_BUCKET/$PRESIGN_KEY"
+    else
+        presign_fail "Object upload failed (HTTP $UPLOAD_STATUS)"
+    fi
 fi
 
 # 5b. Generate presigned GET URL
 echo "Generating presigned GET URL..."
+set +e
 PRESIGNED_GET_URL=$("$DFS_CLI" presign "s3://$PRESIGN_BUCKET/$PRESIGN_KEY" --method GET --expires 300 2>&1)
-if [ $? -ne 0 ] || [ -z "$PRESIGNED_GET_URL" ]; then
+PRESIGN_CLI_EXIT=$?
+set -e
+if [ $PRESIGN_CLI_EXIT -ne 0 ] || [ -z "$PRESIGNED_GET_URL" ]; then
     presign_fail "Failed to generate presigned GET URL: $PRESIGNED_GET_URL"
 else
     presign_pass "Generated presigned GET URL"
@@ -137,8 +149,11 @@ fi
 
 # 5d. Generate presigned DELETE URL
 echo "Generating presigned DELETE URL..."
+set +e
 PRESIGNED_DELETE_URL=$("$DFS_CLI" presign "s3://$PRESIGN_BUCKET/$PRESIGN_KEY" --method DELETE --expires 300 2>&1)
-if [ $? -ne 0 ] || [ -z "$PRESIGNED_DELETE_URL" ]; then
+PRESIGN_CLI_EXIT=$?
+set -e
+if [ $PRESIGN_CLI_EXIT -ne 0 ] || [ -z "$PRESIGNED_DELETE_URL" ]; then
     presign_fail "Failed to generate presigned DELETE URL: $PRESIGNED_DELETE_URL"
 else
     presign_pass "Generated presigned DELETE URL"
