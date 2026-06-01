@@ -658,11 +658,12 @@ impl Client {
         };
 
         // Hedged path: spawn primary, race against hedge delay.
+        let mut primary_done = false;
         let self1 = self.clone();
-        let bid1 = block_id.to_string();
+        let bid = block_id.to_string();
         let loc0 = locations[0].clone();
         let mut primary = tokio::spawn(async move {
-            self1.read_block_from_location(&loc0, &bid1, offset, length).await
+            self1.read_block_from_location(&loc0, &bid, offset, length).await
         });
 
         tokio::select! {
@@ -676,14 +677,15 @@ impl Client {
                     "Primary fast-failed for block {}, launching hedge immediately",
                     block_id
                 );
-                // Fall through to launch hedge even though deadline hasn't fired.
+                // Mark primary as exhausted so we don't re-poll it below.
+                primary_done = true;
             }
             _ = tokio::time::sleep(hedge_delay) => {
                 tracing::debug!("Hedge triggered for block {} after {:?}", block_id, hedge_delay);
             }
         }
 
-        // Primary is slow — launch hedge to the next location.
+        // Launch hedge to the next location.
         let self2 = self.clone();
         let bid2 = block_id.to_string();
         let loc1 = locations[1].clone();
@@ -691,33 +693,73 @@ impl Client {
             self2.read_block_from_location(&loc1, &bid2, offset, length).await
         });
 
-        // Race primary against hedge — first success wins.
-        // If the first to complete fails, wait for the sibling before giving up.
-        let result = tokio::select! {
-            result = &mut primary => {
-                let r = result.unwrap_or_else(|e| Err(anyhow::anyhow!("Primary task error: {}", e)));
-                if r.is_ok() {
+        if primary_done {
+            // Primary already exhausted — only hedge can help.
+            primary.abort(); // no-op since already done, but explicit
+            let hr = hedge
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)));
+            if hr.is_ok() {
+                return hr;
+            }
+            tracing::warn!("Hedge also failed for block {}", block_id);
+            // Fall through to sequential fallback below.
+        } else {
+            // Both are still running — race them.
+            // Collect which finished first and its result, then handle the sibling OUTSIDE
+            // the select! to keep this future cancellation-safe.
+            enum Winner {
+                Primary(anyhow::Result<Vec<u8>>),
+                Hedge(anyhow::Result<Vec<u8>>),
+            }
+
+            let winner = tokio::select! {
+                result = &mut primary => Winner::Primary(
+                    result.unwrap_or_else(|e| Err(anyhow::anyhow!("Primary task error: {}", e)))
+                ),
+                result = &mut hedge => Winner::Hedge(
+                    result.unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)))
+                ),
+            };
+
+            match winner {
+                Winner::Primary(r) if r.is_ok() => {
                     hedge.abort();
                     return r;
                 }
-                tracing::warn!("Primary hedged read failed for block {}, waiting for hedge", block_id);
-                // Primary failed — give the hedge a chance to finish
-                hedge.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)))
-            }
-            result = &mut hedge => {
-                let r = result.unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)));
-                if r.is_ok() {
+                Winner::Hedge(r) if r.is_ok() => {
                     primary.abort();
                     return r;
                 }
-                tracing::warn!("Hedge read failed for block {}, waiting for primary", block_id);
-                // Hedge failed — give the primary a chance to finish
-                primary.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Primary task error: {}", e)))
+                Winner::Primary(_) => {
+                    tracing::warn!(
+                        "Primary hedged read failed for block {}, waiting for hedge",
+                        block_id
+                    );
+                    let hr = hedge
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("Hedge task error: {}", e)));
+                    if hr.is_ok() {
+                        return hr;
+                    }
+                    tracing::warn!("Hedge also failed for block {}", block_id);
+                    // Fall through to sequential fallback below.
+                }
+                Winner::Hedge(_) => {
+                    tracing::warn!(
+                        "Hedge read failed for block {}, waiting for primary",
+                        block_id
+                    );
+                    let pr = primary
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("Primary task error: {}", e)));
+                    if pr.is_ok() {
+                        return pr;
+                    }
+                    tracing::warn!("Primary also failed for block {}", block_id);
+                    // Fall through to sequential fallback below.
+                }
             }
-        };
-
-        if result.is_ok() {
-            return result;
         }
 
         // Both hedged replicas failed — fall back to remaining replicas sequentially.
