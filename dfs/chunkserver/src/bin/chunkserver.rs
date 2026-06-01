@@ -173,6 +173,12 @@ async fn main() -> anyhow::Result<()> {
                 shard_map.get_all_masters()
             };
 
+            // Drain any bad blocks detected by the scrubber
+            let bad_blocks = {
+                let mut pending = chunk_server_heartbeat.pending_bad_blocks.lock().expect("Mutex poisoned");
+                std::mem::take(&mut *pending)
+            };
+
             for master_addr in masters {
                 let mut master_url = master_addr.clone();
                 if args.ca_cert.is_some() && !master_url.starts_with("https://") {
@@ -227,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
                             used_space,
                             available_space,
                             chunk_count,
+                            bad_blocks: bad_blocks.clone(),
                         });
 
                         match client.heartbeat(request).await {

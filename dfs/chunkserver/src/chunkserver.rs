@@ -28,6 +28,8 @@ pub struct MyChunkServer {
     block_cache: Arc<Mutex<LruCache<String, CachedBlock>>>,
     ca_cert_path: Option<String>,
     domain_name: Option<String>,
+    /// Corrupted block IDs detected by the scrubber, waiting to be reported to Master.
+    pub pending_bad_blocks: Arc<Mutex<Vec<String>>>,
 }
 
 impl MyChunkServer {
@@ -73,6 +75,7 @@ impl MyChunkServer {
             block_cache,
             ca_cert_path,
             domain_name,
+            pending_bad_blocks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -426,6 +429,11 @@ impl MyChunkServer {
 
             match result {
                 Ok(corrupted_blocks) => {
+                    // Queue for reporting to Master via next heartbeat
+                    {
+                        let mut pending = server.pending_bad_blocks.lock().expect("Mutex poisoned");
+                        pending.extend(corrupted_blocks.iter().cloned());
+                    }
                     for block_id in corrupted_blocks {
                         tracing::info!("Attempting background recovery for block {}", block_id);
                         if let Err(e) = server.recover_block(&block_id).await {
