@@ -69,9 +69,8 @@ S3互換サービスとしての信頼確保。
 - [x] **Raft Optimizations (Batching & Pipelining)** ✅
     - [x] `simple_raft.rs` の `AppendEntries` をバッチ化し、1回のDisk I/Oで複数ログを処理。
     - [x] コミット応答を待たずに次のログを先行送信するパイプライニングの実装。
-- [ ] **Rack Awareness**
-    - [ ] ChunkServer登録時にラックID（例: `/rack-1/host-1`）をメタデータに追加。
-    - [ ] レプリカ配置時に「少なくとも1つは別ラック」とするプレイスメント・ポリシーの実装。
+- [x] **Rack Awareness (Tier 2)** ✅
+    - [x] ChunkServerのラック情報をMasterに登録し、ブロックレプリカが異なるラックに配置されるよう `AllocateBlock` を修正。
 - [ ] **Hedged Reads (Tail Latency Mitigation)**
     - [ ] 1次リクエストの応答が一定時間（例: p95レイテンシ (ms)）来ない場合、別レプリカに投げる並行リクエスト管理。
     - [ ] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
