@@ -427,11 +427,29 @@ async fn main() -> anyhow::Result<()> {
 
             let (bucket, key) = parse_s3_url(&url)?;
 
+            let method_upper = method.to_uppercase();
+            if !["GET", "PUT", "DELETE"].contains(&method_upper.as_str()) {
+                anyhow::bail!(
+                    "Unsupported method '{}'. Supported methods: GET, PUT, DELETE",
+                    method
+                );
+            }
+
+            if expires == 0 {
+                anyhow::bail!("--expires must be at least 1 second");
+            }
+            if expires > 604_800 {
+                anyhow::bail!(
+                    "--expires {} exceeds the maximum of 604800 seconds (7 days)",
+                    expires
+                );
+            }
+
             let params = dfs_common::auth::presign::PresignParams {
                 endpoint: &endpoint_url,
                 bucket: &bucket,
                 key: &key,
-                method: &method.to_uppercase(),
+                method: &method_upper,
                 access_key: &access_key,
                 secret_key: &secret_key,
                 region: &region,
@@ -688,6 +706,17 @@ mod tests {
     #[test]
     fn test_parse_s3_url_invalid_no_key() {
         assert!(super::parse_s3_url("s3://").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_empty_key_after_slash() {
+        assert!(super::parse_s3_url("s3://bucket/").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_empty_bucket() {
+        // "s3:///key" has empty bucket
+        assert!(super::parse_s3_url("s3:///key").is_err());
     }
 }
 
