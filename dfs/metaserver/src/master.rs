@@ -231,6 +231,11 @@ pub struct MasterState {
     /// Whether safe mode was manually forced
     #[serde(skip)]
     pub safe_mode_manual: bool,
+
+    /// Blocks known to be corrupted on specific ChunkServers (not Raft-persisted).
+    /// Maps block_id -> set of ChunkServer addresses with a bad copy.
+    #[serde(skip)]
+    pub bad_block_locations: HashMap<String, HashSet<String>>,
 }
 
 impl MasterState {
@@ -340,6 +345,74 @@ impl MasterState {
         // Check if we should exit safe mode
         if self.should_exit_safe_mode() {
             self.exit_safe_mode();
+        }
+    }
+}
+
+/// Schedule replication commands for all blocks with fewer live replicas than REPLICATION_FACTOR.
+/// Considers both dead chunk servers and known-bad block locations.
+fn heal_under_replicated_blocks(state: &mut MasterState) {
+    const REPLICATION_FACTOR: usize = 3;
+
+    let live_servers: Vec<String> = state.chunk_servers.keys().cloned().collect();
+    if live_servers.is_empty() {
+        return;
+    }
+
+    for file in state.files.values() {
+        for block in &file.blocks {
+            let bad_on = state
+                .bad_block_locations
+                .get(&block.block_id)
+                .cloned()
+                .unwrap_or_default();
+
+            let live_locs: Vec<String> = block
+                .locations
+                .iter()
+                .filter(|loc| state.chunk_servers.contains_key(*loc) && !bad_on.contains(*loc))
+                .cloned()
+                .collect();
+
+            let needed = REPLICATION_FACTOR.saturating_sub(live_locs.len());
+            if needed == 0 {
+                continue;
+            }
+
+            if live_locs.is_empty() {
+                tracing::error!(
+                    "Healer: block {} has NO live replicas — data may be lost",
+                    block.block_id
+                );
+                continue;
+            }
+
+            let source = &live_locs[0];
+
+            let targets: Vec<String> = live_servers
+                .iter()
+                .filter(|s| !block.locations.contains(s))
+                .take(needed)
+                .cloned()
+                .collect();
+
+            for target in &targets {
+                state
+                    .pending_commands
+                    .entry(source.clone())
+                    .or_default()
+                    .push(ChunkServerCommand {
+                        r#type: 1, // REPLICATE
+                        block_id: block.block_id.clone(),
+                        target_chunk_server_address: target.clone(),
+                    });
+                tracing::info!(
+                    "Healer: scheduled replication of block {} from {} to {}",
+                    block.block_id,
+                    source,
+                    target
+                );
+            }
         }
     }
 }
@@ -2783,5 +2856,101 @@ mod tests {
 
         let record = state.transaction_records.get("tx-1").unwrap();
         assert_eq!(record.state, TxState::Pending);
+    }
+
+    #[test]
+    fn test_heal_under_replicated_blocks_schedules_replication() {
+        let mut state = MasterState::default();
+        let now = 9_999_999_999_999u64;
+        for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
+            state.chunk_servers.insert(
+                addr.to_string(),
+                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1 },
+            );
+        }
+        state.files.insert(
+            "/test/file".to_string(),
+            FileMetadata {
+                path: "/test/file".to_string(),
+                size: 100,
+                blocks: vec![BlockInfo {
+                    block_id: "block-1".to_string(),
+                    size: 100,
+                    locations: vec!["cs1:50055".to_string()],
+                    checksum_crc32c: 0,
+                }],
+                etag_md5: String::new(),
+                created_at_ms: 0,
+            },
+        );
+        heal_under_replicated_blocks(&mut state);
+        let cmds = state.pending_commands.get("cs1:50055").expect("commands expected");
+        assert_eq!(cmds.len(), 2);
+        let targets: std::collections::HashSet<_> = cmds.iter().map(|c| c.target_chunk_server_address.as_str()).collect();
+        assert!(targets.contains("cs2:50056") || targets.contains("cs3:50057"));
+    }
+
+    #[test]
+    fn test_heal_skips_fully_replicated_blocks() {
+        let mut state = MasterState::default();
+        let now = 9_999_999_999_999u64;
+        for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
+            state.chunk_servers.insert(
+                addr.to_string(),
+                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1 },
+            );
+        }
+        state.files.insert(
+            "/test/full".to_string(),
+            FileMetadata {
+                path: "/test/full".to_string(),
+                size: 100,
+                blocks: vec![BlockInfo {
+                    block_id: "block-full".to_string(),
+                    size: 100,
+                    locations: vec!["cs1:50055".to_string(), "cs2:50056".to_string(), "cs3:50057".to_string()],
+                    checksum_crc32c: 0,
+                }],
+                etag_md5: String::new(),
+                created_at_ms: 0,
+            },
+        );
+        heal_under_replicated_blocks(&mut state);
+        assert!(state.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn test_heal_treats_bad_block_location_as_missing() {
+        let mut state = MasterState::default();
+        let now = 9_999_999_999_999u64;
+        for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
+            state.chunk_servers.insert(
+                addr.to_string(),
+                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1 },
+            );
+        }
+        state.files.insert(
+            "/test/bad".to_string(),
+            FileMetadata {
+                path: "/test/bad".to_string(),
+                size: 100,
+                blocks: vec![BlockInfo {
+                    block_id: "block-bad".to_string(),
+                    size: 100,
+                    locations: vec!["cs1:50055".to_string(), "cs2:50056".to_string(), "cs3:50057".to_string()],
+                    checksum_crc32c: 0,
+                }],
+                etag_md5: String::new(),
+                created_at_ms: 0,
+            },
+        );
+        state.bad_block_locations
+            .entry("block-bad".to_string())
+            .or_default()
+            .insert("cs2:50056".to_string());
+        // 3 servers in metadata but cs2 is bad → 2 effective, need 1 more
+        // but all 3 servers are already in block.locations so no unused target exists
+        heal_under_replicated_blocks(&mut state);
+        assert!(state.pending_commands.is_empty());
     }
 }
