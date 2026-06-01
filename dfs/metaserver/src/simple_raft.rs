@@ -902,6 +902,23 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Write multiple log entries to RocksDB in a single atomic WriteBatch.
+    fn save_log_entries_batch(&self, entries: &[(usize, &LogEntry)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        for (index, entry) in entries {
+            let key = format!("log:{}", index);
+            let val = serde_json::to_vec(entry).context("Failed to serialize log entry")?;
+            batch.put(key.as_bytes(), val);
+        }
+        self.db
+            .write(batch)
+            .context("Failed to write log entries batch to DB")?;
+        Ok(())
+    }
+
     fn save_config(&self) -> Result<()> {
         let serialized =
             serde_json::to_vec(&self.cluster_config).context("Failed to serialize config")?;
@@ -1870,6 +1887,7 @@ impl RaftNode {
                             }
 
                             // Append all entries
+                            let mut batch_entries: Vec<(usize, &LogEntry)> = Vec::new();
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
@@ -1884,13 +1902,14 @@ impl RaftNode {
                                         self.delete_log_entries_from(absolute_index)?;
 
                                         self.log.push(entry.clone());
-                                        self.save_log_entry(absolute_index, entry)?;
+                                        batch_entries.push((absolute_index, entry));
                                     }
                                 } else {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry)?;
+                                    batch_entries.push((absolute_index, entry));
                                 }
                             }
+                            self.save_log_entries_batch(&batch_entries)?;
                             match_index = args.prev_log_index + args.entries.len();
                         } else {
                             tracing::info!(
@@ -1927,15 +1946,17 @@ impl RaftNode {
                             }
 
                             // Append new entries (or re-append from conflict point)
+                            let mut batch_entries: Vec<(usize, &LogEntry)> = Vec::new();
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
 
                                 if log_index >= self.log.len() {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry)?;
+                                    batch_entries.push((absolute_index, entry));
                                 }
                             }
+                            self.save_log_entries_batch(&batch_entries)?;
 
                             match_index = args.prev_log_index + args.entries.len();
                         } else {
