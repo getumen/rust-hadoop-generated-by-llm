@@ -66,9 +66,9 @@ S3互換サービスとしての信頼確保。
 性能向上と並行して、リソース使用効率（Bytes per Dollar）を最大化する項目です。
 
 ### 3. Core Protocol & Availability (近代化)
-- [ ] **Raft Optimizations (Batching & Pipelining)**
-    - [ ] `simple_raft.rs` の `AppendEntries` をバッチ化し、1回のDisk I/Oで複数ログを処理。
-    - [ ] コミット応答を待たずに次のログを先行送信するパイプライニングの実装。
+- [x] **Raft Optimizations (Batching & Pipelining)** ✅
+    - [x] `simple_raft.rs` の `AppendEntries` をバッチ化し、1回のDisk I/Oで複数ログを処理。
+    - [x] コミット応答を待たずに次のログを先行送信するパイプライニングの実装。
 - [ ] **Rack Awareness**
     - [ ] ChunkServer登録時にラックID（例: `/rack-1/host-1`）をメタデータに追加。
     - [ ] レプリカ配置時に「少なくとも1つは別ラック」とするプレイスメント・ポリシーの実装。
