@@ -113,6 +113,22 @@ pub async fn auth_middleware(
         }
     };
 
+    // For presigned requests, a missing/invalid X-Amz-Date is a hard error
+    if is_presigned {
+        let ts_ok = DateTime::parse_from_rfc3339(&credentials.timestamp).is_ok()
+            || DateTime::parse_from_str(&credentials.timestamp, "%Y%m%dT%H%M%SZ").is_ok();
+        if !ts_ok {
+            let res = s3_error_response(AuthError::MissingAuth);
+            audit_ctx.log(
+                &state,
+                res.status().as_u16(),
+                Some("InvalidArgument".to_string()),
+                &query_params,
+            );
+            return res;
+        }
+    }
+
     // 5. Clock Skew / Expiry Validation
     if let Ok(req_time) = DateTime::parse_from_rfc3339(&credentials.timestamp)
         .or_else(|_| DateTime::parse_from_str(&credentials.timestamp, "%Y%m%dT%H%M%SZ"))

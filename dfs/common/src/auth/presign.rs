@@ -75,10 +75,8 @@ pub fn generate_presigned_url(params: &PresignParams<'_>) -> String {
     let signing_key = derive_signing_key(params.secret_key, &date, params.region, "s3");
     let signature = calculate_signature(&signing_key, &string_to_sign);
 
-    format!(
-        "{}{path}?{canonical_query_string}&X-Amz-Signature={signature}",
-        params.endpoint,
-    )
+    let base = params.endpoint.trim_end_matches('/');
+    format!("{base}{path}?{canonical_query_string}&X-Amz-Signature={signature}")
 }
 
 #[cfg(test)]
@@ -146,5 +144,16 @@ mod tests {
         let url = generate_presigned_url(&p);
         // Path in URL should have space encoded as %20
         assert!(url.contains("/mybucket/dir/file%20name.txt"), "URL: {}", url);
+    }
+
+    #[test]
+    fn test_credential_slashes_are_percent_encoded() {
+        let url = generate_presigned_url(&test_params());
+        // X-Amz-Credential value should have '/' encoded as %2F
+        assert!(
+            url.contains("X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F"),
+            "Credential slashes must be percent-encoded. URL: {}",
+            url
+        );
     }
 }
