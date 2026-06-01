@@ -24,12 +24,11 @@ pub fn generate_presigned_url(params: &PresignParams<'_>) -> String {
 
     let scope = format!("{}/{}/s3/aws4_request", date, params.region);
     let credential = format!("{}/{}", params.access_key, scope);
-    let credential_encoded = uri_encode(&credential, true); // '/' → %2F
 
     // Build canonical query params (sorted, no X-Amz-Signature)
     let mut query_params: Vec<(String, String)> = vec![
         ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
-        ("X-Amz-Credential".to_string(), credential_encoded),
+        ("X-Amz-Credential".to_string(), credential),
         ("X-Amz-Date".to_string(), datetime.clone()),
         ("X-Amz-Expires".to_string(), params.expires_secs.to_string()),
         ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
@@ -38,18 +37,27 @@ pub fn generate_presigned_url(params: &PresignParams<'_>) -> String {
 
     let canonical_query_string: String = query_params
         .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
+        .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
         .collect::<Vec<_>>()
         .join("&");
 
-    // Extract host from endpoint (strip scheme)
+    // Extract host from endpoint (strip scheme, trailing slash)
     let host = params
         .endpoint
         .split("://")
         .nth(1)
-        .unwrap_or(params.endpoint);
+        .unwrap_or(params.endpoint)
+        .trim_end_matches('/');
 
-    let path = format!("/{}/{}", params.bucket, params.key);
+    // URI-encode the path: encode bucket and each key segment individually
+    let encoded_bucket = uri_encode(params.bucket, true);
+    let encoded_key = params
+        .key
+        .split('/')
+        .map(|seg| uri_encode(seg, true))
+        .collect::<Vec<_>>()
+        .join("/");
+    let path = format!("/{}/{}", encoded_bucket, encoded_key);
     let mut headers = BTreeMap::new();
     headers.insert("host".to_string(), vec![host.to_string()]);
 
@@ -129,5 +137,14 @@ mod tests {
         p.method = "PUT";
         let url = generate_presigned_url(&p);
         assert!(url.contains("X-Amz-Signature="), "URL: {}", url);
+    }
+
+    #[test]
+    fn test_key_with_spaces_and_slashes_is_encoded() {
+        let mut p = test_params();
+        p.key = "dir/file name.txt";
+        let url = generate_presigned_url(&p);
+        // Path in URL should have space encoded as %20
+        assert!(url.contains("/mybucket/dir/file%20name.txt"), "URL: {}", url);
     }
 }
