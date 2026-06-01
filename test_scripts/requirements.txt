@@ -1,2 +1,2 @@
 boto3
-botocore
+botocore[crt]

@@ -138,7 +138,7 @@ check_docker_containers() {
     if [ "$missing" = "1" ]; then
         log_warn "Cluster is not running. Starting it now with Toxiproxy..."
         # Use the toxiproxy-sharded compose file
-        docker compose -f docker-compose.toxiproxy-sharded.yml up -d
+        docker compose -f docker-compose.toxiproxy-sharded.yml up -d --no-build
 
         log_info "Waiting for cluster readiness (20s)..."
         sleep 20

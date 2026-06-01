@@ -8,17 +8,13 @@ echo "=== S3 Integration Test Runner ==="
 
 # 1. Install Requirements
 echo "Installing Python dependencies..."
-pip install -r test_scripts/requirements.txt
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r test_scripts/requirements.txt
 
 # 2. Build and Start Cluster
 echo "Cleaning up old data..."
 docker compose -f test_scripts/spark-s3-test/docker-compose.yml down -v
-# Force rebuild to ensure code changes (like sharding logic) are picked up
-echo "Building Docker images (no cache)..."
-docker compose -f test_scripts/spark-s3-test/docker-compose.yml build --no-cache
-
 echo "Starting Cluster..."
-docker compose -f test_scripts/spark-s3-test/docker-compose.yml up -d
+docker compose -f test_scripts/spark-s3-test/docker-compose.yml up -d --no-build
 
 # 3. Wait for S3 Server
 echo "Waiting for S3 Server (port 9000)..."

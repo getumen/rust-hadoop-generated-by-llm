@@ -44,7 +44,7 @@ echo ""
 
 # Build all binaries first
 echo "Building binaries..."
-cargo build --bin config_server --bin master --bin chunkserver --bin dfs_cli 2>&1 | tail -3
+cargo build --bin config_server --bin master --bin chunkserver --bin dfs_cli
 echo ""
 
 # --- Start Config Server with TLS ---
