@@ -83,6 +83,20 @@ enum Commands {
         #[command(subcommand)]
         action: BenchmarkAction,
     },
+    /// Generate a pre-signed URL for temporary access to an object
+    Presign {
+        /// S3 URL of the object (e.g. s3://bucket/key)
+        url: String,
+        /// HTTP method (GET, PUT, DELETE)
+        #[arg(long, default_value = "GET")]
+        method: String,
+        /// URL validity in seconds (max 604800 = 7 days)
+        #[arg(long, default_value_t = 3600)]
+        expires: u64,
+        /// S3 endpoint URL (overrides S3_ENDPOINT env var, default: http://localhost:9000)
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -154,6 +168,21 @@ enum ClusterAction {
         /// Server ID to remove
         server_id: u32,
     },
+}
+
+fn parse_s3_url(url: &str) -> anyhow::Result<(String, String)> {
+    let path = url
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("URL must start with s3://"))?;
+    let slash = path
+        .find('/')
+        .ok_or_else(|| anyhow::anyhow!("URL must contain a key (s3://bucket/key)"))?;
+    let bucket = path[..slash].to_string();
+    let key = path[slash + 1..].to_string();
+    if bucket.is_empty() || key.is_empty() {
+        anyhow::bail!("Bucket and key must not be empty");
+    }
+    Ok((bucket, key))
 }
 
 #[tokio::main]
@@ -378,6 +407,39 @@ async fn main() -> anyhow::Result<()> {
         Commands::Shuffle { prefix } => {
             client.initiate_shuffle(&prefix).await?;
             println!("Triggered background shuffling for prefix: {}", prefix);
+        }
+        Commands::Presign {
+            url,
+            method,
+            expires,
+            endpoint,
+        } => {
+            let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+                .map_err(|_| anyhow::anyhow!("AWS_ACCESS_KEY_ID environment variable not set"))?;
+            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+                .map_err(|_| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set"))?;
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            let endpoint_url = endpoint
+                .or_else(|| std::env::var("S3_ENDPOINT").ok())
+                .unwrap_or_else(|| "http://localhost:9000".to_string());
+
+            let (bucket, key) = parse_s3_url(&url)?;
+
+            let params = dfs_common::auth::presign::PresignParams {
+                endpoint: &endpoint_url,
+                bucket: &bucket,
+                key: &key,
+                method: &method.to_uppercase(),
+                access_key: &access_key,
+                secret_key: &secret_key,
+                region: &region,
+                expires_secs: expires,
+            };
+
+            let presigned_url = dfs_common::auth::presign::generate_presigned_url(&params);
+            println!("{}", presigned_url);
         }
         Commands::Benchmark { action } => {
             match action {
@@ -607,6 +669,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_parse_s3_url_valid() {
+        let (bucket, key) = super::parse_s3_url("s3://mybucket/path/to/file.txt").unwrap();
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(key, "path/to/file.txt");
+    }
+
+    #[test]
+    fn test_parse_s3_url_invalid_no_scheme() {
+        assert!(super::parse_s3_url("mybucket/key").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_invalid_no_key() {
+        assert!(super::parse_s3_url("s3://").is_err());
+    }
 }
 
 fn print_stats(
