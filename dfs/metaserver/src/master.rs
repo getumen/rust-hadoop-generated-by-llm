@@ -1758,7 +1758,7 @@ impl MasterService for MyMaster {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let span = dfs_common::telemetry::create_server_span(&request, "heartbeat");
         async move {
-            let req = request.into_inner();
+            let mut req = request.into_inner();
             let mut state_lock = self.state.lock().expect("Mutex poisoned");
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1772,7 +1772,7 @@ impl MasterService for MyMaster {
 
                 // Use rack_id from heartbeat if provided, otherwise preserve existing
                 let rack_id = if !req.rack_id.is_empty() {
-                    req.rack_id.clone()
+                    std::mem::take(&mut req.rack_id)
                 } else {
                     state
                         .chunk_servers

@@ -7,7 +7,6 @@ services:
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
-      - "50050:50050"
       - "8080:8080"
     networks:
       - dfs-sharded-network
@@ -24,7 +23,6 @@ services:
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
-      - "50051:50051"
       - "8081:8080"
     networks:
       - dfs-sharded-network
@@ -41,9 +39,7 @@ services:
   chunkserver1-shard1:
     build: .
     container_name: dfs-chunkserver1-shard1
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
-    ports:
-      - "50052:50052"
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052 --rack-id rack-a
     networks:
       - dfs-sharded-network
     depends_on:
@@ -65,7 +61,6 @@ services:
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
-      - "50061:50051"
       - "8091:8080"
     networks:
       - dfs-sharded-network
@@ -82,9 +77,7 @@ services:
   chunkserver1-shard2:
     build: .
     container_name: dfs-chunkserver1-shard2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
-    ports:
-      - "50062:50052"
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052 --rack-id rack-b
     networks:
       - dfs-sharded-network
     depends_on:
@@ -99,9 +92,7 @@ services:
   chunkserver-extra:
     build: .
     container_name: dfs-chunkserver-extra
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
-    ports:
-      - "50072:50052"
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052 --rack-id rack-c
     networks:
       - dfs-sharded-network
     depends_on:
@@ -115,9 +106,7 @@ services:
   chunkserver-extra2:
     build: .
     container_name: dfs-chunkserver-extra2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
-    ports:
-      - "50082:50052"
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052 --rack-id rack-a
     networks:
       - dfs-sharded-network
     depends_on:
