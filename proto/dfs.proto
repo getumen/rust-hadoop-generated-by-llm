@@ -146,6 +146,7 @@ message DeleteFileResponse {
 message RegisterChunkServerRequest {
   string address = 1;
   uint64 capacity = 2;
+  string rack_id = 3;
 }
 
 message RegisterChunkServerResponse {
