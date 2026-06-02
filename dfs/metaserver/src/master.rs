@@ -438,62 +438,150 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
 
     for file in state.files.values() {
         for block in &file.blocks {
-            let bad_on = state
-                .bad_block_locations
-                .get(&block.block_id)
-                .cloned()
-                .unwrap_or_default();
+            if block.ec_data_shards > 0 {
+                // ── EC block: detect missing shards and issue RECONSTRUCT_EC_SHARD ──
+                let k = block.ec_data_shards as usize;
 
-            let live_locs: Vec<String> = block
-                .locations
-                .iter()
-                .filter(|loc| state.chunk_servers.contains_key(*loc) && !bad_on.contains(*loc))
-                .cloned()
-                .collect();
+                // Count live shards
+                let live_count = block
+                    .locations
+                    .iter()
+                    .filter(|loc| state.chunk_servers.contains_key(*loc))
+                    .count();
 
-            let needed = REPLICATION_FACTOR.saturating_sub(live_locs.len());
-            if needed == 0 {
-                continue;
-            }
+                // For each shard position, check if its host is dead
+                for (shard_idx, loc) in block.locations.iter().enumerate() {
+                    if state.chunk_servers.contains_key(loc) {
+                        // Shard is on a live server — nothing to do for this shard
+                        continue;
+                    }
 
-            if live_locs.is_empty() {
-                tracing::error!(
-                    "Healer: block {} has NO live replicas — data may be lost",
-                    block.block_id
-                );
-                continue;
-            }
+                    // Shard is missing
+                    if live_count < k {
+                        tracing::error!(
+                            "Healer: EC block {} is unrecoverable — only {}/{} data shards live",
+                            block.block_id,
+                            live_count,
+                            k
+                        );
+                        // Can't recover any shard; skip all remaining shards too
+                        break;
+                    }
 
-            let source = &live_locs[0];
+                    // Find a target CS not already holding a shard of this block
+                    let target_opt = live_servers
+                        .iter()
+                        .find(|s| !block.locations.contains(s))
+                        .or_else(|| {
+                            // Fallback: any live CS that isn't the dead one
+                            live_servers.iter().find(|s| s.as_str() != loc)
+                        });
 
-            let targets: Vec<String> = live_servers
-                .iter()
-                .filter(|s| !block.locations.contains(s))
-                .take(needed)
-                .cloned()
-                .collect();
+                    let target = match target_opt {
+                        Some(t) => t.clone(),
+                        None => {
+                            tracing::warn!(
+                                "Healer: no available target CS for EC shard {} of block {}",
+                                shard_idx,
+                                block.block_id
+                            );
+                            continue;
+                        }
+                    };
 
-            for target in &targets {
-                state
-                    .pending_commands
-                    .entry(source.clone())
-                    .or_default()
-                    .push(ChunkServerCommand {
-                        r#type: 1, // REPLICATE
-                        block_id: block.block_id.clone(),
-                        target_chunk_server_address: target.clone(),
-                        shard_index: -1,
-                        ec_data_shards: 0,
-                        ec_parity_shards: 0,
-                        ec_shard_sources: vec![],
-                        original_block_size: 0,
-                    });
-                tracing::info!(
-                    "Healer: scheduled replication of block {} from {} to {}",
-                    block.block_id,
-                    source,
-                    target
-                );
+                    // Build sources list: live address or empty string if dead
+                    let sources: Vec<String> = block
+                        .locations
+                        .iter()
+                        .map(|l| {
+                            if state.chunk_servers.contains_key(l) {
+                                l.clone()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect();
+
+                    state
+                        .pending_commands
+                        .entry(target.clone())
+                        .or_default()
+                        .push(ChunkServerCommand {
+                            r#type: 3, // RECONSTRUCT_EC_SHARD
+                            block_id: block.block_id.clone(),
+                            target_chunk_server_address: target.clone(),
+                            shard_index: shard_idx as i32,
+                            ec_data_shards: block.ec_data_shards,
+                            ec_parity_shards: block.ec_parity_shards,
+                            ec_shard_sources: sources,
+                            original_block_size: block.original_size,
+                        });
+                    tracing::info!(
+                        "Healer: scheduled EC reconstruction of shard {} of block {} to {}",
+                        shard_idx,
+                        block.block_id,
+                        target
+                    );
+                }
+            } else {
+                // ── Replication block: existing logic (unchanged) ──
+                let bad_on = state
+                    .bad_block_locations
+                    .get(&block.block_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let live_locs: Vec<String> = block
+                    .locations
+                    .iter()
+                    .filter(|loc| state.chunk_servers.contains_key(*loc) && !bad_on.contains(*loc))
+                    .cloned()
+                    .collect();
+
+                let needed = REPLICATION_FACTOR.saturating_sub(live_locs.len());
+                if needed == 0 {
+                    continue;
+                }
+
+                if live_locs.is_empty() {
+                    tracing::error!(
+                        "Healer: block {} has NO live replicas — data may be lost",
+                        block.block_id
+                    );
+                    continue;
+                }
+
+                let source = &live_locs[0];
+
+                let targets: Vec<String> = live_servers
+                    .iter()
+                    .filter(|s| !block.locations.contains(s))
+                    .take(needed)
+                    .cloned()
+                    .collect();
+
+                for target in &targets {
+                    state
+                        .pending_commands
+                        .entry(source.clone())
+                        .or_default()
+                        .push(ChunkServerCommand {
+                            r#type: 1, // REPLICATE
+                            block_id: block.block_id.clone(),
+                            target_chunk_server_address: target.clone(),
+                            shard_index: -1,
+                            ec_data_shards: 0,
+                            ec_parity_shards: 0,
+                            ec_shard_sources: vec![],
+                            original_block_size: 0,
+                        });
+                    tracing::info!(
+                        "Healer: scheduled replication of block {} from {} to {}",
+                        block.block_id,
+                        source,
+                        target
+                    );
+                }
             }
         }
     }
@@ -3311,5 +3399,53 @@ mod tests {
         let needed = (file.ec_data_shards + file.ec_parity_shards) as usize;
         assert_eq!(needed, 6);
         assert!(state.chunk_servers.len() >= needed);
+    }
+
+    #[test]
+    fn test_heal_ec_block_issues_reconstruct_command() {
+        let mut state = MasterState::default();
+
+        // 6 CSes registered: cs0, cs1, cs3, cs4, cs5 are live; cs2 is dead (not registered)
+        for i in [0usize, 1, 3, 4, 5] {
+            state.chunk_servers.insert(
+                format!("cs{}:50052", i),
+                ChunkServerStatus { last_heartbeat: 9_999_999_999_999, used_space: 0, available_space: 1_000_000, chunk_count: 0, rack_id: String::new() },
+            );
+        }
+
+        // EC(4,2) file with one block; shard 2 was on the now-dead cs2
+        state.files.insert("/ec-file".to_string(), crate::dfs::FileMetadata {
+            path: "/ec-file".to_string(),
+            size: 100,
+            blocks: vec![crate::dfs::BlockInfo {
+                block_id: "blk-1".to_string(),
+                size: 100,
+                locations: vec![
+                    "cs0:50052".to_string(),
+                    "cs1:50052".to_string(),
+                    "cs2:50052".to_string(), // dead
+                    "cs3:50052".to_string(),
+                    "cs4:50052".to_string(),
+                    "cs5:50052".to_string(),
+                ],
+                checksum_crc32c: 0,
+                ec_data_shards: 4,
+                ec_parity_shards: 2,
+                original_size: 100,
+            }],
+            etag_md5: "".to_string(),
+            created_at_ms: 0,
+            ec_data_shards: 4,
+            ec_parity_shards: 2,
+        });
+
+        heal_under_replicated_blocks(&mut state);
+
+        // Should issue exactly one RECONSTRUCT_EC_SHARD for shard 2
+        let all_cmds: Vec<_> = state.pending_commands.values().flatten().collect();
+        assert!(
+            all_cmds.iter().any(|c| c.r#type == 3 && c.block_id == "blk-1" && c.shard_index == 2),
+            "Expected RECONSTRUCT_EC_SHARD for shard 2, got: {:?}", all_cmds
+        );
     }
 }
