@@ -325,6 +325,18 @@ impl Client {
 
             let shards = dfs_common::erasure::encode(&buffer, data_shards, parity_shards)?;
 
+            // Compute CRC32C checksum for each shard before writing
+            let shard_checksums: Vec<u32> = shards.iter().map(|s| {
+                let mut h = crc32fast::Hasher::new();
+                h.update(s);
+                h.finalize()
+            }).collect();
+
+            // Compute CRC32C of the original (pre-encoding) buffer for the block-level checksum
+            let mut full_hasher = crc32fast::Hasher::new();
+            full_hasher.update(&buffer);
+            let full_checksum = full_hasher.finalize();
+
             // Write all shards in parallel (no pipeline, each goes to its own CS)
             let mut write_futs = Vec::new();
             for (shard_idx, (shard_data, cs_addr)) in
@@ -334,6 +346,7 @@ impl Client {
                 let cs_url = format!("http://{}", cs_addr);
                 let self_clone = self.clone();
                 let shard_idx_i32 = shard_idx as i32;
+                let checksum = shard_checksums[shard_idx];
                 write_futs.push(async move {
                     let channel = self_clone.connect_endpoint(&cs_url).await?;
                     let mut cs_client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(
@@ -346,7 +359,7 @@ impl Client {
                         block_id: block_id.clone(),
                         data: shard_data,
                         next_servers: vec![],
-                        expected_checksum_crc32c: 0,
+                        expected_checksum_crc32c: checksum,
                         shard_index: shard_idx_i32,
                     });
                     let resp = cs_client.write_block(req).await?.into_inner();
@@ -366,7 +379,7 @@ impl Client {
 
             let ec_block_checksum = crate::dfs::BlockChecksumInfo {
                 block_id: block.block_id.clone(),
-                checksum_crc32c: 0,
+                checksum_crc32c: full_checksum,
                 actual_size: original_size,
             };
 
