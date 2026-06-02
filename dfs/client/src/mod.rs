@@ -516,9 +516,11 @@ impl Client {
 
         // 2. Read blocks from ChunkServers
         for block in metadata.blocks {
-            let data = self
-                .read_block_range(&block.locations, &block.block_id, 0, 0)
-                .await?;
+            let data = if block.ec_data_shards > 0 {
+                self.read_ec_block(&block).await?
+            } else {
+                self.read_block_range(&block.locations, &block.block_id, 0, 0).await?
+            };
             file.write_all(&data)?;
         }
 
@@ -615,9 +617,16 @@ impl Client {
                 block_length
             );
 
-            let data = self
-                .read_block_range(&block.locations, &block.block_id, block_offset, block_length)
-                .await?;
+            let data = if block.ec_data_shards > 0 {
+                // For EC blocks: read the full block and apply offset/length slice
+                let full = self.read_ec_block(&block).await?;
+                let start = block_offset as usize;
+                let end = (block_offset + block_length) as usize;
+                full[start..end.min(full.len())].to_vec()
+            } else {
+                self.read_block_range(&block.locations, &block.block_id, block_offset, block_length)
+                    .await?
+            };
             result.extend_from_slice(&data);
         }
 
@@ -886,12 +895,68 @@ impl Client {
         bail!("Failed to read block {} from any location", block_id)
     }
 
-    /// Helper function to fetch a single block from any available location
+    /// Read an EC-encoded block by fetching all k+m shards concurrently and reconstructing.
+    async fn read_ec_block(&self, block: &crate::dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
+        let data_shards = block.ec_data_shards as usize;
+        let parity_shards = block.ec_parity_shards as usize;
+        let original_size = block.original_size as usize;
+        let total = data_shards + parity_shards;
+
+        // Fetch all shards concurrently
+        let mut fetch_futs = Vec::new();
+        for (i, loc) in block.locations.iter().enumerate() {
+            let block_id = block.block_id.clone();
+            let loc = loc.clone();
+            let self_clone = self.clone();
+            fetch_futs.push(async move {
+                let result = self_clone.read_block_from_location(&loc, &block_id, 0, 0).await;
+                (i, result)
+            });
+        }
+        let results = futures_util::future::join_all(fetch_futs).await;
+
+        let mut opt_shards: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut available = 0usize;
+        for (i, result) in results {
+            if let Ok(data) = result {
+                opt_shards[i] = Some(data);
+                available += 1;
+            }
+        }
+
+        if available < data_shards {
+            bail!(
+                "EC block {} unrecoverable: only {}/{} shards available",
+                block.block_id, available, data_shards
+            );
+        }
+
+        // Fast path: all data shards present — just concatenate
+        let all_data_ok = opt_shards[..data_shards].iter().all(|s| s.is_some());
+        if all_data_ok {
+            let mut result = Vec::new();
+            for s in &opt_shards[..data_shards] {
+                result.extend_from_slice(s.as_ref().unwrap());
+            }
+            result.truncate(original_size);
+            return Ok(result);
+        }
+
+        // Degraded read: RS decode
+        dfs_common::erasure::decode(&mut opt_shards, data_shards, parity_shards, original_size)
+    }
+
+    /// Helper function to fetch a single block from any available location.
+    /// For EC blocks, uses the EC read path (concurrent shard fetch + RS decode if needed).
     pub async fn fetch_single_block(&self, block: &dfs::BlockInfo) -> anyhow::Result<Vec<u8>> {
         if block.locations.is_empty() {
             bail!("Block {} has no locations", block.block_id);
         }
-        self.read_block_range(&block.locations, &block.block_id, 0, 0).await
+        if block.ec_data_shards > 0 {
+            self.read_ec_block(block).await
+        } else {
+            self.read_block_range(&block.locations, &block.block_id, 0, 0).await
+        }
     }
 
     pub async fn exists(
@@ -1351,5 +1416,34 @@ mod tests {
         };
         let result = client.fetch_single_block(&block).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ec_read_normal_path_no_decode_needed() {
+        // All 4 data shards available — just concatenate
+        let original = vec![42u8; 5000];
+        let shards = dfs_common::erasure::encode(&original, 4, 2).unwrap();
+
+        // Simulate: all data shards present
+        let mut combined = Vec::new();
+        for s in &shards[..4] {
+            combined.extend_from_slice(s);
+        }
+        combined.truncate(5000);
+        assert_eq!(combined, original);
+    }
+
+    #[test]
+    fn test_ec_read_degraded_with_two_missing_shards() {
+        let original = vec![99u8; 3333];
+        let shards = dfs_common::erasure::encode(&original, 4, 2).unwrap();
+
+        // Shards 1 and 3 unavailable
+        let mut opt: Vec<Option<Vec<u8>>> = shards.iter().map(|s| Some(s.clone())).collect();
+        opt[1] = None;
+        opt[3] = None;
+
+        let recovered = dfs_common::erasure::decode(&mut opt, 4, 2, original.len()).unwrap();
+        assert_eq!(recovered, original);
     }
 }
