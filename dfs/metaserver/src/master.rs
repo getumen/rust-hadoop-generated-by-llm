@@ -1706,9 +1706,20 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "list_files");
         async move {
             self.ensure_linearizable_read().await?;
+            let req = request.into_inner();
+            let prefix = req.path;
             let state_lock = self.state.lock().expect("Mutex poisoned");
             if let AppState::Master(ref state) = *state_lock {
-                let files: Vec<String> = state.files.keys().cloned().collect();
+                let files: Vec<String> = if prefix.is_empty() {
+                    state.files.keys().cloned().collect()
+                } else {
+                    state
+                        .files
+                        .keys()
+                        .filter(|k| k.starts_with(&prefix))
+                        .cloned()
+                        .collect()
+                };
                 Ok(Response::new(ListFilesResponse { files }))
             } else {
                 Err(Status::internal("Invalid state"))

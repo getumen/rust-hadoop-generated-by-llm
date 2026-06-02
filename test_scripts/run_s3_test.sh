@@ -96,28 +96,28 @@ if [ ! -f "$DFS_CLI" ]; then
     exit 1
 fi
 
-# 5a. Create bucket and upload test object using aws CLI (or curl if aws not available)
+# 5a. Create bucket and upload test object via direct curl PUT (auth disabled on S3 server)
 echo "Creating bucket '$PRESIGN_BUCKET'..."
-if command -v aws &>/dev/null; then
-    aws --endpoint-url "$S3_ENDPOINT" s3 mb "s3://$PRESIGN_BUCKET" --no-verify-ssl 2>/dev/null || true
-    echo "$PRESIGN_CONTENT" | aws --endpoint-url "$S3_ENDPOINT" s3 cp - "s3://$PRESIGN_BUCKET/$PRESIGN_KEY" --no-verify-ssl
+curl -s -X PUT "$S3_ENDPOINT/$PRESIGN_BUCKET" -o /dev/null || true
+
+UPLOAD_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+    -H "Content-Type: text/plain" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    --data-raw "$PRESIGN_CONTENT" \
+    "$S3_ENDPOINT/$PRESIGN_BUCKET/$PRESIGN_KEY")
+if [ "$UPLOAD_STATUS" = "200" ] || [ "$UPLOAD_STATUS" = "204" ] || [ "$UPLOAD_STATUS" = "201" ]; then
     presign_pass "Object uploaded to s3://$PRESIGN_BUCKET/$PRESIGN_KEY"
 else
-    # Fallback: use curl with AWS SigV4 via the existing Python test infrastructure
-    curl -s -X PUT "$S3_ENDPOINT/$PRESIGN_BUCKET" \
-        -H "Authorization: AWS dummy:dummy" \
-        -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
-        -o /dev/null || true
-    UPLOAD_STATUS=$(echo "$PRESIGN_CONTENT" | curl -s -o /dev/null -w '%{http_code}' -X PUT \
-        -H "Authorization: AWS dummy:dummy" \
-        -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
-        -H "Content-Type: text/plain" \
-        --data-binary @- \
-        "$S3_ENDPOINT/$PRESIGN_BUCKET/$PRESIGN_KEY")
-    if [ "$UPLOAD_STATUS" = "200" ] || [ "$UPLOAD_STATUS" = "204" ] || [ "$UPLOAD_STATUS" = "201" ]; then
-        presign_pass "Object uploaded (curl fallback) to s3://$PRESIGN_BUCKET/$PRESIGN_KEY"
+    presign_fail "Object upload failed (HTTP $UPLOAD_STATUS)"
+fi
+
+# 5a-verify. Confirm content is correct before testing presigned URL
+if [ $PRESIGN_FAILED -eq 0 ]; then
+    VERIFY_CONTENT=$(curl -s -f "$S3_ENDPOINT/$PRESIGN_BUCKET/$PRESIGN_KEY" 2>/dev/null)
+    if echo "$VERIFY_CONTENT" | grep -q "$PRESIGN_CONTENT"; then
+        presign_pass "Upload verified (direct GET returned correct content)"
     else
-        presign_fail "Object upload failed (HTTP $UPLOAD_STATUS)"
+        presign_fail "Upload verification failed: direct GET returned '$VERIFY_CONTENT'"
     fi
 fi
 
@@ -130,7 +130,7 @@ set -e
 if [ $PRESIGN_CLI_EXIT -ne 0 ] || [ -z "$PRESIGNED_GET_URL" ]; then
     presign_fail "Failed to generate presigned GET URL: $PRESIGNED_GET_URL"
 else
-    presign_pass "Generated presigned GET URL"
+    presign_pass "Generated presigned GET URL: $PRESIGNED_GET_URL"
 fi
 
 # 5c. Download using presigned GET URL (no auth headers)
