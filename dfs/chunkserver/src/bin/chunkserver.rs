@@ -258,6 +258,34 @@ async fn main() -> anyhow::Result<()> {
                                                 .initiate_replication(&block_id, &target)
                                                 .await;
                                         });
+                                    } else if command.r#type == 3 {
+                                        // RECONSTRUCT_EC_SHARD
+                                        let chunk_server_clone = chunk_server_heartbeat.clone();
+                                        let block_id = command.block_id.clone();
+                                        let shard_index = command.shard_index as usize;
+                                        let data_shards = command.ec_data_shards as usize;
+                                        let parity_shards = command.ec_parity_shards as usize;
+                                        let sources = command.ec_shard_sources.clone();
+
+                                        tokio::spawn(async move {
+                                            if let Err(e) = chunk_server_clone
+                                                .reconstruct_ec_shard(
+                                                    block_id.clone(),
+                                                    shard_index,
+                                                    data_shards,
+                                                    parity_shards,
+                                                    sources,
+                                                )
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    "EC reconstruct failed for block {} shard {}: {}",
+                                                    block_id,
+                                                    shard_index,
+                                                    e
+                                                );
+                                            }
+                                        });
                                     }
                                 }
                             }

@@ -374,6 +374,130 @@ impl MyChunkServer {
         }
     }
 
+    /// Reconstruct an EC shard using Reed-Solomon from available peer shards.
+    /// Called when Master issues a RECONSTRUCT_EC_SHARD command.
+    pub async fn reconstruct_ec_shard(
+        &self,
+        block_id: String,
+        shard_index: usize,
+        data_shards: usize,
+        parity_shards: usize,
+        sources: Vec<String>, // one address per shard slot; empty = unavailable
+    ) -> anyhow::Result<()> {
+        let total = data_shards + parity_shards;
+        if sources.len() != total {
+            return Err(anyhow::anyhow!(
+                "ec_shard_sources length {} != total shards {}",
+                sources.len(),
+                total
+            ));
+        }
+
+        // 1. Fetch available shards concurrently
+        let mut fetch_futures: Vec<
+            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, anyhow::Result<Vec<u8>>)> + Send>>,
+        > = Vec::new();
+
+        for (i, src_addr) in sources.iter().enumerate() {
+            if src_addr.is_empty() || i == shard_index {
+                continue; // skip unavailable and the shard we are reconstructing
+            }
+            let block_id_c = block_id.clone();
+            let addr = format!("http://{}", src_addr);
+            let ca_cert_path = self.ca_cert_path.clone();
+            let domain_name = self.domain_name.clone();
+
+            fetch_futures.push(Box::pin(async move {
+                // Build endpoint (reuse TLS logic if needed)
+                let resolved = if ca_cert_path.is_some() {
+                    addr.replace("http://", "https://")
+                } else {
+                    addr.clone()
+                };
+                let mut endpoint = match tonic::transport::Endpoint::from_shared(resolved.clone()) {
+                    Ok(e) => e,
+                    Err(e) => return (i, Err(anyhow::anyhow!("Bad endpoint {}: {}", resolved, e))),
+                };
+                if let Some(ref ca_path) = ca_cert_path {
+                    let domain = domain_name.clone().unwrap_or_else(|| {
+                        resolved
+                            .split("://")
+                            .last()
+                            .unwrap_or("")
+                            .split(':')
+                            .next()
+                            .unwrap_or("localhost")
+                            .to_string()
+                    });
+                    if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
+                        endpoint = match endpoint.tls_config(tls_config) {
+                            Ok(e) => e,
+                            Err(e) => return (i, Err(anyhow::anyhow!("TLS config error: {}", e))),
+                        };
+                    }
+                }
+                let channel = match endpoint.connect().await {
+                    Ok(c) => c,
+                    Err(e) => return (i, Err(anyhow::anyhow!("Connect failed to {}: {}", resolved, e))),
+                };
+                let mut client =
+                    crate::dfs::chunk_server_service_client::ChunkServerServiceClient::new(channel)
+                        .max_decoding_message_size(100 * 1024 * 1024);
+                let req = tonic::Request::new(crate::dfs::ReadBlockRequest {
+                    block_id: block_id_c.clone(),
+                    offset: 0,
+                    length: 0, // read entire block
+                });
+                match client.read_block(req).await {
+                    Ok(resp) => (i, Ok(resp.into_inner().data)),
+                    Err(e) => (i, Err(anyhow::anyhow!("ReadBlock failed from {}: {}", resolved, e))),
+                }
+            }));
+        }
+
+        let results = futures_util::future::join_all(fetch_futures).await;
+
+        // 2. Populate opt_shards
+        let mut opt_shards: Vec<Option<Vec<u8>>> = vec![None; total];
+        for (i, result) in results {
+            match result {
+                Ok(data) => opt_shards[i] = Some(data),
+                Err(e) => tracing::warn!("EC fetch shard {}: {}", i, e),
+            }
+        }
+
+        // Verify we have enough shards to reconstruct
+        let available = opt_shards.iter().filter(|s| s.is_some()).count();
+        if available < data_shards {
+            return Err(anyhow::anyhow!(
+                "Only {} shards available, need at least {} for reconstruction",
+                available,
+                data_shards
+            ));
+        }
+
+        // 3. RS reconstruct (fills in all missing shards)
+        let r = reed_solomon_erasure::galois_8::ReedSolomon::new(data_shards, parity_shards)
+            .map_err(|e| anyhow::anyhow!("RS init error: {:?}", e))?;
+        r.reconstruct(&mut opt_shards)
+            .map_err(|e| anyhow::anyhow!("RS reconstruct error: {:?}", e))?;
+
+        // 4. Write the target shard to local storage
+        let shard_data = opt_shards[shard_index]
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Shard {} still None after reconstruct", shard_index))?;
+        self.write_block_local(&block_id, shard_data)
+            .map_err(|e| anyhow::anyhow!("Failed to write reconstructed shard: {}", e))?;
+
+        tracing::info!(
+            "EC reconstruct: wrote shard {} of block {} ({} bytes)",
+            shard_index,
+            block_id,
+            shard_data.len()
+        );
+        Ok(())
+    }
+
     pub async fn run_background_scrubber(server: MyChunkServer, interval: std::time::Duration) {
         let storage_dir = server.storage_dir.clone();
 
@@ -780,6 +904,24 @@ impl ChunkServerService for MyChunkServer {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_ec_reconstruct_shard_logic() {
+        // Verify RS reconstruction produces correct shard
+        let data = vec![7u8; 4096];
+        let shards = dfs_common::erasure::encode(&data, 4, 2).unwrap();
+
+        // Shard 4 (first parity) is "missing"
+        let mut opt: Vec<Option<Vec<u8>>> = shards.iter().map(|s| Some(s.clone())).collect();
+        opt[4] = None;
+
+        // Reconstruct using the erasure module
+        let r = reed_solomon_erasure::galois_8::ReedSolomon::new(4, 2).unwrap();
+        r.reconstruct(&mut opt).unwrap();
+
+        let reconstructed = opt[4].as_ref().unwrap();
+        assert_eq!(reconstructed, &shards[4]);
+    }
 
     #[test]
     fn test_checksum_verification() {
