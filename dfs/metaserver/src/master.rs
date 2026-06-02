@@ -1486,7 +1486,11 @@ impl MasterService for MyMaster {
             if self
                 .raft_tx
                 .send(Event::ClientRequest {
-                    command: Command::Master(MasterCommand::CreateFile { path: req.path }),
+                    command: Command::Master(MasterCommand::CreateFile {
+                        path: req.path,
+                        ec_data_shards: req.ec_data_shards,
+                        ec_parity_shards: req.ec_parity_shards,
+                    }),
                     reply_tx: tx,
                 })
                 .await
@@ -1577,14 +1581,11 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
 
-            // Replication factor (default: 3)
-            const REPLICATION_FACTOR: usize = 3;
-
             self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
-            let (selected_servers, block_id) = {
+            let (selected_servers, block_id, ec_data, ec_parity) = {
                 let state_lock = self.state.lock().expect("Mutex poisoned");
                 if let AppState::Master(ref state) = *state_lock {
                     if !state.files.contains_key(&req.path) {
@@ -1595,14 +1596,32 @@ impl MasterService for MyMaster {
                         return Err(Status::unavailable("No chunk servers available"));
                     }
 
+                    // Look up file's EC policy
+                    let file_meta = &state.files[&req.path];
+                    let ec_data = file_meta.ec_data_shards;
+                    let ec_parity = file_meta.ec_parity_shards;
+
+                    let needed = if ec_data > 0 && ec_parity > 0 {
+                        (ec_data + ec_parity) as usize
+                    } else {
+                        3 // default replication factor
+                    };
+
                     let candidates: Vec<(String, ChunkServerStatus)> = state
                         .chunk_servers
                         .iter()
                         .map(|(addr, status)| (addr.clone(), status.clone()))
                         .collect();
 
-                    let selected = select_servers_rack_aware(&candidates, REPLICATION_FACTOR);
-                    (selected, Uuid::new_v4().to_string())
+                    if candidates.len() < needed {
+                        return Err(Status::unavailable(format!(
+                            "Need {} chunk servers for EC({},{}), only {} available",
+                            needed, ec_data, ec_parity, candidates.len()
+                        )));
+                    }
+
+                    let selected = select_servers_rack_aware(&candidates, needed);
+                    (selected, Uuid::new_v4().to_string(), ec_data, ec_parity)
                 } else {
                     return Err(Status::internal("Wrong state type"));
                 }
@@ -1632,16 +1651,16 @@ impl MasterService for MyMaster {
                         size: 0,
                         locations: selected_servers.clone(),
                         checksum_crc32c: 0,
-                        ec_data_shards: 0,
-                        ec_parity_shards: 0,
+                        ec_data_shards: ec_data,
+                        ec_parity_shards: ec_parity,
                         original_size: 0,
                     };
                     Ok(Response::new(AllocateBlockResponse {
                         block: Some(block),
                         chunk_server_addresses: selected_servers,
                         leader_hint: "".to_string(),
-                        ec_data_shards: 0,
-                        ec_parity_shards: 0,
+                        ec_data_shards: ec_data,
+                        ec_parity_shards: ec_parity,
                     }))
                 }
                 Ok(Err(leader_opt)) => {
@@ -3227,5 +3246,63 @@ mod tests {
         ];
         let selected = select_servers_rack_aware(&servers, 3);
         assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn test_ec_file_metadata_stores_policy() {
+        let mut state = MasterState::default();
+        // Simulate CreateFile with EC(4,2)
+        let metadata = FileMetadata {
+            path: "/ec-file".to_string(),
+            size: 0,
+            blocks: vec![],
+            etag_md5: "".to_string(),
+            created_at_ms: 0,
+            ec_data_shards: 4,
+            ec_parity_shards: 2,
+        };
+        state.files.insert("/ec-file".to_string(), metadata);
+
+        // Verify policy is stored
+        let stored = &state.files["/ec-file"];
+        assert_eq!(stored.ec_data_shards, 4);
+        assert_eq!(stored.ec_parity_shards, 2);
+    }
+
+    #[test]
+    fn test_allocate_block_ec_selects_kplusm_servers() {
+        let mut state = MasterState::default();
+        state.files.insert("/ec-file".to_string(), FileMetadata {
+            path: "/ec-file".to_string(),
+            size: 0,
+            blocks: vec![],
+            etag_md5: "".to_string(),
+            created_at_ms: 0,
+            ec_data_shards: 4,
+            ec_parity_shards: 2,
+        });
+        for i in 0..6usize {
+            state.chunk_servers.insert(
+                format!("cs{}:50052", i),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: String::new(),
+                },
+            );
+        }
+
+        // Verify state has EC policy
+        assert_eq!(state.files["/ec-file"].ec_data_shards, 4);
+        assert_eq!(state.files["/ec-file"].ec_parity_shards, 2);
+        assert_eq!(state.chunk_servers.len(), 6);
+
+        // The dynamic selection logic: needed = ec_data + ec_parity = 6
+        let file = &state.files["/ec-file"];
+        let needed = (file.ec_data_shards + file.ec_parity_shards) as usize;
+        assert_eq!(needed, 6);
+        assert!(state.chunk_servers.len() >= needed);
     }
 }

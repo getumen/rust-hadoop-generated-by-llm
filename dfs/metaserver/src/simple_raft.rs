@@ -255,6 +255,8 @@ impl CatchUpProgress {
 pub enum MasterCommand {
     CreateFile {
         path: String,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
     },
     DeleteFile {
         path: String,
@@ -2869,7 +2871,7 @@ impl RaftNode {
             Command::Master(cmd) => {
                 if let AppState::Master(ref mut master_state) = *state {
                     match cmd {
-                        MasterCommand::CreateFile { path } => {
+                        MasterCommand::CreateFile { path, ec_data_shards, ec_parity_shards } => {
                             master_state.files.insert(
                                 path.clone(),
                                 crate::dfs::FileMetadata {
@@ -2878,8 +2880,8 @@ impl RaftNode {
                                     blocks: vec![],
                                     etag_md5: "".to_string(),
                                     created_at_ms: 0,
-                                    ec_data_shards: 0,
-                                    ec_parity_shards: 0,
+                                    ec_data_shards: *ec_data_shards,
+                                    ec_parity_shards: *ec_parity_shards,
                                 },
                             );
                             tracing::info!("Created file {}", path);
@@ -3213,10 +3215,12 @@ mod tests {
     fn test_master_command_create_file() {
         let cmd = MasterCommand::CreateFile {
             path: "/test/file.txt".to_string(),
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         match cmd {
-            MasterCommand::CreateFile { path } => {
+            MasterCommand::CreateFile { path, .. } => {
                 assert_eq!(path, "/test/file.txt");
             }
             _ => panic!("Expected CreateFile command"),
@@ -3359,6 +3363,8 @@ mod tests {
             term: 1,
             command: Command::Master(MasterCommand::CreateFile {
                 path: "/test.txt".to_string(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
             }),
         };
 
