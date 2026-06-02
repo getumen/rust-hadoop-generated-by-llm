@@ -480,7 +480,7 @@ fn s3_error_response(err: AuthError) -> Response {
         AuthError::InvalidCredentialScope { .. } => StatusCode::BAD_REQUEST,
         AuthError::InsecureTransport => StatusCode::FORBIDDEN,
         AuthError::InvalidToken(_) => StatusCode::FORBIDDEN,
-        AuthError::ExpiredToken => StatusCode::BAD_REQUEST,
+        AuthError::ExpiredToken => StatusCode::FORBIDDEN,
         AuthError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
