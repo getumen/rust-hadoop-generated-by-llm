@@ -8,6 +8,9 @@ pub fn encode(data: &[u8], data_shards: usize, parity_shards: usize) -> Result<V
     if data_shards == 0 || parity_shards == 0 {
         bail!("data_shards and parity_shards must both be > 0");
     }
+    if data.is_empty() {
+        bail!("data must not be empty");
+    }
     let r = ReedSolomon::new(data_shards, parity_shards)
         .map_err(|e| anyhow::anyhow!("RS init error: {:?}", e))?;
     let shard_size = shard_len(data.len(), data_shards);
@@ -28,7 +31,7 @@ pub fn encode(data: &[u8], data_shards: usize, parity_shards: usize) -> Result<V
 /// Missing shards are represented as `None`.
 /// Returns the original data (without padding), truncated to `original_len`.
 pub fn decode(
-    shards: &mut Vec<Option<Vec<u8>>>,
+    shards: &mut [Option<Vec<u8>>],
     data_shards: usize,
     parity_shards: usize,
     original_len: usize,
@@ -38,8 +41,11 @@ pub fn decode(
     r.reconstruct(shards)
         .map_err(|e| anyhow::anyhow!("RS reconstruct error: {:?}", e))?;
     let mut result = Vec::new();
-    for i in 0..data_shards {
-        result.extend_from_slice(shards[i].as_ref().unwrap());
+    for (i, shard_opt) in shards[..data_shards].iter().enumerate() {
+        let shard = shard_opt
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("data shard {} missing after reconstruction", i))?;
+        result.extend_from_slice(shard);
     }
     result.truncate(original_len);
     Ok(result)
@@ -47,8 +53,12 @@ pub fn decode(
 
 /// Returns the byte length of each shard for a given total data length.
 /// Pads up to the nearest multiple of data_shards.
+///
+/// # Panics
+/// Panics if `data_shards == 0`.
 pub fn shard_len(data_len: usize, data_shards: usize) -> usize {
-    (data_len + data_shards - 1) / data_shards
+    assert!(data_shards > 0, "data_shards must be > 0");
+    data_len.div_ceil(data_shards)
 }
 
 #[cfg(test)]
@@ -91,5 +101,12 @@ mod tests {
         assert_eq!(shard_len(28, 4), 7);
         assert_eq!(shard_len(10_000, 4), 2500);
         assert_eq!(shard_len(1, 4), 1);  // ceil(1/4) = 1
+    }
+
+    #[test]
+    fn test_encode_empty_data_returns_error() {
+        // empty shards are rejected by reed-solomon-erasure
+        let result = encode(&[], 4, 2);
+        assert!(result.is_err());
     }
 }
