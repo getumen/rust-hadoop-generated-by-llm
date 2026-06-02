@@ -308,7 +308,93 @@ impl Client {
             "Writing block to chunk servers"
         );
 
-        // 4. Write to first chunk server with replication pipeline
+        // 4a. EC write path: encode into k+m shards and write in parallel
+        let is_ec = alloc_resp.ec_data_shards > 0 && alloc_resp.ec_parity_shards > 0;
+        if is_ec {
+            let data_shards = alloc_resp.ec_data_shards as usize;
+            let parity_shards = alloc_resp.ec_parity_shards as usize;
+            let total_shards = data_shards + parity_shards;
+            let original_size = buffer.len() as u64;
+
+            if chunk_servers.len() != total_shards {
+                bail!(
+                    "Expected {} chunk servers for EC({},{}), got {}",
+                    total_shards, data_shards, parity_shards, chunk_servers.len()
+                );
+            }
+
+            let shards = dfs_common::erasure::encode(&buffer, data_shards, parity_shards)?;
+
+            // Write all shards in parallel (no pipeline, each goes to its own CS)
+            let mut write_futs = Vec::new();
+            for (shard_idx, (shard_data, cs_addr)) in
+                shards.into_iter().zip(chunk_servers.iter()).enumerate()
+            {
+                let block_id = block.block_id.clone();
+                let cs_url = format!("http://{}", cs_addr);
+                let self_clone = self.clone();
+                let shard_idx_i32 = shard_idx as i32;
+                write_futs.push(async move {
+                    let channel = self_clone.connect_endpoint(&cs_url).await?;
+                    let mut cs_client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(
+                        channel,
+                        dfs_common::telemetry::tracing_interceptor
+                            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                    )
+                    .max_decoding_message_size(100 * 1024 * 1024);
+                    let req = tonic::Request::new(WriteBlockRequest {
+                        block_id: block_id.clone(),
+                        data: shard_data,
+                        next_servers: vec![],
+                        expected_checksum_crc32c: 0,
+                        shard_index: shard_idx_i32,
+                    });
+                    let resp = cs_client.write_block(req).await?.into_inner();
+                    if !resp.success {
+                        bail!("Shard {} write failed: {}", shard_idx_i32, resp.error_message);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            futures_util::future::try_join_all(write_futs).await?;
+
+            // Complete file with EC block info (actual_size = original unpadded size)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            let ec_block_checksum = crate::dfs::BlockChecksumInfo {
+                block_id: block.block_id.clone(),
+                checksum_crc32c: 0,
+                actual_size: original_size,
+            };
+
+            let (complete_resp, _) = self
+                .execute_rpc(Some(dest), |mut client| {
+                    let dest = dest.to_string();
+                    let blocks = vec![ec_block_checksum.clone()];
+                    async move {
+                        let complete_req = tonic::Request::new(CompleteFileRequest {
+                            path: dest,
+                            size: original_size,
+                            etag_md5: "".to_string(),
+                            created_at_ms: now,
+                            block_checksums: blocks,
+                        });
+                        client.complete_file(complete_req).await
+                    }
+                })
+                .await?;
+
+            if !complete_resp.into_inner().success {
+                bail!("Failed to complete EC file");
+            }
+
+            return Ok(());
+        }
+
+        // 4b. Replication write path (non-EC)
         let chunk_server_addr = format!("http://{}", chunk_servers[0]);
         let channel = self.connect_endpoint(&chunk_server_addr).await?;
         let mut chunk_client =
@@ -1154,6 +1240,24 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ec_encode_produces_correct_shard_count() {
+        let data: Vec<u8> = (0..1024u16).map(|i| (i % 256) as u8).collect();
+        let shards = dfs_common::erasure::encode(&data, 4, 2).unwrap();
+        assert_eq!(shards.len(), 6);
+        // Each shard should be ceil(1024/4) = 256 bytes
+        for s in &shards {
+            assert_eq!(s.len(), 256);
+        }
+    }
+
+    #[test]
+    fn test_ec_shard_size_calculation() {
+        assert_eq!(dfs_common::erasure::shard_len(1000, 4), 250);
+        assert_eq!(dfs_common::erasure::shard_len(1001, 4), 251); // ceiling
+        assert_eq!(dfs_common::erasure::shard_len(4, 4), 1);
+    }
 
     fn make_client() -> Client {
         Client::new(vec!["http://localhost:50051".to_string()], vec![])
