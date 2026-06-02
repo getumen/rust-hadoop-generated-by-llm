@@ -1706,23 +1706,29 @@ impl MasterService for MyMaster {
                         );
                     }
 
-                    let needed = if ec_data > 0 && ec_parity > 0 {
-                        (ec_data + ec_parity) as usize
-                    } else {
-                        DEFAULT_REPLICATION_FACTOR
-                    };
-
                     let candidates: Vec<(String, ChunkServerStatus)> = state
                         .chunk_servers
                         .iter()
                         .map(|(addr, status)| (addr.clone(), status.clone()))
                         .collect();
 
-                    if candidates.len() < needed {
-                        return Err(Status::unavailable(format!(
-                            "Need {} chunk servers for EC({},{}), only {} available",
-                            needed, ec_data, ec_parity, candidates.len()
-                        )));
+                    let needed = if ec_data > 0 && ec_parity > 0 {
+                        // EC requires exactly k+m distinct chunkservers (one shard each)
+                        let total = (ec_data + ec_parity) as usize;
+                        if candidates.len() < total {
+                            return Err(Status::unavailable(format!(
+                                "Need {} chunk servers for EC({},{}), only {} available",
+                                total, ec_data, ec_parity, candidates.len()
+                            )));
+                        }
+                        total
+                    } else {
+                        // Replication: use as many replicas as possible up to DEFAULT_REPLICATION_FACTOR
+                        std::cmp::min(DEFAULT_REPLICATION_FACTOR, candidates.len())
+                    };
+
+                    if needed == 0 {
+                        return Err(Status::unavailable("No chunk servers available"));
                     }
 
                     let selected = select_servers_rack_aware(&candidates, needed);

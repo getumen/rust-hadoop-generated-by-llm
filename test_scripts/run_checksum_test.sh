@@ -47,6 +47,21 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
+# Wait for Raft leader election (master may not have leader immediately after S3 reports healthy)
+echo "Waiting for Raft leader election..."
+for i in $(seq 1 20); do
+    LEADER=$(curl -s http://localhost:8080/raft/state 2>/dev/null | grep -o '"role":"Leader"' || true)
+    if [ -n "$LEADER" ]; then
+        echo "  Raft leader elected (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 20 ]; then
+        echo "Warning: Raft leader not confirmed after 20s, proceeding anyway..."
+        break
+    fi
+    sleep 1
+done
+
 # Run the test
 echo "Running checksum_verification_test.py against $S3_ENDPOINT..."
 export S3_ENDPOINT

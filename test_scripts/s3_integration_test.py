@@ -198,14 +198,12 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # cleanup?
-        # Maybe separate cleanup or auto-cleanup.
-        # test_cleanup(s3)
-        pass
-        # For now, let's look at the state if it fails.
-        # But if it succeeds, we might want to clean up to be nice.
-        if "clean" in sys.argv:
+        # Always clean up so MPU artifacts don't pollute subsequent tests
+        # (list_files currently returns all files; stale MPU markers cause false is_mpu detection)
+        try:
             test_cleanup(s3)
+        except Exception as cleanup_err:
+            print(f"Cleanup warning (non-fatal): {cleanup_err}")
 
 if __name__ == "__main__":
     main()

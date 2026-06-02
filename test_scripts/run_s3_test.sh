@@ -36,10 +36,24 @@ if [ $RETRIES -eq 0 ]; then
     exit 1
 fi
 
+# 4. Wait for Raft leader election
+echo "Waiting for Raft leader election..."
+for i in $(seq 1 30); do
+    LEADER=$(curl -s http://localhost:8080/raft/state 2>/dev/null | grep -o '"role":"Leader"' || true)
+    if [ -n "$LEADER" ]; then
+        echo "  Raft leader elected (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "Warning: Raft leader not confirmed after 30s, proceeding anyway..."
+    fi
+    sleep 1
+done
+# Extra buffer after leader election
+sleep 3
+
 # 4. Run Test
 echo "Running Integration Test..."
-# Allow Masters to elect leader (takes ~2-5s)
-sleep 10
 
 set +e
 python3 test_scripts/s3_integration_test.py > test_output.log 2>&1
