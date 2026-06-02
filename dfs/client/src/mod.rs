@@ -918,6 +918,7 @@ impl Client {
         let mut opt_shards: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut available = 0usize;
         for (i, result) in results {
+            if i >= total { continue; }
             if let Ok(data) = result {
                 opt_shards[i] = Some(data);
                 available += 1;
