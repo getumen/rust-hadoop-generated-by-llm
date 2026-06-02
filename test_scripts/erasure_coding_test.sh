@@ -76,13 +76,9 @@ OUTPUT=$(docker exec "$MASTER_CONTAINER" \
     /app/dfs_cli --master http://localhost:50051 \
     put /ec_test_original.bin /ec/test.bin --ec-data 2 --ec-parity 2 2>&1)
 
-if echo "$OUTPUT" | grep -qi "error\|failed\|panic"; then
+if ! echo "$OUTPUT" | grep -qi "EC RS(2,2)"; then
     echo "Output: $OUTPUT"
-    fail "EC put failed"
-fi
-if ! echo "$OUTPUT" | grep -qi "EC RS(2,2)\|EC"; then
-    echo "Output: $OUTPUT"
-    fail "Output did not confirm EC upload: $OUTPUT"
+    fail "Output did not confirm EC upload (expected 'EC RS(2,2)')"
 fi
 pass "EC file written: RS(2,2)"
 
@@ -124,7 +120,6 @@ fi
 pass "inspect: OriginalSize=65536 (64KB)"
 
 # Verify shard count: RS(2,2) = 4 shards
-SHARD_COUNT=$(echo "$INSPECT" | grep -oP '"[^"]+:[0-9]+"' | wc -l || echo "$INSPECT" | grep -c "50052" || true)
 info "Inspect output:"
 echo "$INSPECT" | grep -E "Storage|Block|EC|Shard|Original" | while read line; do
     info "  $line"

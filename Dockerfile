@@ -8,7 +8,14 @@ RUN apt-get update && apt-get install -y \
     clang \
     libclang-dev \
     build-essential \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Trust corporate CA if present (needed for SSL-inspecting proxies)
+# Copy a dummy placeholder and overwrite if the real cert exists
+RUN echo "" > /usr/local/share/ca-certificates/corporate_ca.crt
+COPY corporate_ca.pem /usr/local/share/ca-certificates/corporate_ca.crt
+RUN update-ca-certificates
 
 # Install sccache for faster incremental builds
 RUN ARCH=$(uname -m) && \
@@ -28,12 +35,13 @@ COPY Cargo.toml Cargo.lock ./
 # COPY dfs/common/Cargo.toml dfs/common/Cargo.toml
 # ... (omitted for brevity, will copy all first)
 
-# Copy the entire project
+# Copy the entire project and build
+# External dependencies are downloaded via internet (CA cert installed above for corporate proxies)
+# The cargo registry cache speeds up rebuilds when only source code changes
 COPY . .
-
-# Build the project with optimizations, using sccache mount cache for faster rebuilds
-RUN --mount=type=cache,target=/sccache \
-    cargo build --release && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/sccache \
+    cargo build --release --locked && \
     strip target/release/master && \
     strip target/release/chunkserver && \
     strip target/release/config_server && \
