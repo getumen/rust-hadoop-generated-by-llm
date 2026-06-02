@@ -226,6 +226,19 @@ impl Client {
         self.create_file_from_buffer(buffer, dest).await
     }
 
+    pub async fn create_file_ec(
+        &self,
+        source: &Path,
+        dest: &str,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
+    ) -> anyhow::Result<()> {
+        let mut file = File::open(source)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        self.create_file_from_buffer_ec(buffer, dest, ec_data_shards, ec_parity_shards).await
+    }
+
     pub async fn create_file_from_buffer(&self, buffer: Vec<u8>, dest: &str) -> anyhow::Result<()> {
         let buffer_len = buffer.len() as u64;
 
@@ -475,6 +488,178 @@ impl Client {
             bail!("Failed to complete file");
         }
 
+        Ok(())
+    }
+
+    pub async fn create_file_from_buffer_ec(
+        &self,
+        buffer: Vec<u8>,
+        dest: &str,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
+    ) -> anyhow::Result<()> {
+        // Like create_file_from_buffer but sets EC policy in CreateFileRequest.
+        // We can't delegate to create_file_from_buffer because it would overwrite
+        // the EC policy with zeros when it sends its own CreateFileRequest.
+        let buffer_len = buffer.len() as u64;
+
+        let (create_resp, success_addr) = self
+            .execute_rpc(Some(dest), |mut client| {
+                let dest = dest.to_string();
+                async move {
+                    let create_req = tonic::Request::new(CreateFileRequest {
+                        path: dest,
+                        ec_data_shards,
+                        ec_parity_shards,
+                    });
+                    let response = client.create_file(create_req).await?;
+                    let inner = response.get_ref();
+                    if !inner.success && inner.error_message == "Not Leader" {
+                        return Err(tonic::Status::unavailable(format!(
+                            "Not Leader|{}",
+                            inner.leader_hint
+                        )));
+                    }
+                    Ok(response)
+                }
+            })
+            .await?;
+        let create_resp = create_resp.into_inner();
+        if !create_resp.success {
+            bail!("Failed to create EC file: {}", create_resp.error_message);
+        }
+
+        // Allocate block (master returns ec_data_shards/ec_parity_shards from file policy)
+        let alloc_masters = {
+            let mut m = vec![success_addr];
+            for addr in &self.master_addrs {
+                if !m.contains(addr) {
+                    m.push(addr.clone());
+                }
+            }
+            m
+        };
+        let (alloc_resp, _) = self
+            .execute_rpc_internal(
+                &alloc_masters,
+                self.max_retries,
+                self.initial_backoff_ms,
+                |mut client| {
+                    let dest = dest.to_string();
+                    async move {
+                        let alloc_req = tonic::Request::new(AllocateBlockRequest { path: dest });
+                        let response = client.allocate_block(alloc_req).await?;
+                        let inner = response.get_ref();
+                        if inner.block.is_none() {
+                            return Err(tonic::Status::unavailable(format!(
+                                "Not Leader|{}",
+                                inner.leader_hint
+                            )));
+                        }
+                        Ok(response)
+                    }
+                },
+            )
+            .await?;
+        let alloc_resp = alloc_resp.into_inner();
+        let block = alloc_resp.block.ok_or_else(|| anyhow!("No block allocated"))?;
+        let chunk_servers = alloc_resp.chunk_server_addresses;
+
+        if chunk_servers.is_empty() {
+            bail!("No chunk servers available for EC write");
+        }
+
+        // EC write: encode + parallel shard writes
+        let data_shards = alloc_resp.ec_data_shards as usize;
+        let parity_shards = alloc_resp.ec_parity_shards as usize;
+        let total_shards = data_shards + parity_shards;
+        let original_size = buffer_len;
+
+        if data_shards == 0 || parity_shards == 0 {
+            bail!(
+                "Master returned non-EC policy (data={}, parity={}) for EC file",
+                data_shards, parity_shards
+            );
+        }
+        if chunk_servers.len() != total_shards {
+            bail!(
+                "Expected {} chunk servers for EC({},{}), got {}",
+                total_shards, data_shards, parity_shards, chunk_servers.len()
+            );
+        }
+
+        let shards = dfs_common::erasure::encode(&buffer, data_shards, parity_shards)?;
+        let shard_checksums: Vec<u32> = shards.iter().map(|s| {
+            let mut h = crc32fast::Hasher::new();
+            h.update(s);
+            h.finalize()
+        }).collect();
+        let mut full_hasher = crc32fast::Hasher::new();
+        full_hasher.update(&buffer);
+        let full_checksum = full_hasher.finalize();
+
+        let mut write_futs = Vec::new();
+        for (shard_idx, (shard_data, cs_addr)) in
+            shards.into_iter().zip(chunk_servers.iter()).enumerate()
+        {
+            let block_id = block.block_id.clone();
+            let cs_url = format!("http://{}", cs_addr);
+            let self_clone = self.clone();
+            let shard_idx_i32 = shard_idx as i32;
+            let checksum = shard_checksums[shard_idx];
+            write_futs.push(async move {
+                let channel = self_clone.connect_endpoint(&cs_url).await?;
+                let mut cs_client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(
+                    channel,
+                    dfs_common::telemetry::tracing_interceptor
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                )
+                .max_decoding_message_size(100 * 1024 * 1024);
+                let req = tonic::Request::new(WriteBlockRequest {
+                    block_id: block_id.clone(),
+                    data: shard_data,
+                    next_servers: vec![],
+                    expected_checksum_crc32c: checksum,
+                    shard_index: shard_idx_i32,
+                });
+                let resp = cs_client.write_block(req).await?.into_inner();
+                if !resp.success {
+                    bail!("Shard {} write failed: {}", shard_idx_i32, resp.error_message);
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        futures_util::future::try_join_all(write_futs).await?;
+
+        // Complete file
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ec_block_checksum = crate::dfs::BlockChecksumInfo {
+            block_id: block.block_id.clone(),
+            checksum_crc32c: full_checksum,
+            actual_size: original_size,
+        };
+        let (complete_resp, _) = self
+            .execute_rpc(Some(dest), |mut client| {
+                let dest = dest.to_string();
+                let blocks = vec![ec_block_checksum.clone()];
+                async move {
+                    let complete_req = tonic::Request::new(CompleteFileRequest {
+                        path: dest,
+                        size: original_size,
+                        etag_md5: "".to_string(),
+                        created_at_ms: now,
+                        block_checksums: blocks,
+                    });
+                    client.complete_file(complete_req).await
+                }
+            })
+            .await?;
+        if !complete_resp.into_inner().success {
+            bail!("Failed to complete EC file");
+        }
         Ok(())
     }
 

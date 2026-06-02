@@ -48,6 +48,12 @@ enum Commands {
     Put {
         source: PathBuf,
         dest: String,
+        /// Erasure coding data shards (e.g. --ec-data 2 --ec-parity 2 for RS(2,2))
+        #[arg(long, default_value_t = 0)]
+        ec_data: i32,
+        /// Erasure coding parity shards
+        #[arg(long, default_value_t = 0)]
+        ec_parity: i32,
     },
     Get {
         source: String,
@@ -262,9 +268,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", file);
             }
         }
-        Commands::Put { source, dest } => {
-            client.create_file(&source, &dest).await?;
-            println!("File uploaded successfully with replication");
+        Commands::Put { source, dest, ec_data, ec_parity } => {
+            if ec_data > 0 && ec_parity > 0 {
+                client.create_file_ec(&source, &dest, ec_data, ec_parity).await?;
+                println!("File uploaded successfully with EC RS({},{})", ec_data, ec_parity);
+            } else {
+                client.create_file(&source, &dest).await?;
+                println!("File uploaded successfully with replication");
+            }
         }
         Commands::Get { source, dest } => {
             client.get_file(&source, &dest).await?;
@@ -275,12 +286,26 @@ async fn main() -> anyhow::Result<()> {
             if let Some(meta) = metadata {
                 println!("File Metadata for: {}", meta.path);
                 println!("  Size: {} bytes", meta.size);
+                if meta.ec_data_shards > 0 {
+                    println!("  Storage: EC RS({},{})", meta.ec_data_shards, meta.ec_parity_shards);
+                } else {
+                    println!("  Storage: Replicated");
+                }
                 println!("  Blocks: {}", meta.blocks.len());
                 for (i, block) in meta.blocks.iter().enumerate() {
-                    println!(
-                        "    Block {}: ID={}, Size={}, Locations={:?}",
-                        i, block.block_id, block.size, block.locations
-                    );
+                    if block.ec_data_shards > 0 {
+                        println!(
+                            "    Block {}: ID={}, Size={}, EC=RS({},{}), OriginalSize={}, Shards={:?}",
+                            i, block.block_id, block.size,
+                            block.ec_data_shards, block.ec_parity_shards,
+                            block.original_size, block.locations
+                        );
+                    } else {
+                        println!(
+                            "    Block {}: ID={}, Size={}, Locations={:?}",
+                            i, block.block_id, block.size, block.locations
+                        );
+                    }
                 }
             } else {
                 println!("File not found: {}", path);
