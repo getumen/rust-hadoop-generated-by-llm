@@ -480,7 +480,7 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                         r#type: 1, // REPLICATE
                         block_id: block.block_id.clone(),
                         target_chunk_server_address: target.clone(),
-                        shard_index: 0,
+                        shard_index: -1,
                         ec_data_shards: 0,
                         ec_parity_shards: 0,
                         ec_shard_sources: vec![],
@@ -699,7 +699,7 @@ impl MyMaster {
                                 r#type: 1, // REPLICATE
                                 block_id: block_id.clone(),
                                 target_chunk_server_address: least_full_addr.clone(),
-                                shard_index: 0,
+                                shard_index: -1,
                                 ec_data_shards: 0,
                                 ec_parity_shards: 0,
                                 ec_shard_sources: vec![],
@@ -872,7 +872,7 @@ impl MyMaster {
                                     r#type: 1, // REPLICATE
                                     block_id: block_id.clone(),
                                     target_chunk_server_address: least_full_addr.clone(),
-                                    shard_index: 0,
+                                    shard_index: -1,
                                     ec_data_shards: 0,
                                     ec_parity_shards: 0,
                                     ec_shard_sources: vec![],

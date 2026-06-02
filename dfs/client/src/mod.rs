@@ -234,7 +234,11 @@ impl Client {
             .execute_rpc(Some(dest), |mut client| {
                 let dest = dest.to_string();
                 async move {
-                    let create_req = tonic::Request::new(CreateFileRequest { path: dest });
+                    let create_req = tonic::Request::new(CreateFileRequest {
+                        path: dest,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                    });
                     let response = client.create_file(create_req).await?;
                     let inner = response.get_ref();
                     if !inner.success && inner.error_message == "Not Leader" {
@@ -335,6 +339,7 @@ impl Client {
             data: buffer,
             next_servers,
             expected_checksum_crc32c: checksum_crc32c,
+            shard_index: -1,  // -1 = replicated (not EC)
         });
 
         let write_resp = chunk_client.write_block(write_req).await?.into_inner();
@@ -1171,6 +1176,9 @@ mod tests {
             size: 0,
             locations: vec![],
             checksum_crc32c: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            original_size: 0,
         };
         let result = client.fetch_single_block(&block).await;
         assert!(result.is_err());
@@ -1199,6 +1207,9 @@ mod tests {
             size: 0,
             locations: vec!["localhost:19999".to_string()], // unreachable
             checksum_crc32c: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            original_size: 0,
         };
         // Should fail gracefully (not panic) even with hedge enabled
         let result = client.fetch_single_block(&block).await;
@@ -1217,6 +1228,9 @@ mod tests {
                 "localhost:19998".to_string(),
             ],
             checksum_crc32c: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            original_size: 0,
         };
         let result = client.fetch_single_block(&block).await;
         assert!(result.is_err());
