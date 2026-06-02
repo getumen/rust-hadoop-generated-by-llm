@@ -442,6 +442,19 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                 // ── EC block: detect missing shards and issue RECONSTRUCT_EC_SHARD ──
                 let k = block.ec_data_shards as usize;
 
+                let total = (block.ec_data_shards + block.ec_parity_shards) as usize;
+                if block.locations.len() != total {
+                    tracing::error!(
+                        "EC block {} has {} locations but EC({},{}) expects {}; skipping heal",
+                        block.block_id,
+                        block.locations.len(),
+                        block.ec_data_shards,
+                        block.ec_parity_shards,
+                        total
+                    );
+                    continue; // skip this block
+                }
+
                 // Count live shards
                 let live_count = block
                     .locations
@@ -459,9 +472,10 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                     // Shard is missing
                     if live_count < k {
                         tracing::error!(
-                            "Healer: EC block {} is unrecoverable — only {}/{} data shards live",
+                            "EC block {} is unrecoverable: only {}/{} shards available (need {} to recover)",
                             block.block_id,
                             live_count,
+                            block.ec_data_shards + block.ec_parity_shards,
                             k
                         );
                         // Can't recover any shard; skip all remaining shards too
@@ -469,19 +483,15 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                     }
 
                     // Find a target CS not already holding a shard of this block
-                    let target_opt = live_servers
+                    let target = match live_servers
                         .iter()
-                        .find(|s| !block.locations.contains(s))
-                        .or_else(|| {
-                            // Fallback: any live CS that isn't the dead one
-                            live_servers.iter().find(|s| s.as_str() != loc)
-                        });
-
-                    let target = match target_opt {
+                        .find(|s| !block.locations.contains(*s))
+                    {
                         Some(t) => t.clone(),
                         None => {
                             tracing::warn!(
-                                "Healer: no available target CS for EC shard {} of block {}",
+                                "EC heal: no free CS to hold reconstructed shard {} of block {}; \
+                                 cluster may need more nodes",
                                 shard_idx,
                                 block.block_id
                             );
@@ -3405,8 +3415,10 @@ mod tests {
     fn test_heal_ec_block_issues_reconstruct_command() {
         let mut state = MasterState::default();
 
-        // 6 CSes registered: cs0, cs1, cs3, cs4, cs5 are live; cs2 is dead (not registered)
-        for i in [0usize, 1, 3, 4, 5] {
+        // 7 CSes registered: cs0, cs1, cs3, cs4, cs5 are live; cs2 is dead (not registered);
+        // cs6 is a spare node not holding any shard of the block, so it can serve as the
+        // reconstruction target (required by the no-fallback target selection policy).
+        for i in [0usize, 1, 3, 4, 5, 6] {
             state.chunk_servers.insert(
                 format!("cs{}:50052", i),
                 ChunkServerStatus { last_heartbeat: 9_999_999_999_999, used_space: 0, available_space: 1_000_000, chunk_count: 0, rack_id: String::new() },
