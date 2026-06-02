@@ -480,6 +480,11 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                         r#type: 1, // REPLICATE
                         block_id: block.block_id.clone(),
                         target_chunk_server_address: target.clone(),
+                        shard_index: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        ec_shard_sources: vec![],
+                        original_block_size: 0,
                     });
                 tracing::info!(
                     "Healer: scheduled replication of block {} from {} to {}",
@@ -694,6 +699,11 @@ impl MyMaster {
                                 r#type: 1, // REPLICATE
                                 block_id: block_id.clone(),
                                 target_chunk_server_address: least_full_addr.clone(),
+                                shard_index: 0,
+                                ec_data_shards: 0,
+                                ec_parity_shards: 0,
+                                ec_shard_sources: vec![],
+                                original_block_size: 0,
                             };
 
                             state
@@ -862,6 +872,11 @@ impl MyMaster {
                                     r#type: 1, // REPLICATE
                                     block_id: block_id.clone(),
                                     target_chunk_server_address: least_full_addr.clone(),
+                                    shard_index: 0,
+                                    ec_data_shards: 0,
+                                    ec_parity_shards: 0,
+                                    ec_shard_sources: vec![],
+                                    original_block_size: 0,
                                 };
 
                                 state
@@ -1617,11 +1632,16 @@ impl MasterService for MyMaster {
                         size: 0,
                         locations: selected_servers.clone(),
                         checksum_crc32c: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        original_size: 0,
                     };
                     Ok(Response::new(AllocateBlockResponse {
                         block: Some(block),
                         chunk_server_addresses: selected_servers,
                         leader_hint: "".to_string(),
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
                     }))
                 }
                 Ok(Err(leader_opt)) => {
@@ -1631,6 +1651,8 @@ impl MasterService for MyMaster {
                         block: None,
                         chunk_server_addresses: vec![],
                         leader_hint,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
                     }))
                 }
                 Err(_) => Err(Status::internal("Raft response error")),
@@ -2817,6 +2839,8 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2856,6 +2880,8 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2879,6 +2905,8 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2904,9 +2932,14 @@ mod tests {
                 size: 1024,
                 locations: vec!["chunk1:50052".to_string()],
                 checksum_crc32c: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                original_size: 0,
             }],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2965,6 +2998,8 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3007,9 +3042,14 @@ mod tests {
                     size: 100,
                     locations: vec!["cs1:50055".to_string()],
                     checksum_crc32c: 0,
+                    ec_data_shards: 0,
+                    ec_parity_shards: 0,
+                    original_size: 0,
                 }],
                 etag_md5: String::new(),
                 created_at_ms: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
             },
         );
         heal_under_replicated_blocks(&mut state);
@@ -3039,9 +3079,14 @@ mod tests {
                     size: 100,
                     locations: vec!["cs1:50055".to_string(), "cs2:50056".to_string(), "cs3:50057".to_string()],
                     checksum_crc32c: 0,
+                    ec_data_shards: 0,
+                    ec_parity_shards: 0,
+                    original_size: 0,
                 }],
                 etag_md5: String::new(),
                 created_at_ms: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
             },
         );
         heal_under_replicated_blocks(&mut state);
@@ -3068,9 +3113,14 @@ mod tests {
                     size: 100,
                     locations: vec!["cs1:50055".to_string(), "cs2:50056".to_string(), "cs3:50057".to_string()],
                     checksum_crc32c: 0,
+                    ec_data_shards: 0,
+                    ec_parity_shards: 0,
+                    original_size: 0,
                 }],
                 etag_md5: String::new(),
                 created_at_ms: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
             },
         );
         state.bad_block_locations

@@ -2878,6 +2878,8 @@ impl RaftNode {
                                     blocks: vec![],
                                     etag_md5: "".to_string(),
                                     created_at_ms: 0,
+                                    ec_data_shards: 0,
+                                    ec_parity_shards: 0,
                                 },
                             );
                             tracing::info!("Created file {}", path);
@@ -2898,6 +2900,9 @@ impl RaftNode {
                                     size: 0,
                                     locations: locations.clone(),
                                     checksum_crc32c: 0,
+                                    ec_data_shards: 0,
+                                    ec_parity_shards: 0,
+                                    original_size: 0,
                                 });
                                 tracing::info!("Allocated block {} for file {}", block_id, path);
                             } else {
@@ -3245,6 +3250,8 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
