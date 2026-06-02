@@ -3062,6 +3062,7 @@ impl RaftNode {
                                         {
                                             block.checksum_crc32c = info.checksum_crc32c;
                                             block.size = info.actual_size;
+                                            block.original_size = info.actual_size;
                                         }
                                     }
                                 } else {
