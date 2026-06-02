@@ -394,13 +394,15 @@ impl MyChunkServer {
         }
 
         // 1. Fetch available shards concurrently
-        let mut fetch_futures: Vec<
-            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, anyhow::Result<Vec<u8>>)> + Send>>,
-        > = Vec::new();
+        type ShardFuture =
+            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, anyhow::Result<Vec<u8>>)> + Send>>;
+        let mut fetch_futures: Vec<ShardFuture> = Vec::new();
 
         for (i, src_addr) in sources.iter().enumerate() {
+            // Skip the shard we're reconstructing — RS::reconstruct needs opt_shards[shard_index] = None
+            // to know which shard to fill in. Also skip unavailable sources (empty addr).
             if src_addr.is_empty() || i == shard_index {
-                continue; // skip unavailable and the shard we are reconstructing
+                continue;
             }
             let block_id_c = block_id.clone();
             let addr = format!("http://{}", src_addr);
@@ -468,6 +470,9 @@ impl MyChunkServer {
 
         // Verify we have enough shards to reconstruct
         let available = opt_shards.iter().filter(|s| s.is_some()).count();
+        // RS requires at least data_shards shards present to reconstruct any missing one.
+        // Note: opt_shards[shard_index] is intentionally None (being reconstructed),
+        // so available counts only the other shards.
         if available < data_shards {
             return Err(anyhow::anyhow!(
                 "Only {} shards available, need at least {} for reconstruction",
