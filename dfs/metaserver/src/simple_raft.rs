@@ -2897,13 +2897,15 @@ impl RaftNode {
                             locations,
                         } => {
                             if let Some(meta) = master_state.files.get_mut(path) {
+                                let ec_data = meta.ec_data_shards;
+                                let ec_parity = meta.ec_parity_shards;
                                 meta.blocks.push(crate::dfs::BlockInfo {
                                     block_id: block_id.clone(),
                                     size: 0,
                                     locations: locations.clone(),
                                     checksum_crc32c: 0,
-                                    ec_data_shards: 0,
-                                    ec_parity_shards: 0,
+                                    ec_data_shards: ec_data,
+                                    ec_parity_shards: ec_parity,
                                     original_size: 0,
                                 });
                                 tracing::info!("Allocated block {} for file {}", block_id, path);

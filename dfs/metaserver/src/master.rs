@@ -23,6 +23,8 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 use uuid::Uuid;
 
+const DEFAULT_REPLICATION_FACTOR: usize = 3;
+
 // ============================================================================
 // Transaction Record Types for Cross-Shard Operations
 // ============================================================================
@@ -1592,19 +1594,24 @@ impl MasterService for MyMaster {
                         return Err(Status::not_found("File not found"));
                     }
 
-                    if state.chunk_servers.is_empty() {
-                        return Err(Status::unavailable("No chunk servers available"));
-                    }
-
                     // Look up file's EC policy
                     let file_meta = &state.files[&req.path];
                     let ec_data = file_meta.ec_data_shards;
                     let ec_parity = file_meta.ec_parity_shards;
 
+                    if (ec_data > 0) != (ec_parity > 0) {
+                        tracing::warn!(
+                            path = %req.path,
+                            ec_data,
+                            ec_parity,
+                            "EC policy partially set — only one of ec_data/ec_parity is non-zero; falling back to replication"
+                        );
+                    }
+
                     let needed = if ec_data > 0 && ec_parity > 0 {
                         (ec_data + ec_parity) as usize
                     } else {
-                        3 // default replication factor
+                        DEFAULT_REPLICATION_FACTOR
                     };
 
                     let candidates: Vec<(String, ChunkServerStatus)> = state
