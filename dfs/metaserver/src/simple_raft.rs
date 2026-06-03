@@ -3483,6 +3483,28 @@ mod tests {
                         meta.moved_to_cold_at_ms = *moved_at_ms;
                     }
                 }
+                MasterCommand::AllocateBlock { path, block_id, locations } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        let ec_data = meta.ec_data_shards;
+                        let ec_parity = meta.ec_parity_shards;
+                        meta.blocks.push(crate::dfs::BlockInfo {
+                            block_id: block_id.clone(),
+                            size: 0,
+                            locations: locations.clone(),
+                            checksum_crc32c: 0,
+                            ec_data_shards: ec_data,
+                            ec_parity_shards: ec_parity,
+                            original_size: 0,
+                        });
+                    }
+                }
+                MasterCommand::ConvertToEc { path, ec_data_shards, ec_parity_shards, new_blocks } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        meta.ec_data_shards = *ec_data_shards;
+                        meta.ec_parity_shards = *ec_parity_shards;
+                        meta.blocks = new_blocks.clone();
+                    }
+                }
                 _ => {}
             }
         }
@@ -3506,11 +3528,18 @@ mod tests {
                 accessed_at_ms: 1000,
             },
         );
+        apply_cmd(
+            &state,
+            MasterCommand::UpdateAccessStats {
+                path: "/f".into(),
+                accessed_at_ms: 2000,
+            },
+        );
         let locked = state.lock().unwrap();
         if let AppState::Master(ref ms) = *locked {
             let f = ms.files.get("/f").unwrap();
-            assert_eq!(f.last_access_ms, 1000);
-            assert_eq!(f.access_count, 1);
+            assert_eq!(f.last_access_ms, 2000);
+            assert_eq!(f.access_count, 2);
         }
     }
 
@@ -3535,6 +3564,66 @@ mod tests {
         let locked = state.lock().unwrap();
         if let AppState::Master(ref ms) = *locked {
             assert_eq!(ms.files.get("/f").unwrap().moved_to_cold_at_ms, 5000);
+        }
+    }
+
+    #[test]
+    fn test_apply_convert_to_ec() {
+        let state = make_test_master_state();
+        // Create file
+        apply_cmd(
+            &state,
+            MasterCommand::CreateFile {
+                path: "/ec_file".into(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+            },
+        );
+        // Allocate a replication block
+        apply_cmd(
+            &state,
+            MasterCommand::AllocateBlock {
+                path: "/ec_file".into(),
+                block_id: "blk-001".into(),
+                locations: vec!["cs1:9000".into()],
+            },
+        );
+        // Convert to EC
+        let ec_block = crate::dfs::BlockInfo {
+            block_id: "blk-001-ec".into(),
+            size: 0,
+            locations: vec![
+                "cs1".into(),
+                "cs2".into(),
+                "cs3".into(),
+                "cs4".into(),
+                "cs5".into(),
+                "cs6".into(),
+                "cs7".into(),
+                "cs8".into(),
+                "cs9".into(),
+            ],
+            checksum_crc32c: 0,
+            ec_data_shards: 6,
+            ec_parity_shards: 3,
+            original_size: 0,
+        };
+        apply_cmd(
+            &state,
+            MasterCommand::ConvertToEc {
+                path: "/ec_file".into(),
+                ec_data_shards: 6,
+                ec_parity_shards: 3,
+                new_blocks: vec![ec_block],
+            },
+        );
+        let locked = state.lock().unwrap();
+        if let AppState::Master(ref ms) = *locked {
+            let f = ms.files.get("/ec_file").unwrap();
+            assert_eq!(f.ec_data_shards, 6);
+            assert_eq!(f.ec_parity_shards, 3);
+            assert_eq!(f.blocks.len(), 1);
+            assert_eq!(f.blocks[0].ec_data_shards, 6);
         }
     }
 }
