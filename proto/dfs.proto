@@ -65,6 +65,7 @@ message ChunkServerCommand {
     REPLICATE = 1;
     DELETE = 2; // Future use
     RECONSTRUCT_EC_SHARD = 3;
+    MOVE_TO_COLD = 4;  // Move block from hot storage dir to cold storage dir
   }
   CommandType type = 1;
   string block_id = 2;
