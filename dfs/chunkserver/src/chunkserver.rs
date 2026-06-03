@@ -173,6 +173,7 @@ impl MyChunkServer {
         // Write data
         let mut file = fs::File::create(&path)?;
         file.write_all(data)?;
+        file.sync_all()?;
 
         // Calculate and write checksums
         let checksums = Self::calculate_checksums(data);
@@ -180,6 +181,7 @@ impl MyChunkServer {
         for checksum in checksums {
             meta_file.write_all(&checksum.to_be_bytes())?;
         }
+        meta_file.sync_all()?;
 
         Ok(())
     }
@@ -200,28 +202,16 @@ impl MyChunkServer {
 
         tokio::task::spawn_blocking(move || {
             tokio_uring::start(async {
-                // Write block data
+                // Write block data — write_all_at handles partial writes internally
                 let file = tokio_uring::fs::File::create(&path).await?;
-                let mut pos = 0u64;
-                let mut remaining = data_owned;
-                while !remaining.is_empty() {
-                    let (res, ret_buf) = file.write_at(remaining, pos).await;
-                    let n = res?;
-                    pos += n as u64;
-                    remaining = ret_buf[n..].to_vec();
-                }
+                let (res, _) = file.write_all_at(data_owned, 0).await;
+                res?;
                 file.sync_all().await?;
 
                 // Write checksum metadata
                 let meta_file = tokio_uring::fs::File::create(&meta_path).await?;
-                let mut meta_pos = 0u64;
-                let mut meta_remaining = meta_bytes;
-                while !meta_remaining.is_empty() {
-                    let (res, ret_buf) = meta_file.write_at(meta_remaining, meta_pos).await;
-                    let n = res?;
-                    meta_pos += n as u64;
-                    meta_remaining = ret_buf[n..].to_vec();
-                }
+                let (res, _) = meta_file.write_all_at(meta_bytes, 0).await;
+                res?;
                 meta_file.sync_all().await?;
                 Ok::<(), std::io::Error>(())
             })
@@ -259,10 +249,23 @@ impl MyChunkServer {
         tokio::task::spawn_blocking(move || {
             tokio_uring::start(async move {
                 let file = tokio_uring::fs::File::open(&path).await?;
-                let buf = vec![0u8; bytes_to_read];
-                let (res, buf) = file.read_at(buf, offset).await;
-                let n = res?;
-                Ok::<Vec<u8>, std::io::Error>(buf[..n].to_vec())
+                // read_at may return fewer bytes than requested; loop until full
+                let mut buf = vec![0u8; bytes_to_read];
+                let mut filled = 0usize;
+                while filled < bytes_to_read {
+                    let sub_buf = buf[filled..].to_vec();
+                    let (res, ret_buf) = file.read_at(sub_buf, offset + filled as u64).await;
+                    let n = res?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "read_at returned 0 bytes before buffer full",
+                        ));
+                    }
+                    buf[filled..filled + n].copy_from_slice(&ret_buf[..n]);
+                    filled += n;
+                }
+                Ok::<Vec<u8>, std::io::Error>(buf)
             })
         })
         .await

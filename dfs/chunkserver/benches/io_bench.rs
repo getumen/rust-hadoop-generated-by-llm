@@ -68,6 +68,9 @@ fn bench_partial_read_stdfs(c: &mut Criterion) {
 
 #[cfg(feature = "io-uring")]
 fn bench_write_uring(c: &mut Criterion) {
+    // Note: production code also wraps tokio_uring::start in spawn_blocking to bridge
+    // the tonic/tokio runtime. That thread-pool dispatch overhead (~1–5µs) is not
+    // included here so that the benchmark isolates io_uring I/O cost specifically.
     let mut group = c.benchmark_group("write_uring");
     for size in [4 * 1024usize, 64 * 1024, 1024 * 1024] {
         let data = make_data(size);
@@ -79,14 +82,8 @@ fn bench_write_uring(c: &mut Criterion) {
                 let data = data.clone();
                 tokio_uring::start(async move {
                     let file = tokio_uring::fs::File::create(&path).await.unwrap();
-                    let mut pos = 0u64;
-                    let mut remaining = data;
-                    while !remaining.is_empty() {
-                        let (res, ret) = file.write_at(remaining, pos).await;
-                        let n = res.unwrap();
-                        pos += n as u64;
-                        remaining = ret[n..].to_vec();
-                    }
+                    let (res, _) = file.write_all_at(data, 0).await;
+                    res.unwrap();
                     file.sync_all().await.unwrap();
                 });
             });
