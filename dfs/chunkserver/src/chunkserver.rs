@@ -1,6 +1,5 @@
 use crate::dfs::chunk_server_service_server::ChunkServerService;
 use crate::dfs::{ReadBlockRequest, ReadBlockResponse, WriteBlockRequest, WriteBlockResponse};
-use crate::io_uring_pool::IoUringPool;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -31,7 +30,6 @@ pub struct MyChunkServer {
     domain_name: Option<String>,
     /// Corrupted block IDs detected by the scrubber, waiting to be reported to Master.
     pub pending_bad_blocks: Arc<Mutex<Vec<String>>>,
-    io_uring_pool: Arc<IoUringPool>,
 }
 
 impl MyChunkServer {
@@ -78,7 +76,6 @@ impl MyChunkServer {
             ca_cert_path,
             domain_name,
             pending_bad_blocks: Arc::new(Mutex::new(Vec::new())),
-            io_uring_pool: Arc::new(IoUringPool::new(1024)),
         }
     }
 
@@ -173,15 +170,20 @@ impl MyChunkServer {
     async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self.storage_dir.join(block_id);
         let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
-
         let checksums = Self::calculate_checksums(data);
-        let meta_bytes: Vec<u8> = checksums
-            .iter()
-            .flat_map(|c| c.to_be_bytes())
-            .collect();
-
-        self.io_uring_pool.write(path, data.to_vec()).await?;
-        self.io_uring_pool.write(meta_path, meta_bytes).await
+        let meta_bytes: Vec<u8> = checksums.iter().flat_map(|c| c.to_be_bytes()).collect();
+        let data_owned = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(&data_owned)?;
+            file.sync_all()?;
+            let mut meta_file = std::fs::File::create(&meta_path)?;
+            meta_file.write_all(&meta_bytes)?;
+            meta_file.sync_all()?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
     }
 
     async fn read_block_async(
@@ -190,6 +192,7 @@ impl MyChunkServer {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::{Seek, SeekFrom};
         let path = self.storage_dir.join(block_id);
         let total_size = std::fs::metadata(&path)?.len();
         if offset >= total_size {
@@ -199,7 +202,15 @@ impl MyChunkServer {
             ));
         }
         let bytes_to_read = std::cmp::min(length, total_size - offset) as usize;
-        self.io_uring_pool.read(path, offset, bytes_to_read).await
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; bytes_to_read];
+            file.read_exact(&mut buf)?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
     }
 
     fn verify_block(&self, block_id: &str, data: &[u8]) -> Result<(), String> {

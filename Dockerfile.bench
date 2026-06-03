@@ -1,0 +1,21 @@
+FROM rust:1.91-bookworm
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    clang \
+    libclang-dev \
+    build-essential \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "" > /usr/local/share/ca-certificates/corporate_ca.crt
+COPY corporate_ca.pem /usr/local/share/ca-certificates/corporate_ca.crt
+RUN update-ca-certificates
+
+ENV RUSTC_WRAPPER=""
+
+COPY . .
+
+CMD ["/bin/bash", "-c", "echo '=== std::fs ===' && cargo bench -p dfs-chunkserver --bench io_bench 2>&1 | grep -E 'Benchmarking|time:|thrpt:' && echo '' && echo '=== io_uring ===' && cargo bench -p dfs-chunkserver --bench io_bench --features dfs-chunkserver/io-uring 2>&1 | grep -E 'Benchmarking|time:|thrpt:'"]

@@ -1,0 +1,4 @@
+    Finished `bench` profile [optimized] target(s) in 0.45s
+     Running unittests src/lib.rs (target/release/deps/dfs_chunkserver-0d26c3c4b46364f6)
+error: Unrecognized option: 'save-baseline'
+error: bench failed, to rerun pass `-p dfs-chunkserver --lib`
