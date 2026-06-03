@@ -22,6 +22,12 @@ pub struct IoUringPool {
     sender: mpsc::Sender<IoRequest>,
 }
 
+impl std::fmt::Debug for IoUringPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringPool").finish_non_exhaustive()
+    }
+}
+
 impl IoUringPool {
     pub fn new(channel_capacity: usize) -> Self {
         let (tx, mut rx) = mpsc::channel::<IoRequest>(channel_capacity);
