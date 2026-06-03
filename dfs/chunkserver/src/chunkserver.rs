@@ -184,6 +184,57 @@ impl MyChunkServer {
         Ok(())
     }
 
+    #[cfg(feature = "io-uring")]
+    async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
+        let path = self.storage_dir.join(block_id);
+        let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
+
+        // Build checksum bytes synchronously (CPU-bound)
+        let checksums = Self::calculate_checksums(data);
+        let mut meta_bytes: Vec<u8> = Vec::with_capacity(checksums.len() * 4);
+        for c in checksums {
+            meta_bytes.extend_from_slice(&c.to_be_bytes());
+        }
+
+        let data_owned: Vec<u8> = data.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            tokio_uring::start(async {
+                // Write block data
+                let file = tokio_uring::fs::File::create(&path).await?;
+                let mut pos = 0u64;
+                let mut remaining = data_owned;
+                while !remaining.is_empty() {
+                    let (res, ret_buf) = file.write_at(remaining, pos).await;
+                    let n = res?;
+                    pos += n as u64;
+                    remaining = ret_buf[n..].to_vec();
+                }
+                file.sync_all().await?;
+
+                // Write checksum metadata
+                let meta_file = tokio_uring::fs::File::create(&meta_path).await?;
+                let mut meta_pos = 0u64;
+                let mut meta_remaining = meta_bytes;
+                while !meta_remaining.is_empty() {
+                    let (res, ret_buf) = meta_file.write_at(meta_remaining, meta_pos).await;
+                    let n = res?;
+                    meta_pos += n as u64;
+                    meta_remaining = ret_buf[n..].to_vec();
+                }
+                meta_file.sync_all().await?;
+                Ok::<(), std::io::Error>(())
+            })
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+    }
+
+    #[cfg(not(feature = "io-uring"))]
+    async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
+        self.write_block_local(block_id, data)
+    }
+
     fn verify_block(&self, block_id: &str, data: &[u8]) -> Result<(), String> {
         let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
         if !meta_path.exists() {
@@ -910,6 +961,10 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn make_test_server(dir: &std::path::Path) -> MyChunkServer {
+        MyChunkServer::new(dir.to_path_buf(), vec![], None, None)
+    }
+
     #[test]
     fn test_ec_reconstruct_shard_logic() {
         // Verify RS reconstruction produces correct shard
@@ -951,5 +1006,28 @@ mod tests {
 
         // Verify should fail
         assert!(server.verify_block(block_id, &corrupted_data).is_err());
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[tokio::test]
+    async fn test_write_block_async_creates_file_with_correct_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_test_server(dir.path());
+        let data = b"hello io_uring world";
+        server.write_block_async("test-block-async", data).await.unwrap();
+        let written = std::fs::read(dir.path().join("test-block-async")).unwrap();
+        assert_eq!(written.as_slice(), data.as_ref());
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[tokio::test]
+    async fn test_write_block_async_creates_meta_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_test_server(dir.path());
+        let data = b"checksum test data for io_uring";
+        server.write_block_async("meta-block-async", data).await.unwrap();
+        assert!(dir.path().join("meta-block-async.meta").exists());
+        let meta = std::fs::read(dir.path().join("meta-block-async.meta")).unwrap();
+        assert!(!meta.is_empty());
     }
 }
