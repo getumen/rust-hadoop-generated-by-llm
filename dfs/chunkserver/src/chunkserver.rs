@@ -169,26 +169,6 @@ impl MyChunkServer {
         checksums
     }
 
-    #[cfg(test)]
-    fn write_block_local(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
-        let path = self.storage_dir.join(block_id);
-        let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
-
-        // Write data
-        let mut file = fs::File::create(&path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-
-        // Calculate and write checksums
-        let checksums = Self::calculate_checksums(data);
-        let mut meta_file = fs::File::create(&meta_path)?;
-        for checksum in checksums {
-            meta_file.write_all(&checksum.to_be_bytes())?;
-        }
-        meta_file.sync_all()?;
-
-        Ok(())
-    }
 
     async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self.storage_dir.join(block_id);
