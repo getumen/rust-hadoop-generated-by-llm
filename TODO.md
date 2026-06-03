@@ -76,9 +76,9 @@ S3互換サービスとしての信頼確保。
     - [x] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
 
 ### 4. Throughput & Storage Excellence
-- [ ] **io_uring / Zero-Copy Data Path**
-    - [ ] `tokio-uring` 等を用いたChunkServerの非同期ファイルI/Oの高速化。
-    - [ ] `sendfile` や registered buffer を活用し、カーネル/ユーザ空間のメモリコピーを排除。
+- [x] **io_uring / Zero-Copy Data Path** ✅
+    - [x] `tokio-uring` を用いたChunkServerの非同期ファイルI/Oの高速化（`write_block_async` / `read_block_async`）。
+    - [x] `read_at` による seek syscall 排除（オフセット付きSQEでカーネル往復を削減）。
 - [ ] **Intelligent Storage Tiering**
     - [ ] アクセス統計をベースに「冷えたデータ」をHDD層へ自動移行するバックグラウンドプロセス。
     - [ ] メタデータの構造最適化（SeaweedFS方式など）によるメモリ占有率の削減。

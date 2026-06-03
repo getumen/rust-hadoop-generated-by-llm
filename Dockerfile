@@ -41,7 +41,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/sccache \
-    cargo build --release --locked && \
+    cargo build --release --locked --features dfs-chunkserver/io-uring && \
     strip target/release/master && \
     strip target/release/chunkserver && \
     strip target/release/config_server && \
