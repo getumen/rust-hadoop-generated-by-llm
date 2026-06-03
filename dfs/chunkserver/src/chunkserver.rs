@@ -235,6 +235,64 @@ impl MyChunkServer {
         self.write_block_local(block_id, data)
     }
 
+    #[cfg(feature = "io-uring")]
+    async fn read_block_async(
+        &self,
+        block_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        let path = self.storage_dir.join(block_id);
+
+        // Get file size synchronously (cheap metadata call, no I/O needed via io_uring)
+        let total_size = std::fs::metadata(&path)?.len();
+
+        if offset >= total_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Offset {} exceeds file size {}", offset, total_size),
+            ));
+        }
+
+        let bytes_to_read = std::cmp::min(length, total_size - offset) as usize;
+
+        tokio::task::spawn_blocking(move || {
+            tokio_uring::start(async move {
+                let file = tokio_uring::fs::File::open(&path).await?;
+                let buf = vec![0u8; bytes_to_read];
+                let (res, buf) = file.read_at(buf, offset).await;
+                let n = res?;
+                Ok::<Vec<u8>, std::io::Error>(buf[..n].to_vec())
+            })
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+    }
+
+    #[cfg(not(feature = "io-uring"))]
+    async fn read_block_async(
+        &self,
+        block_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.storage_dir.join(block_id);
+        let total_size = std::fs::metadata(&path)?.len();
+        if offset >= total_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Offset {} exceeds file size {}", offset, total_size),
+            ));
+        }
+        let bytes_to_read = std::cmp::min(length, total_size - offset) as usize;
+        let mut file = std::fs::File::open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; bytes_to_read];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
     fn verify_block(&self, block_id: &str, data: &[u8]) -> Result<(), String> {
         let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
         if !meta_path.exists() {
@@ -1008,6 +1066,10 @@ mod tests {
         assert!(server.verify_block(block_id, &corrupted_data).is_err());
     }
 
+    fn make_test_data(size: usize) -> Vec<u8> {
+        (0..size).map(|i| (i % 256) as u8).collect()
+    }
+
     #[cfg(feature = "io-uring")]
     #[tokio::test]
     async fn test_write_block_async_creates_file_with_correct_content() {
@@ -1029,5 +1091,51 @@ mod tests {
         assert!(dir.path().join("meta-block-async.meta").exists());
         let meta = std::fs::read(dir.path().join("meta-block-async.meta")).unwrap();
         assert!(!meta.is_empty());
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[tokio::test]
+    async fn test_read_block_async_returns_correct_data() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_test_server(dir.path());
+        let data = make_test_data(4096);
+        std::fs::write(dir.path().join("read-test"), &data).unwrap();
+        let result = server.read_block_async("read-test", 0, data.len() as u64).await.unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[tokio::test]
+    async fn test_read_block_async_partial_read_at_offset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_test_server(dir.path());
+        let data = make_test_data(65536);
+        std::fs::write(dir.path().join("partial-test"), &data).unwrap();
+        let result = server.read_block_async("partial-test", 32768, 4096).await.unwrap();
+        assert_eq!(result.len(), 4096);
+        assert_eq!(result, data[32768..32768 + 4096].to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_read_block_async_fallback_correct_data() {
+        // This test runs on all platforms (no feature gate) to verify the fallback
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_test_server(dir.path());
+        let data = make_test_data(4096);
+        std::fs::write(dir.path().join("fallback-read-test"), &data).unwrap();
+        let result = server.read_block_async("fallback-read-test", 0, data.len() as u64).await.unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn test_read_block_async_fallback_partial_read() {
+        // This test runs on all platforms (no feature gate) to verify the fallback
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = make_test_server(dir.path());
+        let data = make_test_data(65536);
+        std::fs::write(dir.path().join("fallback-partial-test"), &data).unwrap();
+        let result = server.read_block_async("fallback-partial-test", 32768, 4096).await.unwrap();
+        assert_eq!(result.len(), 4096);
+        assert_eq!(result, data[32768..32768 + 4096].to_vec());
     }
 }
