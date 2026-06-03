@@ -169,6 +169,7 @@ impl MyChunkServer {
         checksums
     }
 
+    #[cfg(test)]
     fn write_block_local(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self.storage_dir.join(block_id);
         let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
@@ -934,15 +935,15 @@ mod tests {
         assert_eq!(reconstructed, &shards[4]);
     }
 
-    #[test]
-    fn test_checksum_verification() {
+    #[tokio::test]
+    async fn test_checksum_verification() {
         let dir = tempdir().unwrap();
         let server = MyChunkServer::new(dir.path().to_path_buf(), vec![], None, None);
         let block_id = "test_block";
         let data = b"Hello, world! This is a test block for checksum verification.";
 
         // Test write and verify
-        server.write_block_local(block_id, data).unwrap();
+        server.write_block_async(block_id, data).await.unwrap();
         server.verify_block(block_id, data).unwrap();
 
         // Test corruption
@@ -963,7 +964,6 @@ mod tests {
         (0..size).map(|i| (i % 256) as u8).collect()
     }
 
-    #[cfg(feature = "io-uring")]
     #[tokio::test]
     async fn test_write_block_async_creates_file_with_correct_content() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -974,7 +974,6 @@ mod tests {
         assert_eq!(written.as_slice(), data.as_ref());
     }
 
-    #[cfg(feature = "io-uring")]
     #[tokio::test]
     async fn test_write_block_async_creates_meta_file() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -986,7 +985,6 @@ mod tests {
         assert!(!meta.is_empty());
     }
 
-    #[cfg(feature = "io-uring")]
     #[tokio::test]
     async fn test_read_block_async_returns_correct_data() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -997,7 +995,6 @@ mod tests {
         assert_eq!(result, data);
     }
 
-    #[cfg(feature = "io-uring")]
     #[tokio::test]
     async fn test_read_block_async_partial_read_at_offset() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1009,26 +1006,4 @@ mod tests {
         assert_eq!(result, data[32768..32768 + 4096].to_vec());
     }
 
-    #[tokio::test]
-    async fn test_read_block_async_fallback_correct_data() {
-        // This test runs on all platforms (no feature gate) to verify the fallback
-        let dir = tempfile::TempDir::new().unwrap();
-        let server = make_test_server(dir.path());
-        let data = make_test_data(4096);
-        std::fs::write(dir.path().join("fallback-read-test"), &data).unwrap();
-        let result = server.read_block_async("fallback-read-test", 0, data.len() as u64).await.unwrap();
-        assert_eq!(result, data);
-    }
-
-    #[tokio::test]
-    async fn test_read_block_async_fallback_partial_read() {
-        // This test runs on all platforms (no feature gate) to verify the fallback
-        let dir = tempfile::TempDir::new().unwrap();
-        let server = make_test_server(dir.path());
-        let data = make_test_data(65536);
-        std::fs::write(dir.path().join("fallback-partial-test"), &data).unwrap();
-        let result = server.read_block_async("fallback-partial-test", 32768, 4096).await.unwrap();
-        assert_eq!(result.len(), 4096);
-        assert_eq!(result, data[32768..32768 + 4096].to_vec());
-    }
 }
