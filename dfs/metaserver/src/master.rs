@@ -369,7 +369,7 @@ fn select_servers_rack_aware(servers: &[(String, ChunkServerStatus)], n: usize) 
 
     // Sort candidates by available_space descending
     let mut candidates: Vec<&(String, ChunkServerStatus)> = servers.iter().collect();
-    candidates.sort_by(|a, b| b.1.available_space.cmp(&a.1.available_space));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.1.available_space));
 
     // Group by rack. Empty rack_id → use address as key to avoid grouping them.
     let mut rack_buckets: HashMap<String, Vec<&(String, ChunkServerStatus)>> = HashMap::new();
@@ -756,7 +756,7 @@ impl MyMaster {
                     }
 
                     let mut sorted_servers = servers;
-                    sorted_servers.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending available space (Least available first)
+                    sorted_servers.sort_by_key(|a| a.1); // Ascending available space (Least available first)
 
                     let (most_full_addr, min_avail) = sorted_servers.first().unwrap();
                     let (least_full_addr, max_avail) = sorted_servers.last().unwrap();
@@ -936,7 +936,7 @@ impl MyMaster {
                         let mut state_lock = state_clone_shuffle.lock().expect("Mutex poisoned");
                         if let AppState::Master(ref mut state) = *state_lock {
                             let mut sorted_servers = servers.clone();
-                            sorted_servers.sort_by(|a, b| b.1.cmp(&a.1)); // Descending available space (Coolest first)
+                            sorted_servers.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending available space (Coolest first)
 
                             let (least_full_addr, _) = sorted_servers.first().unwrap();
                             let (most_full_addr, _) = sorted_servers.last().unwrap();
