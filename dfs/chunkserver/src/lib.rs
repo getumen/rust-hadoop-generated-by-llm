@@ -3,3 +3,4 @@ pub mod dfs {
 }
 
 pub mod chunkserver;
+pub mod io_uring_pool;
