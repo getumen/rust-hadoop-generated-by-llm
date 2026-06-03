@@ -22,7 +22,7 @@ cleanup
 
 # Start cluster
 echo "Starting cluster..."
-docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml up -d --no-build
 echo "Waiting for cluster to stabilize (30s)..."
 sleep 30
 

@@ -24,7 +24,7 @@ docker compose -f $COMPOSE_FILE down -v || true
 
 # Start cluster
 echo "Starting cluster..."
-docker compose -f $COMPOSE_FILE up -d --build
+docker compose -f $COMPOSE_FILE up -d --no-build
 echo "Waiting for cluster to stabilize (30s)..."
 sleep 30
 

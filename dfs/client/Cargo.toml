@@ -28,6 +28,7 @@ anyhow = "1.0"
 rand = "0.8"
 rustls = { version = "0.23", features = ["ring"] }
 dfs-common = { path = "../common" }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 md5 = "0.7"
 crc32fast = "1.4"
 hex = "0.4"

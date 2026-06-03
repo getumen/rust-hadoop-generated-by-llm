@@ -67,6 +67,15 @@ struct Args {
 
     #[arg(long)]
     domain_name: Option<String>,
+
+    /// S3 endpoint for snapshot backups (e.g. http://dfs-s3-server:9000).
+    /// If not set, backup is disabled.
+    #[arg(long)]
+    backup_s3_endpoint: Option<String>,
+
+    /// S3 bucket name for snapshot backups.
+    #[arg(long, default_value = "dfs-backups")]
+    backup_bucket: String,
 }
 
 // Axum state for sharing the Raft channel
@@ -136,6 +145,8 @@ async fn main() -> anyhow::Result<()> {
         inbox: raft_rx,
         self_tx: raft_tx_for_node,
         ca_cert_path: args.ca_cert.clone(),
+        backup_s3_endpoint: args.backup_s3_endpoint.clone(),
+        backup_bucket: args.backup_bucket.clone(),
     });
 
     // Start Raft Node

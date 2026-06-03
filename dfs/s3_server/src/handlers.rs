@@ -897,10 +897,15 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
     // Check if MPU object (directory)
     let full_path = format!("/{}/{}", bucket, key);
 
-    // MPU Handling (simplified for brevity, assume existing logic)
+    // MPU Handling: check for .s3_mpu_completed marker under this path.
+    // Filter by full_path prefix to guard against list_files returning stale entries
+    // from other paths (list_files may return all files if server-side filtering is absent).
     let list_res = state.client.list_files(&full_path).await;
     let is_mpu = if let Ok(files) = &list_res {
-        files.iter().any(|f| f.ends_with(".s3_mpu_completed"))
+        files
+            .iter()
+            .filter(|f| f.starts_with(&full_path))
+            .any(|f| f.ends_with(".s3_mpu_completed"))
     } else {
         false
     };
@@ -947,10 +952,13 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
     response_headers.insert("Last-Modified", last_modified.parse().unwrap());
 
     if is_mpu {
-        // Stream parts
+        // Stream parts — only include files under full_path to avoid cross-path pollution
         let files = list_res.unwrap();
         let mut parts: Vec<(i32, String)> = Vec::new();
         for f in files {
+            if !f.starts_with(&full_path) {
+                continue;
+            }
             if f.ends_with(".s3keep") || f.ends_with(".s3_mpu_completed") {
                 continue;
             }
@@ -1135,10 +1143,27 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
 
 async fn delete_object(state: S3AppState, bucket: &str, key: &str) -> Response {
     let path = format!("/{}/{}", bucket, key);
-    match state.client.delete_file(&path).await {
+
+    // Try direct delete first (regular object)
+    let direct_result = state.client.delete_file(&path).await;
+
+    // Also check for and delete MPU artifacts under this path (if it was an MPU object).
+    // MPU structure: /bucket/key/.s3_mpu_completed, /bucket/key/1, /bucket/key/2, ...
+    if let Ok(files) = state.client.list_files(&path).await {
+        for f in files {
+            if f.starts_with(&path) {
+                let _ = state.client.delete_file(&f).await;
+            }
+        }
+    }
+    // Also delete associated metadata file
+    let meta_path = format!("{}.meta", path);
+    let _ = state.client.delete_file(&meta_path).await;
+
+    match direct_result {
         Ok(_) => empty_response(StatusCode::NO_CONTENT),
-        Err(e) => {
-            tracing::error!("DeleteObject failed: {}", e);
+        Err(_) => {
+            // S3 delete is idempotent — always return 204 even if file not found
             empty_response(StatusCode::NO_CONTENT)
         }
     }

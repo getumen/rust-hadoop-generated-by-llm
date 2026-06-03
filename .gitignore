@@ -1,3 +1,7 @@
 /target
 *.log
 certs/
+corporate_ca.pem
+*.pem
+/vendor/
+.worktrees/

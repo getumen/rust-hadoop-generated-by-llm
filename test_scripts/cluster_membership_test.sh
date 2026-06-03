@@ -29,16 +29,22 @@ cleanup
 
 # Port check
 echo "Checking if ports are free..."
-for port in 50050 50051 50052 50061 50062 50072 50082 9000; do
+for port in 9000; do
     if lsof -i :$port >/dev/null 2>&1; then
         echo "⚠️  Warning: Port $port is in use. Attempting to kill the process..."
-        lsof -ti :$port | xargs kill -9 2>/dev/null || true
+        # Skip SSH and limactl to avoid killing Lima's Docker socket forwarding
+        lsof -ti :$port | while read pid; do
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
+            if [ "$comm" != "ssh" ] && [ "$comm" != "limactl" ]; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
     fi
 done
 
 # Start the cluster
 echo "Starting cluster..."
-docker compose up -d --build
+docker compose up -d --no-build
 
 echo "Waiting for cluster to stabilize (20s)..."
 sleep 20

@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod encoding;
 pub mod oidc;
 pub mod policy;
+pub mod presign;
 pub mod signing;
 pub mod sts;
 

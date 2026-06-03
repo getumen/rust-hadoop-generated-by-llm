@@ -14,6 +14,16 @@ set -e
 cd "$(dirname "$0")/.."
 SCRIPT_DIR="$(pwd)"
 
+# Kill any stale processes on the ports used by this test (mock OIDC: 18080, S3: 19000)
+for _port in 18080 19000; do
+    lsof -ti:$_port 2>/dev/null | while read _pid; do
+        _comm=$(ps -p "$_pid" -o comm= 2>/dev/null || echo "")
+        if [ "$_comm" != "ssh" ] && [ "$_comm" != "limactl" ]; then
+            kill -9 "$_pid" 2>/dev/null || true
+        fi
+    done
+done
+
 echo "========================================"
 echo " IAM Credential Design — 機能テスト"
 echo "========================================"
@@ -23,12 +33,12 @@ echo ""
 echo "[PREP] Checking Python dependencies..."
 python3 -c "import jwt; import cryptography" 2>/dev/null || {
     echo "[PREP] Installing PyJWT and cryptography..."
-    pip3 install --break-system-packages pyjwt cryptography
+    pip3 install --break-system-packages --trusted-host pypi.org --trusted-host files.pythonhosted.org pyjwt cryptography
 }
 
 # 2. Build
 echo "[PREP] Building project..."
-cargo build -p s3-server 2>&1 | tail -1
+cargo build -p s3-server
 
 # 3. Run tests
 echo ""

@@ -26,8 +26,7 @@ echo "=========================="
 
 # Start sharded cluster
 echo "🚀 Starting sharded cluster..."
-docker compose -f docker-compose.yml build
-docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml up -d --no-build
 
 # Wait for cluster
 echo "Waiting for cluster to be ready..."

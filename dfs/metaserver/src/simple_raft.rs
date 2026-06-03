@@ -255,6 +255,8 @@ impl CatchUpProgress {
 pub enum MasterCommand {
     CreateFile {
         path: String,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
     },
     DeleteFile {
         path: String,
@@ -614,6 +616,11 @@ pub struct RaftNode {
     pub last_committed_config_index: usize,
     /// Monotonic time counter (for tracking timeouts and progress).
     pub monotonic_time: u64,
+
+    /// S3 endpoint for snapshot backups (None = disabled).
+    pub backup_s3_endpoint: Option<String>,
+    /// S3 bucket name for snapshot backups.
+    pub backup_bucket: String,
 }
 
 pub struct RaftNodeConfig {
@@ -625,6 +632,8 @@ pub struct RaftNodeConfig {
     pub inbox: mpsc::Receiver<Event>,
     pub self_tx: mpsc::Sender<Event>,
     pub ca_cert_path: Option<String>,
+    pub backup_s3_endpoint: Option<String>,
+    pub backup_bucket: String,
 }
 
 impl RaftNode {
@@ -638,6 +647,8 @@ impl RaftNode {
             inbox,
             self_tx,
             ca_cert_path,
+            backup_s3_endpoint,
+            backup_bucket,
         } = config;
         let path = format!("{}/raft_node_{}", storage_dir, id);
         let db = DB::open_default(&path).expect("Failed to open RocksDB");
@@ -734,6 +745,8 @@ impl RaftNode {
             catch_up_progress: HashMap::new(),
             last_committed_config_index: 0,
             monotonic_time: 0,
+            backup_s3_endpoint,
+            backup_bucket,
         }
     }
 
@@ -888,6 +901,23 @@ impl RaftNode {
         self.db
             .put(key.as_bytes(), val)
             .context("Failed to save log entry to DB")?;
+        Ok(())
+    }
+
+    /// Write multiple log entries to RocksDB in a single atomic WriteBatch.
+    fn save_log_entries_batch(&self, entries: &[(usize, &LogEntry)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        for (index, entry) in entries {
+            let key = format!("log:{}", index);
+            let val = serde_json::to_vec(entry).context("Failed to serialize log entry")?;
+            batch.put(key.as_bytes(), val);
+        }
+        self.db
+            .write(batch)
+            .context("Failed to write log entries batch to DB")?;
         Ok(())
     }
 
@@ -1144,6 +1174,64 @@ impl RaftNode {
         const SNAPSHOT_THRESHOLD: usize = 100;
         if self.log.len() > SNAPSHOT_THRESHOLD && self.last_applied > self.last_included_index {
             self.create_snapshot()?;
+            // Upload snapshot to S3 if this is the leader and backup is configured
+            if self.role == Role::Leader && self.backup_s3_endpoint.is_some() {
+                let db = self.db.clone();
+                let endpoint = self.backup_s3_endpoint.clone().unwrap();
+                let bucket = self.backup_bucket.clone();
+                let id = self.id;
+                let last_included_index = self.last_included_index;
+                tokio::spawn(async move {
+                    let snapshot_data = match db.get(b"snapshot_data") {
+                        Ok(Some(data)) => data,
+                        Ok(None) => {
+                            tracing::debug!(
+                                "Backup: no snapshot_data found after snapshot creation"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Backup: failed to read snapshot_data: {}", e);
+                            return;
+                        }
+                    };
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let key = format!(
+                        "master-snapshots/node-{}/{}--idx{}.bin",
+                        id, timestamp, last_included_index
+                    );
+                    let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
+                    tracing::info!("Backup: uploading snapshot to {}", url);
+                    match reqwest::Client::new()
+                        .put(&url)
+                        .header("Content-Type", "application/octet-stream")
+                        .body(snapshot_data)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            tracing::info!(
+                                "Backup: snapshot uploaded successfully (node={}, idx={})",
+                                id,
+                                last_included_index
+                            );
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                "Backup: S3 upload returned status {} for {}",
+                                resp.status(),
+                                url
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Backup: S3 upload failed: {}", e);
+                        }
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -1576,6 +1664,14 @@ impl RaftNode {
                 // For single-node clusters, this is handled in `become_leader`.
                 // For multi-node, commit_index is advanced in `handle_append_entries_response`.
 
+                // Pipeline: immediately replicate to followers without waiting for next tick.
+                // For multi-node clusters this reduces write latency from up to 100ms to ~0ms.
+                if !self.peers.is_empty() {
+                    if let Err(e) = self.send_heartbeats().await {
+                        tracing::warn!("Immediate replication after ClientRequest failed: {}", e);
+                    }
+                }
+
                 let _ = reply_tx.send(Ok(()));
             }
             Event::GetLeaderInfo { reply_tx } => {
@@ -1803,6 +1899,7 @@ impl RaftNode {
                             }
 
                             // Append all entries
+                            let mut batch_entries: Vec<(usize, &LogEntry)> = Vec::new();
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
@@ -1817,13 +1914,14 @@ impl RaftNode {
                                         self.delete_log_entries_from(absolute_index)?;
 
                                         self.log.push(entry.clone());
-                                        self.save_log_entry(absolute_index, entry)?;
+                                        batch_entries.push((absolute_index, entry));
                                     }
                                 } else {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry)?;
+                                    batch_entries.push((absolute_index, entry));
                                 }
                             }
+                            self.save_log_entries_batch(&batch_entries)?;
                             match_index = args.prev_log_index + args.entries.len();
                         } else {
                             tracing::info!(
@@ -1860,15 +1958,17 @@ impl RaftNode {
                             }
 
                             // Append new entries (or re-append from conflict point)
+                            let mut batch_entries: Vec<(usize, &LogEntry)> = Vec::new();
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
 
                                 if log_index >= self.log.len() {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry)?;
+                                    batch_entries.push((absolute_index, entry));
                                 }
                             }
+                            self.save_log_entries_batch(&batch_entries)?;
 
                             match_index = args.prev_log_index + args.entries.len();
                         } else {
@@ -2773,7 +2873,11 @@ impl RaftNode {
             Command::Master(cmd) => {
                 if let AppState::Master(ref mut master_state) = *state {
                     match cmd {
-                        MasterCommand::CreateFile { path } => {
+                        MasterCommand::CreateFile {
+                            path,
+                            ec_data_shards,
+                            ec_parity_shards,
+                        } => {
                             master_state.files.insert(
                                 path.clone(),
                                 crate::dfs::FileMetadata {
@@ -2782,6 +2886,8 @@ impl RaftNode {
                                     blocks: vec![],
                                     etag_md5: "".to_string(),
                                     created_at_ms: 0,
+                                    ec_data_shards: *ec_data_shards,
+                                    ec_parity_shards: *ec_parity_shards,
                                 },
                             );
                             tracing::info!("Created file {}", path);
@@ -2797,11 +2903,16 @@ impl RaftNode {
                             locations,
                         } => {
                             if let Some(meta) = master_state.files.get_mut(path) {
+                                let ec_data = meta.ec_data_shards;
+                                let ec_parity = meta.ec_parity_shards;
                                 meta.blocks.push(crate::dfs::BlockInfo {
                                     block_id: block_id.clone(),
                                     size: 0,
                                     locations: locations.clone(),
                                     checksum_crc32c: 0,
+                                    ec_data_shards: ec_data,
+                                    ec_parity_shards: ec_parity,
+                                    original_size: 0,
                                 });
                                 tracing::info!("Allocated block {} for file {}", block_id, path);
                             } else {
@@ -2957,6 +3068,7 @@ impl RaftNode {
                                         {
                                             block.checksum_crc32c = info.checksum_crc32c;
                                             block.size = info.actual_size;
+                                            block.original_size = info.actual_size;
                                         }
                                     }
                                 } else {
@@ -3112,10 +3224,12 @@ mod tests {
     fn test_master_command_create_file() {
         let cmd = MasterCommand::CreateFile {
             path: "/test/file.txt".to_string(),
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         match cmd {
-            MasterCommand::CreateFile { path } => {
+            MasterCommand::CreateFile { path, .. } => {
                 assert_eq!(path, "/test/file.txt");
             }
             _ => panic!("Expected CreateFile command"),
@@ -3149,6 +3263,8 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3256,6 +3372,8 @@ mod tests {
             term: 1,
             command: Command::Master(MasterCommand::CreateFile {
                 path: "/test.txt".to_string(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
             }),
         };
 

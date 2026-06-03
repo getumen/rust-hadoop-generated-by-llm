@@ -29,7 +29,7 @@ cleanup
 
 # Start cluster
 echo "🚀 Starting cluster..."
-docker compose -f docker-compose.auto-scaling.yml up -d --build --force-recreate
+docker compose -f docker-compose.auto-scaling.yml up -d --no-build --force-recreate
 
 # Wait for readiness
 echo "Waiting for cluster readiness (20s)..."

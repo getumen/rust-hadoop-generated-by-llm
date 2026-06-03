@@ -10,9 +10,13 @@ cleanup() {
     [ ! -z "$S3_PID" ] && kill $S3_PID 2>/dev/null || true
     [ ! -z "$MOCK_PID" ] && kill $MOCK_PID 2>/dev/null || true
     rm -f /tmp/iam_config.json /tmp/hello.txt
-    # Kill any remaining processes on our ports
-    lsof -ti:8085 | xargs kill -9 2>/dev/null || true
-    lsof -ti:9000 | xargs kill -9 2>/dev/null || true
+    # Kill any remaining processes on our ports (skip SSH to avoid breaking Lima's Docker socket forwarding)
+    for _port in 8085 9000; do
+        lsof -ti:$_port | while read pid; do
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
+            if [ "$comm" != "ssh" ] && [ "$comm" != "limactl" ]; then kill -9 "$pid" 2>/dev/null || true; fi
+        done
+    done
 }
 
 trap cleanup EXIT
@@ -26,7 +30,7 @@ echo "=== OIDC & STS E2E Test ==="
 # 1. Install dependencies (Python for mock server and token generation)
 echo "Installing Python dependencies (PyJWT, cryptography, boto3)..."
 # Capture output and status to handle errors properly without being too noisy
-PIP_OUTPUT=$(pip3 install --break-system-packages pyjwt cryptography boto3 2>&1)
+PIP_OUTPUT=$(pip3 install --break-system-packages --trusted-host pypi.org --trusted-host files.pythonhosted.org pyjwt cryptography boto3 2>&1)
 PIP_STATUS=$?
 echo "$PIP_OUTPUT" | grep -v "already satisfied" || true
 

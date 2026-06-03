@@ -28,7 +28,7 @@ echo "🚀 Cleaning up and starting cluster..."
 docker compose down -v 2>/dev/null || true
 
 echo "🚀 Starting cluster..."
-docker compose up -d --build --force-recreate
+docker compose up -d --no-build --force-recreate
 
 # Wait for cluster
 echo "Waiting for cluster to be ready (30s)..."

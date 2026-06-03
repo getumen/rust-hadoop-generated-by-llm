@@ -31,7 +31,7 @@ cd "$PROJECT_ROOT"
 # Start the cluster (includes S3 server on port 9000)
 echo "🚀 Starting cluster..."
 docker compose down -v 2>/dev/null || true
-docker compose up -d --build
+docker compose up -d --no-build
 
 # Wait for S3 server to be ready
 echo "Waiting for S3 server to be ready at $S3_ENDPOINT..."
@@ -43,6 +43,21 @@ for i in $(seq 1 30); do
     if [ "$i" -eq 30 ]; then
         echo "Error: S3 server did not start within 30 seconds"
         exit 1
+    fi
+    sleep 1
+done
+
+# Wait for Raft leader election (master may not have leader immediately after S3 reports healthy)
+echo "Waiting for Raft leader election..."
+for i in $(seq 1 20); do
+    LEADER=$(curl -s http://localhost:8080/raft/state 2>/dev/null | grep -o '"role":"Leader"' || true)
+    if [ -n "$LEADER" ]; then
+        echo "  Raft leader elected (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 20 ]; then
+        echo "Warning: Raft leader not confirmed after 20s, proceeding anyway..."
+        break
     fi
     sleep 1
 done

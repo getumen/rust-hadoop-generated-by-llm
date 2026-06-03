@@ -109,6 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         inbox: raft_rx,
         self_tx: raft_tx_for_node,
         ca_cert_path: args.ca_cert.clone(),
+        backup_s3_endpoint: None,
+        backup_bucket: String::new(),
     });
 
     // Start Raft Node
