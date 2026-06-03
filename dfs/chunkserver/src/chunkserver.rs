@@ -355,7 +355,7 @@ impl MyChunkServer {
                             // 3. Verify the fetched data
                             if self.verify_block(block_id, &data).is_ok() {
                                 // 4. Replace corrupted block
-                                if let Err(e) = self.write_block_local(block_id, &data) {
+                                if let Err(e) = self.write_block_async(block_id, &data).await {
                                     tracing::error!("Failed to write recovered block: {}", e);
                                     continue;
                                 }
@@ -542,7 +542,7 @@ impl MyChunkServer {
         let shard_data = opt_shards[shard_index]
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Shard {} still None after reconstruct", shard_index))?;
-        self.write_block_local(&block_id, shard_data)
+        self.write_block_async(&block_id, shard_data).await
             .map_err(|e| anyhow::anyhow!("Failed to write reconstructed shard: {}", e))?;
 
         tracing::info!(
@@ -668,7 +668,7 @@ impl ChunkServerService for MyChunkServer {
             }
 
             // Write block locally with checksums
-            if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
+            if let Err(e) = self.write_block_async(&req.block_id, &req.data).await {
                 return Ok(Response::new(WriteBlockResponse {
                     success: false,
                     error_message: e.to_string(),
@@ -910,7 +910,7 @@ impl ChunkServerService for MyChunkServer {
             }
 
             // Write block locally with checksums
-            if let Err(e) = self.write_block_local(&req.block_id, &req.data) {
+            if let Err(e) = self.write_block_async(&req.block_id, &req.data).await {
                 return Ok(Response::new(crate::dfs::ReplicateBlockResponse {
                     success: false,
                     error_message: e.to_string(),
