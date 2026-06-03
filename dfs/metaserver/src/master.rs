@@ -1545,6 +1545,141 @@ impl MyMaster {
         }
     }
 
+    /// Background EC conversion scanner: converts cold files to erasure coding.
+    pub async fn scan_ec_conversion(&self) {
+        const EC_DATA: i32 = 6;
+        const EC_PARITY: i32 = 3;
+        let total_shards = (EC_DATA + EC_PARITY) as usize;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ec_threshold_ms = self.config.ec_threshold_secs * 1000;
+
+        // Collect candidates: cold files that have aged past ec_threshold
+        let candidates: Vec<crate::dfs::FileMetadata> = {
+            let state = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref ms) = *state {
+                ms.files
+                    .values()
+                    .filter(|f| {
+                        f.moved_to_cold_at_ms > 0
+                            && f.ec_data_shards == 0
+                            && now_ms.saturating_sub(f.moved_to_cold_at_ms) > ec_threshold_ms
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        for file in candidates {
+            // Pick enough ChunkServers for EC shards
+            let shard_servers: Vec<String> = {
+                let state = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref ms) = *state {
+                    let mut servers: Vec<String> = ms
+                        .chunk_servers
+                        .iter()
+                        .filter(|(_, s)| s.available_space > 0)
+                        .map(|(addr, _)| addr.clone())
+                        .collect();
+                    // Sort for determinism in tests
+                    servers.sort();
+                    servers.truncate(total_shards);
+                    servers
+                } else {
+                    vec![]
+                }
+            };
+
+            if shard_servers.len() < total_shards {
+                tracing::warn!(
+                    "Not enough ChunkServers for EC conversion of {} (need {}, have {})",
+                    file.path,
+                    total_shards,
+                    shard_servers.len()
+                );
+                continue;
+            }
+
+            let mut new_blocks: Vec<crate::dfs::BlockInfo> = Vec::new();
+
+            for block in &file.blocks {
+                // One CS per EC shard
+                let new_block = crate::dfs::BlockInfo {
+                    block_id: block.block_id.clone(),
+                    size: block.size,
+                    locations: shard_servers.clone(),
+                    checksum_crc32c: block.checksum_crc32c,
+                    ec_data_shards: EC_DATA,
+                    ec_parity_shards: EC_PARITY,
+                    original_size: block.original_size,
+                };
+                new_blocks.push(new_block);
+
+                // Get source CS (first location of the current replication block)
+                let source_cs = block.locations.first().cloned().unwrap_or_default();
+
+                {
+                    let mut state = self.state.lock().expect("Mutex poisoned");
+                    if let AppState::Master(ref mut ms) = *state {
+                        // Issue RECONSTRUCT_EC_SHARD for each shard
+                        for (shard_idx, cs_addr) in shard_servers.iter().enumerate() {
+                            let mut ec_shard_sources =
+                                vec!["".to_string(); total_shards];
+                            ec_shard_sources[0] = source_cs.clone();
+                            ms.pending_commands
+                                .entry(cs_addr.clone())
+                                .or_default()
+                                .push(crate::dfs::ChunkServerCommand {
+                                    r#type: crate::dfs::chunk_server_command::CommandType::ReconstructEcShard as i32,
+                                    block_id: block.block_id.clone(),
+                                    shard_index: shard_idx as i32,
+                                    ec_data_shards: EC_DATA,
+                                    ec_parity_shards: EC_PARITY,
+                                    ec_shard_sources,
+                                    original_block_size: block.original_size,
+                                    ..Default::default()
+                                });
+                        }
+
+                        // Issue DELETE for old replicas
+                        for old_loc in &block.locations {
+                            ms.pending_commands
+                                .entry(old_loc.clone())
+                                .or_default()
+                                .push(crate::dfs::ChunkServerCommand {
+                                    r#type: crate::dfs::chunk_server_command::CommandType::Delete as i32,
+                                    block_id: block.block_id.clone(),
+                                    ..Default::default()
+                                });
+                        }
+                    }
+                }
+            }
+
+            // Persist EC conversion via Raft
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::ConvertToEc {
+                        path: file.path.clone(),
+                        ec_data_shards: EC_DATA,
+                        ec_parity_shards: EC_PARITY,
+                        new_blocks,
+                    }),
+                    reply_tx: tx,
+                })
+                .await;
+            let _ = rx.await;
+            tracing::info!("Tiering scanner: queued EC conversion for {}", file.path);
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn check_shard_ownership(&self, path: &str) -> Result<(), Status> {
         let map = self.shard_map.lock().expect("Mutex poisoned");
@@ -3850,6 +3985,59 @@ mod tests {
             assert!(
                 cmds.is_some_and(|c| c.iter().any(|cmd| cmd.block_id == "blk-tiering-001")),
                 "Expected MOVE_TO_COLD command queued for blk-tiering-001"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_ec_conversion_queues_commands() {
+        let (master, _dir) = make_test_master().await;
+
+        // Insert a cold file with a block and 9 fake ChunkServers
+        {
+            let mut state = master.state.lock().unwrap();
+            if let AppState::Master(ref mut ms) = *state {
+                // Register 9 fake ChunkServers
+                for i in 0..9usize {
+                    ms.chunk_servers.insert(
+                        format!("127.0.0.{}:9000", i + 1),
+                        ChunkServerStatus {
+                            available_space: 1_000_000,
+                            last_heartbeat: 1,
+                            used_space: 0,
+                            chunk_count: 0,
+                            rack_id: String::new(),
+                        },
+                    );
+                }
+                ms.files.insert(
+                    "/cold-ec-file".to_string(),
+                    crate::dfs::FileMetadata {
+                        path: "/cold-ec-file".to_string(),
+                        moved_to_cold_at_ms: 1, // ancient
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        blocks: vec![crate::dfs::BlockInfo {
+                            block_id: "blk-ec-conv-001".to_string(),
+                            locations: vec!["127.0.0.1:9000".to_string()],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        master.scan_ec_conversion().await;
+
+        let state = master.state.lock().unwrap();
+        if let AppState::Master(ref ms) = *state {
+            // Should have RECONSTRUCT_EC_SHARD commands on 9 servers + DELETE on 1
+            let total_cmds: usize = ms.pending_commands.values().map(|v| v.len()).sum();
+            assert!(
+                total_cmds >= 9,
+                "Expected at least 9 EC shard commands, got {}",
+                total_cmds
             );
         }
     }

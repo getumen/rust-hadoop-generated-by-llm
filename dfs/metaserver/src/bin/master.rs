@@ -232,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             master_for_tiering.scan_tiering().await;
+            master_for_tiering.scan_ec_conversion().await;
         }
     });
 
