@@ -11,11 +11,6 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Trust corporate CA if present (needed for SSL-inspecting proxies)
-# Copy a dummy placeholder and overwrite if the real cert exists
-RUN echo "" > /usr/local/share/ca-certificates/corporate_ca.crt
-COPY corporate_ca.pem /usr/local/share/ca-certificates/corporate_ca.crt
-RUN update-ca-certificates
 
 # Install sccache for faster incremental builds
 RUN ARCH=$(uname -m) && \
