@@ -327,6 +327,24 @@ pub enum MasterCommand {
     StopShuffle {
         prefix: String,
     },
+    /// Update file access statistics (called on each read)
+    UpdateAccessStats {
+        path: String,
+        accessed_at_ms: u64,
+    },
+    /// Mark file as moved to cold tier
+    MoveToCold {
+        path: String,
+        moved_at_ms: u64,
+    },
+    /// Mark file as converted to EC (updates block locations and ec fields)
+    ConvertToEc {
+        path: String,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
+        /// New BlockInfo list with EC shard locations replacing replication locations
+        new_blocks: Vec<crate::dfs::BlockInfo>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2888,6 +2906,9 @@ impl RaftNode {
                                     created_at_ms: 0,
                                     ec_data_shards: *ec_data_shards,
                                     ec_parity_shards: *ec_parity_shards,
+                                    last_access_ms: 0,
+                                    access_count: 0,
+                                    moved_to_cold_at_ms: 0,
                                 },
                             );
                             tracing::info!("Created file {}", path);
@@ -3108,6 +3129,26 @@ impl RaftNode {
                             master_state.shuffling_prefixes.remove(prefix.as_str());
                             tracing::info!("Stopped background shuffling for prefix: {}", prefix);
                         }
+                        MasterCommand::UpdateAccessStats { path, accessed_at_ms } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.last_access_ms = *accessed_at_ms;
+                                meta.access_count += 1;
+                            }
+                        }
+                        MasterCommand::MoveToCold { path, moved_at_ms } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.moved_to_cold_at_ms = *moved_at_ms;
+                                tracing::info!("Moved file {} to cold tier", path);
+                            }
+                        }
+                        MasterCommand::ConvertToEc { path, ec_data_shards, ec_parity_shards, new_blocks } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.ec_data_shards = *ec_data_shards;
+                                meta.ec_parity_shards = *ec_parity_shards;
+                                meta.blocks = new_blocks.clone();
+                                tracing::info!("Converted file {} to EC({},{})", path, ec_data_shards, ec_parity_shards);
+                            }
+                        }
                     }
                 } else {
                     tracing::error!("Error: Received MasterCommand but state is not MasterState");
@@ -3265,6 +3306,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3382,5 +3426,115 @@ mod tests {
             serde_json::from_str(&serialized).expect("Failed to deserialize log entry");
 
         assert_eq!(deserialized.term, 1);
+    }
+
+    // =========================================================================
+    // Test helpers for storage tiering tests
+    // =========================================================================
+
+    fn make_test_master_state() -> Arc<Mutex<AppState>> {
+        let state = crate::master::MasterState {
+            files: std::collections::HashMap::new(),
+            transaction_records: std::collections::HashMap::new(),
+            shuffling_prefixes: std::collections::HashSet::new(),
+            chunk_servers: std::collections::HashMap::new(),
+            pending_commands: std::collections::HashMap::new(),
+            safe_mode: false,
+            safe_mode_entered_at: 0,
+            safe_mode_min_chunkservers: 0,
+            expected_block_count: 0,
+            reported_block_count: 0,
+            safe_mode_threshold: 0.0,
+            safe_mode_manual: false,
+            bad_block_locations: std::collections::HashMap::new(),
+        };
+        Arc::new(Mutex::new(AppState::Master(state)))
+    }
+
+    fn apply_cmd(app_state: &Arc<Mutex<AppState>>, cmd: MasterCommand) {
+        let mut state = app_state.lock().unwrap();
+        if let AppState::Master(ref mut master_state) = *state {
+            match &cmd {
+                MasterCommand::CreateFile { path, ec_data_shards, ec_parity_shards } => {
+                    master_state.files.insert(
+                        path.clone(),
+                        crate::dfs::FileMetadata {
+                            path: path.clone(),
+                            size: 0,
+                            blocks: vec![],
+                            etag_md5: "".to_string(),
+                            created_at_ms: 0,
+                            ec_data_shards: *ec_data_shards,
+                            ec_parity_shards: *ec_parity_shards,
+                            last_access_ms: 0,
+                            access_count: 0,
+                            moved_to_cold_at_ms: 0,
+                        },
+                    );
+                }
+                MasterCommand::UpdateAccessStats { path, accessed_at_ms } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        meta.last_access_ms = *accessed_at_ms;
+                        meta.access_count += 1;
+                    }
+                }
+                MasterCommand::MoveToCold { path, moved_at_ms } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        meta.moved_to_cold_at_ms = *moved_at_ms;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_update_access_stats() {
+        let state = make_test_master_state();
+        apply_cmd(
+            &state,
+            MasterCommand::CreateFile {
+                path: "/f".into(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+            },
+        );
+        apply_cmd(
+            &state,
+            MasterCommand::UpdateAccessStats {
+                path: "/f".into(),
+                accessed_at_ms: 1000,
+            },
+        );
+        let locked = state.lock().unwrap();
+        if let AppState::Master(ref ms) = *locked {
+            let f = ms.files.get("/f").unwrap();
+            assert_eq!(f.last_access_ms, 1000);
+            assert_eq!(f.access_count, 1);
+        }
+    }
+
+    #[test]
+    fn test_apply_move_to_cold() {
+        let state = make_test_master_state();
+        apply_cmd(
+            &state,
+            MasterCommand::CreateFile {
+                path: "/f".into(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+            },
+        );
+        apply_cmd(
+            &state,
+            MasterCommand::MoveToCold {
+                path: "/f".into(),
+                moved_at_ms: 5000,
+            },
+        );
+        let locked = state.lock().unwrap();
+        if let AppState::Master(ref ms) = *locked {
+            assert_eq!(ms.files.get("/f").unwrap().moved_to_cold_at_ms, 5000);
+        }
     }
 }

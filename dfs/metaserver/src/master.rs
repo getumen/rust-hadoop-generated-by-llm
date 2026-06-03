@@ -2960,6 +2960,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3001,6 +3004,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3026,6 +3032,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3059,6 +3068,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3119,6 +3131,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3175,6 +3190,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         heal_under_replicated_blocks(&mut state);
@@ -3228,6 +3246,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         heal_under_replicated_blocks(&mut state);
@@ -3272,6 +3293,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         state
@@ -3450,6 +3474,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 4,
             ec_parity_shards: 2,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
         state.files.insert("/ec-file".to_string(), metadata);
 
@@ -3472,6 +3499,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 4,
                 ec_parity_shards: 2,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         for i in 0..6usize {
@@ -3545,6 +3575,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 4,
                 ec_parity_shards: 2,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
 
