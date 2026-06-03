@@ -143,7 +143,7 @@ impl MyChunkServer {
     /// Atomically moves a block (and its .meta file) from hot to cold storage.
     pub async fn move_block_to_cold(&self, block_id: &str) -> std::io::Result<()> {
         let cold_dir = self.cold_storage_dir.as_ref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "cold_storage_dir not configured")
+            std::io::Error::other("cold_storage_dir not configured")
         })?;
         let src = self.storage_dir.join(block_id);
         let src_meta = self.storage_dir.join(format!("{}.meta", block_id));
