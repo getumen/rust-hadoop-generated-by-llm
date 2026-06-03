@@ -166,7 +166,6 @@ impl MyChunkServer {
         checksums
     }
 
-
     async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self.storage_dir.join(block_id);
         let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
@@ -531,7 +530,8 @@ impl MyChunkServer {
         let shard_data = opt_shards[shard_index]
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Shard {} still None after reconstruct", shard_index))?;
-        self.write_block_async(&block_id, shard_data).await
+        self.write_block_async(&block_id, shard_data)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to write reconstructed shard: {}", e))?;
 
         tracing::info!(
@@ -754,7 +754,10 @@ impl ChunkServerService for MyChunkServer {
             }
 
             // io_uring read (no seek syscall — read_at uses offset directly)
-            let data = match self.read_block_async(&req.block_id, offset, bytes_to_read).await {
+            let data = match self
+                .read_block_async(&req.block_id, offset, bytes_to_read)
+                .await
+            {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(Status::not_found("Block not found"));
@@ -971,7 +974,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let server = make_test_server(dir.path());
         let data = b"hello io_uring world";
-        server.write_block_async("test-block-async", data).await.unwrap();
+        server
+            .write_block_async("test-block-async", data)
+            .await
+            .unwrap();
         let written = std::fs::read(dir.path().join("test-block-async")).unwrap();
         assert_eq!(written.as_slice(), data.as_ref());
     }
@@ -981,7 +987,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let server = make_test_server(dir.path());
         let data = b"checksum test data for io_uring";
-        server.write_block_async("meta-block-async", data).await.unwrap();
+        server
+            .write_block_async("meta-block-async", data)
+            .await
+            .unwrap();
         assert!(dir.path().join("meta-block-async.meta").exists());
         let meta = std::fs::read(dir.path().join("meta-block-async.meta")).unwrap();
         assert!(!meta.is_empty());
@@ -993,7 +1002,10 @@ mod tests {
         let server = make_test_server(dir.path());
         let data = make_test_data(4096);
         std::fs::write(dir.path().join("read-test"), &data).unwrap();
-        let result = server.read_block_async("read-test", 0, data.len() as u64).await.unwrap();
+        let result = server
+            .read_block_async("read-test", 0, data.len() as u64)
+            .await
+            .unwrap();
         assert_eq!(result, data);
     }
 
@@ -1003,9 +1015,11 @@ mod tests {
         let server = make_test_server(dir.path());
         let data = make_test_data(65536);
         std::fs::write(dir.path().join("partial-test"), &data).unwrap();
-        let result = server.read_block_async("partial-test", 32768, 4096).await.unwrap();
+        let result = server
+            .read_block_async("partial-test", 32768, 4096)
+            .await
+            .unwrap();
         assert_eq!(result.len(), 4096);
         assert_eq!(result, data[32768..32768 + 4096].to_vec());
     }
-
 }

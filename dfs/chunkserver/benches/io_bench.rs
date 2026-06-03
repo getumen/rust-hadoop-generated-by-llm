@@ -64,5 +64,10 @@ fn bench_partial_read_stdfs(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_write_stdfs, bench_read_stdfs, bench_partial_read_stdfs);
+criterion_group!(
+    benches,
+    bench_write_stdfs,
+    bench_read_stdfs,
+    bench_partial_read_stdfs
+);
 criterion_main!(benches);
