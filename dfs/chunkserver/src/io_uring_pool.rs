@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
+use tokio_uring::buf::BoundedBuf;
 use tokio_uring::fs::File;
 
 enum IoRequest {
@@ -24,27 +25,30 @@ pub struct IoUringPool {
 impl IoUringPool {
     pub fn new(channel_capacity: usize) -> Self {
         let (tx, mut rx) = mpsc::channel::<IoRequest>(channel_capacity);
-        std::thread::spawn(move || {
-            tokio_uring::start(async move {
-                while let Some(req) = rx.recv().await {
-                    tokio_uring::spawn(async move {
-                        match req {
-                            IoRequest::Write { path, data, reply } => {
-                                let _ = reply.send(do_write(path, data).await);
+        std::thread::Builder::new()
+            .name("io-uring-pool".to_string())
+            .spawn(move || {
+                tokio_uring::start(async move {
+                    while let Some(req) = rx.recv().await {
+                        tokio_uring::spawn(async move {
+                            match req {
+                                IoRequest::Write { path, data, reply } => {
+                                    let _ = reply.send(do_write(path, data).await);
+                                }
+                                IoRequest::Read {
+                                    path,
+                                    offset,
+                                    length,
+                                    reply,
+                                } => {
+                                    let _ = reply.send(do_read(path, offset, length).await);
+                                }
                             }
-                            IoRequest::Read {
-                                path,
-                                offset,
-                                length,
-                                reply,
-                            } => {
-                                let _ = reply.send(do_read(path, offset, length).await);
-                            }
-                        }
-                    });
-                }
-            });
-        });
+                        });
+                    }
+                });
+            })
+            .expect("failed to spawn io-uring thread");
         IoUringPool { sender: tx }
     }
 
@@ -79,6 +83,8 @@ impl IoUringPool {
 }
 
 async fn do_write(path: PathBuf, data: Vec<u8>) -> io::Result<()> {
+    // File::create uses O_CREAT|O_WRONLY|O_TRUNC — any existing content is discarded.
+    // This is intentional: blocks are always written whole (no partial overwrites).
     let file = File::create(&path).await?;
     let (res, _) = file.write_all_at(data, 0).await;
     res?;
@@ -90,16 +96,20 @@ async fn do_read(path: PathBuf, offset: u64, length: usize) -> io::Result<Vec<u8
     let mut buf = vec![0u8; length];
     let mut filled = 0usize;
     while filled < length {
-        let sub = buf[filled..].to_vec();
-        let (res, ret) = file.read_at(sub, offset + filled as u64).await;
+        // Use a Slice to read directly into buf[filled..] without allocating a
+        // sub-buffer.  slice(filled..) takes ownership of `buf`, submits the
+        // io-uring read into the correct region, then returns the Vec via
+        // into_inner() so we can continue using it.
+        let slice = buf.slice(filled..length);
+        let (res, slice) = file.read_at(slice, offset + filled as u64).await;
         let n = res?;
+        buf = slice.into_inner();
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "read_at returned 0 bytes before buffer full",
             ));
         }
-        buf[filled..filled + n].copy_from_slice(&ret[..n]);
         filled += n;
     }
     Ok(buf)
