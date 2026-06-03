@@ -670,9 +670,13 @@ pub struct MasterConfig {
     pub merge_threshold_rps: f64,
     pub ca_cert_path: Option<String>,
     pub domain_name: Option<String>,
+    /// Seconds since last access before a file is considered cold (env: COLD_THRESHOLD_SECS, default: 604800 = 7 days)
+    pub cold_threshold_secs: u64,
+    /// Seconds after cold move before EC conversion (env: EC_THRESHOLD_SECS, default: 2592000 = 30 days)
+    pub ec_threshold_secs: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MyMaster {
     state: Arc<Mutex<AppState>>,
     raft_tx: mpsc::Sender<Event>,
@@ -681,6 +685,7 @@ pub struct MyMaster {
     monitor: Arc<ThroughputMonitor>,
     _master_address: String,
     _config_server_addrs: Vec<String>,
+    config: MasterConfig,
 }
 
 impl MyMaster {
@@ -1446,10 +1451,11 @@ impl MyMaster {
             state,
             raft_tx,
             shard_map,
-            shard_id: config.shard_id,
+            shard_id: config.shard_id.clone(),
             monitor,
-            _master_address: config.master_address,
-            _config_server_addrs: config.config_server_addrs,
+            _master_address: config.master_address.clone(),
+            _config_server_addrs: config.config_server_addrs.clone(),
+            config,
         }
     }
 
@@ -1471,6 +1477,71 @@ impl MyMaster {
                 Err(Status::failed_precondition(msg))
             }
             Err(_) => Err(Status::internal("Raft node shutdown")),
+        }
+    }
+
+    /// Background tiering scanner: identifies cold files and issues MOVE_TO_COLD commands.
+    pub async fn scan_tiering(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cold_threshold_ms = self.config.cold_threshold_secs * 1000;
+
+        // Collect candidates without holding the lock across awaits
+        let candidates: Vec<(String, Vec<crate::dfs::BlockInfo>)> = {
+            let state = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref ms) = *state {
+                ms.files
+                    .values()
+                    .filter(|f| {
+                        f.moved_to_cold_at_ms == 0
+                            && f.ec_data_shards == 0
+                            && f.last_access_ms > 0
+                            && now_ms.saturating_sub(f.last_access_ms) > cold_threshold_ms
+                    })
+                    .map(|f| (f.path.clone(), f.blocks.clone()))
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        for (path, blocks) in candidates {
+            // Queue MOVE_TO_COLD commands to all ChunkServers holding blocks
+            {
+                let mut state = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref mut ms) = *state {
+                    for block in &blocks {
+                        for loc in &block.locations {
+                            ms.pending_commands
+                                .entry(loc.clone())
+                                .or_default()
+                                .push(crate::dfs::ChunkServerCommand {
+                                    r#type: crate::dfs::chunk_server_command::CommandType::MoveToCold
+                                        as i32,
+                                    block_id: block.block_id.clone(),
+                                    ..Default::default()
+                                });
+                        }
+                    }
+                }
+            }
+
+            // Persist cold-move via Raft (best effort — ignore Not Leader errors)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::MoveToCold {
+                        path: path.clone(),
+                        moved_at_ms: now_ms,
+                    }),
+                    reply_tx: tx,
+                })
+                .await;
+            let _ = rx.await;
+            tracing::info!("Tiering scanner: queued cold move for {}", path);
         }
     }
 
@@ -3676,6 +3747,8 @@ mod tests {
             merge_threshold_rps: 0.0,
             ca_cert_path: None,
             domain_name: None,
+            cold_threshold_secs: 604800,
+            ec_threshold_secs: 2592000,
         };
 
         let master = MyMaster::new(
@@ -3736,6 +3809,48 @@ mod tests {
             );
         } else {
             panic!("Expected Master state");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_tiering_queues_cold_move() {
+        let (master, _app_state) = make_test_master().await;
+
+        // Insert a file with an ancient last_access_ms and a fake block location
+        {
+            let mut state = master.state.lock().unwrap();
+            if let AppState::Master(ref mut ms) = *state {
+                ms.files.insert(
+                    "/old-file".to_string(),
+                    crate::dfs::FileMetadata {
+                        path: "/old-file".to_string(),
+                        last_access_ms: 1, // epoch+1ms = ancient
+                        access_count: 1,
+                        moved_to_cold_at_ms: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        blocks: vec![crate::dfs::BlockInfo {
+                            block_id: "blk-tiering-001".to_string(),
+                            locations: vec!["127.0.0.1:9001".to_string()],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        // last_access_ms=1 and now_ms >> 1 + 604800*1000 guarantees cold threshold is exceeded
+        master.scan_tiering().await;
+
+        // Verify MOVE_TO_COLD command queued for the block's ChunkServer
+        let state = master.state.lock().unwrap();
+        if let AppState::Master(ref ms) = *state {
+            let cmds = ms.pending_commands.get("127.0.0.1:9001");
+            assert!(
+                cmds.is_some_and(|c| c.iter().any(|cmd| cmd.block_id == "blk-tiering-001")),
+                "Expected MOVE_TO_COLD command queued for blk-tiering-001"
+            );
         }
     }
 }

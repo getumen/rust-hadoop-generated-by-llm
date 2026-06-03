@@ -212,10 +212,28 @@ async fn main() -> anyhow::Result<()> {
             merge_threshold_rps: args.merge_threshold_rps,
             ca_cert_path: args.ca_cert.clone(),
             domain_name: args.domain_name.clone(),
+            cold_threshold_secs: std::env::var("COLD_THRESHOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(604800),
+            ec_threshold_secs: std::env::var("EC_THRESHOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2592000),
         },
     );
 
     tracing::info!("Master gRPC server listening on {}", addr);
+
+    // Storage tiering background scanner (60s interval)
+    let master_for_tiering = master.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            master_for_tiering.scan_tiering().await;
+        }
+    });
 
     let mut server = Server::builder();
 
