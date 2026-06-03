@@ -362,22 +362,17 @@ impl MasterState {
 /// 3. Stop when `n` servers are selected or candidates exhausted.
 ///
 /// Empty rack_id strings are each treated as a unique rack (address-keyed).
-fn select_servers_rack_aware(
-    servers: &[(String, ChunkServerStatus)],
-    n: usize,
-) -> Vec<String> {
+fn select_servers_rack_aware(servers: &[(String, ChunkServerStatus)], n: usize) -> Vec<String> {
     if n == 0 || servers.is_empty() {
         return vec![];
     }
 
     // Sort candidates by available_space descending
-    let mut candidates: Vec<&(String, ChunkServerStatus)> =
-        servers.iter().collect();
+    let mut candidates: Vec<&(String, ChunkServerStatus)> = servers.iter().collect();
     candidates.sort_by(|a, b| b.1.available_space.cmp(&a.1.available_space));
 
     // Group by rack. Empty rack_id → use address as key to avoid grouping them.
-    let mut rack_buckets: HashMap<String, Vec<&(String, ChunkServerStatus)>> =
-        HashMap::new();
+    let mut rack_buckets: HashMap<String, Vec<&(String, ChunkServerStatus)>> = HashMap::new();
     for s in &candidates {
         let rack_key = if s.1.rack_id.is_empty() {
             format!("__addr__{}", s.0)
@@ -392,12 +387,9 @@ fn select_servers_rack_aware(
     // (HashMap iteration order), but this is benign — all racks still participate
     // in the round-robin and any server from a tied rack is equally valid.
     let racks: Vec<Vec<&(String, ChunkServerStatus)>> = {
-        let mut r: Vec<Vec<&(String, ChunkServerStatus)>> =
-            rack_buckets.into_values().collect();
+        let mut r: Vec<Vec<&(String, ChunkServerStatus)>> = rack_buckets.into_values().collect();
         // Sort racks by best server descending
-        r.sort_by(|a, b| {
-            b[0].1.available_space.cmp(&a[0].1.available_space)
-        });
+        r.sort_by(|a, b| b[0].1.available_space.cmp(&a[0].1.available_space));
         r
     };
 
@@ -483,10 +475,7 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                     }
 
                     // Find a target CS not already holding a shard of this block
-                    let target = match live_servers
-                        .iter()
-                        .find(|s| !block.locations.contains(*s))
-                    {
+                    let target = match live_servers.iter().find(|s| !block.locations.contains(*s)) {
                         Some(t) => t.clone(),
                         None => {
                             tracing::warn!(
@@ -3159,7 +3148,13 @@ mod tests {
         for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
             state.chunk_servers.insert(
                 addr.to_string(),
-                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1, rack_id: String::new() },
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 1,
+                    rack_id: String::new(),
+                },
             );
         }
         state.files.insert(
@@ -3183,9 +3178,15 @@ mod tests {
             },
         );
         heal_under_replicated_blocks(&mut state);
-        let cmds = state.pending_commands.get("cs1:50055").expect("commands expected");
+        let cmds = state
+            .pending_commands
+            .get("cs1:50055")
+            .expect("commands expected");
         assert_eq!(cmds.len(), 2);
-        let targets: std::collections::HashSet<_> = cmds.iter().map(|c| c.target_chunk_server_address.as_str()).collect();
+        let targets: std::collections::HashSet<_> = cmds
+            .iter()
+            .map(|c| c.target_chunk_server_address.as_str())
+            .collect();
         assert!(targets.contains("cs2:50056") || targets.contains("cs3:50057"));
     }
 
@@ -3196,7 +3197,13 @@ mod tests {
         for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
             state.chunk_servers.insert(
                 addr.to_string(),
-                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1, rack_id: String::new() },
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 1,
+                    rack_id: String::new(),
+                },
             );
         }
         state.files.insert(
@@ -3207,7 +3214,11 @@ mod tests {
                 blocks: vec![BlockInfo {
                     block_id: "block-full".to_string(),
                     size: 100,
-                    locations: vec!["cs1:50055".to_string(), "cs2:50056".to_string(), "cs3:50057".to_string()],
+                    locations: vec![
+                        "cs1:50055".to_string(),
+                        "cs2:50056".to_string(),
+                        "cs3:50057".to_string(),
+                    ],
                     checksum_crc32c: 0,
                     ec_data_shards: 0,
                     ec_parity_shards: 0,
@@ -3230,7 +3241,13 @@ mod tests {
         for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
             state.chunk_servers.insert(
                 addr.to_string(),
-                ChunkServerStatus { last_heartbeat: now, used_space: 0, available_space: 1_000_000, chunk_count: 1, rack_id: String::new() },
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 1,
+                    rack_id: String::new(),
+                },
             );
         }
         state.files.insert(
@@ -3241,7 +3258,11 @@ mod tests {
                 blocks: vec![BlockInfo {
                     block_id: "block-bad".to_string(),
                     size: 100,
-                    locations: vec!["cs1:50055".to_string(), "cs2:50056".to_string(), "cs3:50057".to_string()],
+                    locations: vec![
+                        "cs1:50055".to_string(),
+                        "cs2:50056".to_string(),
+                        "cs3:50057".to_string(),
+                    ],
                     checksum_crc32c: 0,
                     ec_data_shards: 0,
                     ec_parity_shards: 0,
@@ -3253,7 +3274,8 @@ mod tests {
                 ec_parity_shards: 0,
             },
         );
-        state.bad_block_locations
+        state
+            .bad_block_locations
             .entry("block-bad".to_string())
             .or_default()
             .insert("cs2:50056".to_string());
@@ -3267,28 +3289,50 @@ mod tests {
     fn test_rack_aware_selection_spreads_across_racks() {
         // 3 servers on 3 different racks — should pick one per rack
         let servers = vec![
-            ("cs1:50051".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 1_000_000, chunk_count: 0,
-                rack_id: "rack-a".to_string(),
-            }),
-            ("cs2:50052".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 900_000, chunk_count: 0,
-                rack_id: "rack-b".to_string(),
-            }),
-            ("cs3:50053".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 800_000, chunk_count: 0,
-                rack_id: "rack-c".to_string(),
-            }),
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "rack-b".to_string(),
+                },
+            ),
+            (
+                "cs3:50053".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 800_000,
+                    chunk_count: 0,
+                    rack_id: "rack-c".to_string(),
+                },
+            ),
         ];
         let selected = select_servers_rack_aware(&servers, 3);
         assert_eq!(selected.len(), 3);
         // All 3 racks represented
-        let racks: std::collections::HashSet<String> = selected.iter()
+        let racks: std::collections::HashSet<String> = selected
+            .iter()
             .map(|addr| {
-                servers.iter().find(|(a, _)| a == addr).unwrap().1.rack_id.clone()
+                servers
+                    .iter()
+                    .find(|(a, _)| a == addr)
+                    .unwrap()
+                    .1
+                    .rack_id
+                    .clone()
             })
             .collect();
         assert_eq!(racks.len(), 3, "All 3 racks should be represented");
@@ -3298,21 +3342,36 @@ mod tests {
     fn test_rack_aware_selection_fallback_to_same_rack() {
         // 3 servers on only 2 racks — need 3 replicas, must pick 2 from one rack
         let servers = vec![
-            ("cs1:50051".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 1_000_000, chunk_count: 0,
-                rack_id: "rack-a".to_string(),
-            }),
-            ("cs2:50052".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 900_000, chunk_count: 0,
-                rack_id: "rack-a".to_string(),
-            }),
-            ("cs3:50053".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 800_000, chunk_count: 0,
-                rack_id: "rack-b".to_string(),
-            }),
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs3:50053".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 800_000,
+                    chunk_count: 0,
+                    rack_id: "rack-b".to_string(),
+                },
+            ),
         ];
         let selected = select_servers_rack_aware(&servers, 3);
         assert_eq!(selected.len(), 3);
@@ -3325,16 +3384,26 @@ mod tests {
     fn test_rack_aware_selection_empty_rack_id_treated_as_distinct() {
         // Servers with empty rack_id should each be treated as their own rack
         let servers = vec![
-            ("cs1:50051".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 1_000_000, chunk_count: 0,
-                rack_id: "".to_string(),
-            }),
-            ("cs2:50052".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 900_000, chunk_count: 0,
-                rack_id: "".to_string(),
-            }),
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "".to_string(),
+                },
+            ),
         ];
         let selected = select_servers_rack_aware(&servers, 2);
         assert_eq!(selected.len(), 2);
@@ -3344,16 +3413,26 @@ mod tests {
     fn test_rack_aware_selection_fewer_servers_than_replicas() {
         // Only 2 servers but want 3 replicas — return all 2
         let servers = vec![
-            ("cs1:50051".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 1_000_000, chunk_count: 0,
-                rack_id: "rack-a".to_string(),
-            }),
-            ("cs2:50052".to_string(), ChunkServerStatus {
-                last_heartbeat: 9_999_999_999_999,
-                used_space: 0, available_space: 900_000, chunk_count: 0,
-                rack_id: "rack-b".to_string(),
-            }),
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "rack-b".to_string(),
+                },
+            ),
         ];
         let selected = select_servers_rack_aware(&servers, 3);
         assert_eq!(selected.len(), 2);
@@ -3383,15 +3462,18 @@ mod tests {
     #[test]
     fn test_allocate_block_ec_selects_kplusm_servers() {
         let mut state = MasterState::default();
-        state.files.insert("/ec-file".to_string(), FileMetadata {
-            path: "/ec-file".to_string(),
-            size: 0,
-            blocks: vec![],
-            etag_md5: "".to_string(),
-            created_at_ms: 0,
-            ec_data_shards: 4,
-            ec_parity_shards: 2,
-        });
+        state.files.insert(
+            "/ec-file".to_string(),
+            FileMetadata {
+                path: "/ec-file".to_string(),
+                size: 0,
+                blocks: vec![],
+                etag_md5: "".to_string(),
+                created_at_ms: 0,
+                ec_data_shards: 4,
+                ec_parity_shards: 2,
+            },
+        );
         for i in 0..6usize {
             state.chunk_servers.insert(
                 format!("cs{}:50052", i),
@@ -3427,43 +3509,55 @@ mod tests {
         for i in [0usize, 1, 3, 4, 5, 6] {
             state.chunk_servers.insert(
                 format!("cs{}:50052", i),
-                ChunkServerStatus { last_heartbeat: 9_999_999_999_999, used_space: 0, available_space: 1_000_000, chunk_count: 0, rack_id: String::new() },
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: String::new(),
+                },
             );
         }
 
         // EC(4,2) file with one block; shard 2 was on the now-dead cs2
-        state.files.insert("/ec-file".to_string(), crate::dfs::FileMetadata {
-            path: "/ec-file".to_string(),
-            size: 100,
-            blocks: vec![crate::dfs::BlockInfo {
-                block_id: "blk-1".to_string(),
+        state.files.insert(
+            "/ec-file".to_string(),
+            crate::dfs::FileMetadata {
+                path: "/ec-file".to_string(),
                 size: 100,
-                locations: vec![
-                    "cs0:50052".to_string(),
-                    "cs1:50052".to_string(),
-                    "cs2:50052".to_string(), // dead
-                    "cs3:50052".to_string(),
-                    "cs4:50052".to_string(),
-                    "cs5:50052".to_string(),
-                ],
-                checksum_crc32c: 0,
+                blocks: vec![crate::dfs::BlockInfo {
+                    block_id: "blk-1".to_string(),
+                    size: 100,
+                    locations: vec![
+                        "cs0:50052".to_string(),
+                        "cs1:50052".to_string(),
+                        "cs2:50052".to_string(), // dead
+                        "cs3:50052".to_string(),
+                        "cs4:50052".to_string(),
+                        "cs5:50052".to_string(),
+                    ],
+                    checksum_crc32c: 0,
+                    ec_data_shards: 4,
+                    ec_parity_shards: 2,
+                    original_size: 100,
+                }],
+                etag_md5: "".to_string(),
+                created_at_ms: 0,
                 ec_data_shards: 4,
                 ec_parity_shards: 2,
-                original_size: 100,
-            }],
-            etag_md5: "".to_string(),
-            created_at_ms: 0,
-            ec_data_shards: 4,
-            ec_parity_shards: 2,
-        });
+            },
+        );
 
         heal_under_replicated_blocks(&mut state);
 
         // Should issue exactly one RECONSTRUCT_EC_SHARD for shard 2
         let all_cmds: Vec<_> = state.pending_commands.values().flatten().collect();
         assert!(
-            all_cmds.iter().any(|c| c.r#type == 3 && c.block_id == "blk-1" && c.shard_index == 2),
-            "Expected RECONSTRUCT_EC_SHARD for shard 2, got: {:?}", all_cmds
+            all_cmds
+                .iter()
+                .any(|c| c.r#type == 3 && c.block_id == "blk-1" && c.shard_index == 2),
+            "Expected RECONSTRUCT_EC_SHARD for shard 2, got: {:?}",
+            all_cmds
         );
     }
 }

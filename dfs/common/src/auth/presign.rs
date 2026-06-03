@@ -27,7 +27,10 @@ pub fn generate_presigned_url(params: &PresignParams<'_>) -> String {
 
     // Build canonical query params (sorted, no X-Amz-Signature)
     let mut query_params: Vec<(String, String)> = vec![
-        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
         ("X-Amz-Credential".to_string(), credential),
         ("X-Amz-Date".to_string(), datetime.clone()),
         ("X-Amz-Expires".to_string(), params.expires_secs.to_string()),
@@ -109,7 +112,11 @@ mod tests {
     #[test]
     fn test_url_contains_required_query_params() {
         let url = generate_presigned_url(&test_params());
-        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "URL: {}", url);
+        assert!(
+            url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"),
+            "URL: {}",
+            url
+        );
         assert!(url.contains("X-Amz-Expires=3600"), "URL: {}", url);
         assert!(url.contains("X-Amz-SignedHeaders=host"), "URL: {}", url);
         assert!(url.contains("X-Amz-Signature="), "URL: {}", url);
@@ -143,7 +150,11 @@ mod tests {
         p.key = "dir/file name.txt";
         let url = generate_presigned_url(&p);
         // Path in URL should have space encoded as %20
-        assert!(url.contains("/mybucket/dir/file%20name.txt"), "URL: {}", url);
+        assert!(
+            url.contains("/mybucket/dir/file%20name.txt"),
+            "URL: {}",
+            url
+        );
     }
 
     #[test]

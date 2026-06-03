@@ -268,10 +268,20 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", file);
             }
         }
-        Commands::Put { source, dest, ec_data, ec_parity } => {
+        Commands::Put {
+            source,
+            dest,
+            ec_data,
+            ec_parity,
+        } => {
             if ec_data > 0 && ec_parity > 0 {
-                client.create_file_ec(&source, &dest, ec_data, ec_parity).await?;
-                println!("File uploaded successfully with EC RS({},{})", ec_data, ec_parity);
+                client
+                    .create_file_ec(&source, &dest, ec_data, ec_parity)
+                    .await?;
+                println!(
+                    "File uploaded successfully with EC RS({},{})",
+                    ec_data, ec_parity
+                );
             } else {
                 client.create_file(&source, &dest).await?;
                 println!("File uploaded successfully with replication");
@@ -287,7 +297,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("File Metadata for: {}", meta.path);
                 println!("  Size: {} bytes", meta.size);
                 if meta.ec_data_shards > 0 {
-                    println!("  Storage: EC RS({},{})", meta.ec_data_shards, meta.ec_parity_shards);
+                    println!(
+                        "  Storage: EC RS({},{})",
+                        meta.ec_data_shards, meta.ec_parity_shards
+                    );
                 } else {
                     println!("  Storage: Replicated");
                 }
@@ -441,8 +454,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let access_key = std::env::var("AWS_ACCESS_KEY_ID")
                 .map_err(|_| anyhow::anyhow!("AWS_ACCESS_KEY_ID environment variable not set"))?;
-            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-                .map_err(|_| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set"))?;
+            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
+                anyhow::anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set")
+            })?;
             let region = std::env::var("AWS_REGION")
                 .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string());

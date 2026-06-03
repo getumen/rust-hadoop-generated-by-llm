@@ -180,7 +180,10 @@ async fn main() -> anyhow::Result<()> {
 
             // Drain any bad blocks detected by the scrubber
             let bad_blocks = {
-                let mut pending = chunk_server_heartbeat.pending_bad_blocks.lock().expect("Mutex poisoned");
+                let mut pending = chunk_server_heartbeat
+                    .pending_bad_blocks
+                    .lock()
+                    .expect("Mutex poisoned");
                 std::mem::take(&mut *pending)
             };
 

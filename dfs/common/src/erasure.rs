@@ -16,10 +16,7 @@ pub fn encode(data: &[u8], data_shards: usize, parity_shards: usize) -> Result<V
     let shard_size = shard_len(data.len(), data_shards);
     let mut padded = data.to_vec();
     padded.resize(shard_size * data_shards, 0);
-    let mut shards: Vec<Vec<u8>> = padded
-        .chunks(shard_size)
-        .map(|c| c.to_vec())
-        .collect();
+    let mut shards: Vec<Vec<u8>> = padded.chunks(shard_size).map(|c| c.to_vec()).collect();
     shards.resize(data_shards + parity_shards, vec![0u8; shard_size]);
     r.encode(&mut shards)
         .map_err(|e| anyhow::anyhow!("RS encode error: {:?}", e))?;
@@ -100,7 +97,7 @@ mod tests {
     fn test_shard_len() {
         assert_eq!(shard_len(28, 4), 7);
         assert_eq!(shard_len(10_000, 4), 2500);
-        assert_eq!(shard_len(1, 4), 1);  // ceil(1/4) = 1
+        assert_eq!(shard_len(1, 4), 1); // ceil(1/4) = 1
     }
 
     #[test]

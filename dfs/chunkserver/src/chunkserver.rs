@@ -423,8 +423,9 @@ impl MyChunkServer {
         }
 
         // 1. Fetch available shards concurrently
-        type ShardFuture =
-            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, anyhow::Result<Vec<u8>>)> + Send>>;
+        type ShardFuture = std::pin::Pin<
+            Box<dyn std::future::Future<Output = (usize, anyhow::Result<Vec<u8>>)> + Send>,
+        >;
         let mut fetch_futures: Vec<ShardFuture> = Vec::new();
 
         for (i, src_addr) in sources.iter().enumerate() {
@@ -460,7 +461,9 @@ impl MyChunkServer {
                             .unwrap_or("localhost")
                             .to_string()
                     });
-                    if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
+                    if let Ok(tls_config) =
+                        dfs_common::security::get_client_tls_config(ca_path, &domain)
+                    {
                         endpoint = match endpoint.tls_config(tls_config) {
                             Ok(e) => e,
                             Err(e) => return (i, Err(anyhow::anyhow!("TLS config error: {}", e))),
@@ -469,7 +472,12 @@ impl MyChunkServer {
                 }
                 let channel = match endpoint.connect().await {
                     Ok(c) => c,
-                    Err(e) => return (i, Err(anyhow::anyhow!("Connect failed to {}: {}", resolved, e))),
+                    Err(e) => {
+                        return (
+                            i,
+                            Err(anyhow::anyhow!("Connect failed to {}: {}", resolved, e)),
+                        )
+                    }
                 };
                 let mut client =
                     crate::dfs::chunk_server_service_client::ChunkServerServiceClient::new(channel)
@@ -481,7 +489,10 @@ impl MyChunkServer {
                 });
                 match client.read_block(req).await {
                     Ok(resp) => (i, Ok(resp.into_inner().data)),
-                    Err(e) => (i, Err(anyhow::anyhow!("ReadBlock failed from {}: {}", resolved, e))),
+                    Err(e) => (
+                        i,
+                        Err(anyhow::anyhow!("ReadBlock failed from {}: {}", resolved, e)),
+                    ),
                 }
             }));
         }

@@ -87,8 +87,8 @@ pub async fn auth_middleware(
     let query_params: BTreeMap<String, String> =
         serde_urlencoded::from_str(query_string_raw).unwrap_or_default();
 
-    let is_presigned = query_params.contains_key("X-Amz-Expires")
-        && query_params.contains_key("X-Amz-Algorithm");
+    let is_presigned =
+        query_params.contains_key("X-Amz-Expires") && query_params.contains_key("X-Amz-Algorithm");
 
     let normalized_query_string = normalize_query_string(query_string_raw);
 
@@ -689,7 +689,11 @@ fn normalize_query_string(query_string_raw: &str) -> String {
     normalized_query_parts.join("&")
 }
 
-fn presigned_is_expired(request_timestamp: &str, expires_secs: i64, now: chrono::DateTime<Utc>) -> bool {
+fn presigned_is_expired(
+    request_timestamp: &str,
+    expires_secs: i64,
+    now: chrono::DateTime<Utc>,
+) -> bool {
     let req_utc = DateTime::parse_from_rfc3339(request_timestamp)
         .map(|dt| dt.with_timezone(&Utc))
         .or_else(|_| {
@@ -713,9 +717,21 @@ mod tests {
     fn test_normalize_query_string_excludes_x_amz_signature() {
         let raw = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc123&X-Amz-Expires=3600";
         let normalized = normalize_query_string(raw);
-        assert!(!normalized.contains("X-Amz-Signature"), "Got: {}", normalized);
-        assert!(normalized.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "Got: {}", normalized);
-        assert!(normalized.contains("X-Amz-Expires=3600"), "Got: {}", normalized);
+        assert!(
+            !normalized.contains("X-Amz-Signature"),
+            "Got: {}",
+            normalized
+        );
+        assert!(
+            normalized.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"),
+            "Got: {}",
+            normalized
+        );
+        assert!(
+            normalized.contains("X-Amz-Expires=3600"),
+            "Got: {}",
+            normalized
+        );
     }
 
     #[test]
@@ -738,15 +754,25 @@ mod tests {
     #[test]
     fn test_presigned_not_expired() {
         let now = Utc::now();
-        let ts = (now - chrono::Duration::seconds(30)).format("%Y%m%dT%H%M%SZ").to_string();
-        assert!(!presigned_is_expired(&ts, 3600, now), "30-second-old URL with 1hr expiry should be valid");
+        let ts = (now - chrono::Duration::seconds(30))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        assert!(
+            !presigned_is_expired(&ts, 3600, now),
+            "30-second-old URL with 1hr expiry should be valid"
+        );
     }
 
     #[test]
     fn test_presigned_expired() {
         let now = Utc::now();
-        let ts = (now - chrono::Duration::seconds(7200)).format("%Y%m%dT%H%M%SZ").to_string();
-        assert!(presigned_is_expired(&ts, 3600, now), "2-hour-old URL with 1hr expiry should be expired");
+        let ts = (now - chrono::Duration::seconds(7200))
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        assert!(
+            presigned_is_expired(&ts, 3600, now),
+            "2-hour-old URL with 1hr expiry should be expired"
+        );
     }
 }
 

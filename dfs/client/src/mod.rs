@@ -236,7 +236,8 @@ impl Client {
         let mut file = File::open(source)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        self.create_file_from_buffer_ec(buffer, dest, ec_data_shards, ec_parity_shards).await
+        self.create_file_from_buffer_ec(buffer, dest, ec_data_shards, ec_parity_shards)
+            .await
     }
 
     pub async fn create_file_from_buffer(&self, buffer: Vec<u8>, dest: &str) -> anyhow::Result<()> {
@@ -332,18 +333,24 @@ impl Client {
             if chunk_servers.len() != total_shards {
                 bail!(
                     "Expected {} chunk servers for EC({},{}), got {}",
-                    total_shards, data_shards, parity_shards, chunk_servers.len()
+                    total_shards,
+                    data_shards,
+                    parity_shards,
+                    chunk_servers.len()
                 );
             }
 
             let shards = dfs_common::erasure::encode(&buffer, data_shards, parity_shards)?;
 
             // Compute CRC32C checksum for each shard before writing
-            let shard_checksums: Vec<u32> = shards.iter().map(|s| {
-                let mut h = crc32fast::Hasher::new();
-                h.update(s);
-                h.finalize()
-            }).collect();
+            let shard_checksums: Vec<u32> = shards
+                .iter()
+                .map(|s| {
+                    let mut h = crc32fast::Hasher::new();
+                    h.update(s);
+                    h.finalize()
+                })
+                .collect();
 
             // Compute CRC32C of the original (pre-encoding) buffer for the block-level checksum
             let mut full_hasher = crc32fast::Hasher::new();
@@ -451,7 +458,7 @@ impl Client {
             data: buffer,
             next_servers,
             expected_checksum_crc32c: checksum_crc32c,
-            shard_index: -1,  // -1 = replicated (not EC)
+            shard_index: -1, // -1 = replicated (not EC)
         });
 
         let write_resp = chunk_client.write_block(write_req).await?.into_inner();
@@ -562,7 +569,9 @@ impl Client {
             )
             .await?;
         let alloc_resp = alloc_resp.into_inner();
-        let block = alloc_resp.block.ok_or_else(|| anyhow!("No block allocated"))?;
+        let block = alloc_resp
+            .block
+            .ok_or_else(|| anyhow!("No block allocated"))?;
         let chunk_servers = alloc_resp.chunk_server_addresses;
 
         if chunk_servers.is_empty() {
@@ -578,22 +587,29 @@ impl Client {
         if data_shards == 0 || parity_shards == 0 {
             bail!(
                 "Master returned non-EC policy (data={}, parity={}) for EC file",
-                data_shards, parity_shards
+                data_shards,
+                parity_shards
             );
         }
         if chunk_servers.len() != total_shards {
             bail!(
                 "Expected {} chunk servers for EC({},{}), got {}",
-                total_shards, data_shards, parity_shards, chunk_servers.len()
+                total_shards,
+                data_shards,
+                parity_shards,
+                chunk_servers.len()
             );
         }
 
         let shards = dfs_common::erasure::encode(&buffer, data_shards, parity_shards)?;
-        let shard_checksums: Vec<u32> = shards.iter().map(|s| {
-            let mut h = crc32fast::Hasher::new();
-            h.update(s);
-            h.finalize()
-        }).collect();
+        let shard_checksums: Vec<u32> = shards
+            .iter()
+            .map(|s| {
+                let mut h = crc32fast::Hasher::new();
+                h.update(s);
+                h.finalize()
+            })
+            .collect();
         let mut full_hasher = crc32fast::Hasher::new();
         full_hasher.update(&buffer);
         let full_checksum = full_hasher.finalize();
@@ -704,7 +720,8 @@ impl Client {
             let data = if block.ec_data_shards > 0 {
                 self.read_ec_block(&block).await?
             } else {
-                self.read_block_range(&block.locations, &block.block_id, 0, 0).await?
+                self.read_block_range(&block.locations, &block.block_id, 0, 0)
+                    .await?
             };
             file.write_all(&data)?;
         }
@@ -809,8 +826,13 @@ impl Client {
                 let end = (block_offset + block_length) as usize;
                 full[start..end.min(full.len())].to_vec()
             } else {
-                self.read_block_range(&block.locations, &block.block_id, block_offset, block_length)
-                    .await?
+                self.read_block_range(
+                    &block.locations,
+                    &block.block_id,
+                    block_offset,
+                    block_length,
+                )
+                .await?
             };
             result.extend_from_slice(&data);
         }
@@ -947,7 +969,10 @@ impl Client {
                     {
                         Ok(data) => return Ok(data),
                         Err(e) => tracing::warn!(
-                            "Failed to read block {} from {}: {}", block_id, location, e
+                            "Failed to read block {} from {}: {}",
+                            block_id,
+                            location,
+                            e
                         ),
                     }
                 }
@@ -961,7 +986,9 @@ impl Client {
         let bid = block_id.to_string();
         let loc0 = locations[0].clone();
         let mut primary = tokio::spawn(async move {
-            self1.read_block_from_location(&loc0, &bid, offset, length).await
+            self1
+                .read_block_from_location(&loc0, &bid, offset, length)
+                .await
         });
 
         tokio::select! {
@@ -988,7 +1015,9 @@ impl Client {
         let bid2 = block_id.to_string();
         let loc1 = locations[1].clone();
         let mut hedge = tokio::spawn(async move {
-            self2.read_block_from_location(&loc1, &bid2, offset, length).await
+            self2
+                .read_block_from_location(&loc1, &bid2, offset, length)
+                .await
         });
 
         if primary_done {
@@ -1071,9 +1100,9 @@ impl Client {
                 .await
             {
                 Ok(data) => return Ok(data),
-                Err(e) => tracing::warn!(
-                    "Failed to read block {} from {}: {}", block_id, location, e
-                ),
+                Err(e) => {
+                    tracing::warn!("Failed to read block {} from {}: {}", block_id, location, e)
+                }
             }
         }
 
@@ -1094,7 +1123,9 @@ impl Client {
             let loc = loc.clone();
             let self_clone = self.clone();
             fetch_futs.push(async move {
-                let result = self_clone.read_block_from_location(&loc, &block_id, 0, 0).await;
+                let result = self_clone
+                    .read_block_from_location(&loc, &block_id, 0, 0)
+                    .await;
                 (i, result)
             });
         }
@@ -1103,7 +1134,9 @@ impl Client {
         let mut opt_shards: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut available = 0usize;
         for (i, result) in results {
-            if i >= total { continue; }
+            if i >= total {
+                continue;
+            }
             if let Ok(data) = result {
                 opt_shards[i] = Some(data);
                 available += 1;
@@ -1113,7 +1146,9 @@ impl Client {
         if available < data_shards {
             bail!(
                 "EC block {} unrecoverable: only {}/{} shards available",
-                block.block_id, available, data_shards
+                block.block_id,
+                available,
+                data_shards
             );
         }
 
@@ -1141,7 +1176,8 @@ impl Client {
         if block.ec_data_shards > 0 {
             self.read_ec_block(block).await
         } else {
-            self.read_block_range(&block.locations, &block.block_id, 0, 0).await
+            self.read_block_range(&block.locations, &block.block_id, 0, 0)
+                .await
         }
     }
 
@@ -1591,10 +1627,7 @@ mod tests {
         let block = crate::dfs::BlockInfo {
             block_id: "b2".to_string(),
             size: 0,
-            locations: vec![
-                "localhost:19997".to_string(),
-                "localhost:19998".to_string(),
-            ],
+            locations: vec!["localhost:19997".to_string(), "localhost:19998".to_string()],
             checksum_crc32c: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,

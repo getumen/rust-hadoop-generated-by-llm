@@ -1185,7 +1185,9 @@ impl RaftNode {
                     let snapshot_data = match db.get(b"snapshot_data") {
                         Ok(Some(data)) => data,
                         Ok(None) => {
-                            tracing::debug!("Backup: no snapshot_data found after snapshot creation");
+                            tracing::debug!(
+                                "Backup: no snapshot_data found after snapshot creation"
+                            );
                             return;
                         }
                         Err(e) => {
@@ -2871,7 +2873,11 @@ impl RaftNode {
             Command::Master(cmd) => {
                 if let AppState::Master(ref mut master_state) = *state {
                     match cmd {
-                        MasterCommand::CreateFile { path, ec_data_shards, ec_parity_shards } => {
+                        MasterCommand::CreateFile {
+                            path,
+                            ec_data_shards,
+                            ec_parity_shards,
+                        } => {
                             master_state.files.insert(
                                 path.clone(),
                                 crate::dfs::FileMetadata {
