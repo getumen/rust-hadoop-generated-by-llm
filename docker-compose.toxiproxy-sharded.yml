@@ -20,7 +20,10 @@ services:
 
   # Config Server
   config-server:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-config-server
     command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://toxiproxy:60150
     environment:
@@ -34,7 +37,10 @@ services:
 
   # Shard 1 Master
   master1-shard1:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master1-shard1
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60151 --shard-id shard-1 --config-servers http://toxiproxy:60150 --merge-threshold-rps=-1.0
     environment:
@@ -55,7 +61,10 @@ services:
 
   # Shard 2 Master
   master1-shard2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master1-shard2
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60161 --shard-id shard-2 --config-servers http://toxiproxy:60150 --merge-threshold-rps=-1.0
     environment:
@@ -76,7 +85,10 @@ services:
 
   # ChunkServer for Shard 1
   chunkserver1-shard1:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver1-shard1
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs1 --advertise-addr http://toxiproxy:60152
     networks:
@@ -92,7 +104,10 @@ services:
 
   # Extra services maintained for compatibility but not primary test targets
   chunkserver-extra:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-extra
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
     networks:
@@ -106,7 +121,10 @@ services:
       - ./shard_config.json:/app/shard_config.json:ro
 
   chunkserver-extra2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-extra2
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
     networks:

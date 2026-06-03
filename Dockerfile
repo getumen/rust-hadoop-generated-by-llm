@@ -11,6 +11,14 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Trust a custom CA cert if provided via BuildKit secret (e.g. corporate SSL proxy).
+# Usage: place cert at ./ca.pem (gitignored), then run docker compose up --build.
+RUN --mount=type=secret,id=ca_cert \
+    if [ -f /run/secrets/ca_cert ] && [ -s /run/secrets/ca_cert ]; then \
+        cp /run/secrets/ca_cert /usr/local/share/ca-certificates/ca.crt && \
+        update-ca-certificates; \
+    fi
+
 
 # Install sccache for faster incremental builds
 RUN ARCH=$(uname -m) && \
