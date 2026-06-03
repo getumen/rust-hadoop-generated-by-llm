@@ -1,5 +1,6 @@
 use crate::dfs::chunk_server_service_server::ChunkServerService;
 use crate::dfs::{ReadBlockRequest, ReadBlockResponse, WriteBlockRequest, WriteBlockResponse};
+use crate::io_uring_pool::IoUringPool;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ pub struct MyChunkServer {
     domain_name: Option<String>,
     /// Corrupted block IDs detected by the scrubber, waiting to be reported to Master.
     pub pending_bad_blocks: Arc<Mutex<Vec<String>>>,
+    io_uring_pool: Arc<IoUringPool>,
 }
 
 impl MyChunkServer {
@@ -76,6 +78,7 @@ impl MyChunkServer {
             ca_cert_path,
             domain_name,
             pending_bad_blocks: Arc::new(Mutex::new(Vec::new())),
+            io_uring_pool: Arc::new(IoUringPool::new(1024)),
         }
     }
 
@@ -186,100 +189,26 @@ impl MyChunkServer {
         Ok(())
     }
 
-    #[cfg(feature = "io-uring")]
     async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self.storage_dir.join(block_id);
         let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
 
-        // Build checksum bytes synchronously (CPU-bound)
         let checksums = Self::calculate_checksums(data);
-        let mut meta_bytes: Vec<u8> = Vec::with_capacity(checksums.len() * 4);
-        for c in checksums {
-            meta_bytes.extend_from_slice(&c.to_be_bytes());
-        }
+        let meta_bytes: Vec<u8> = checksums
+            .iter()
+            .flat_map(|c| c.to_be_bytes())
+            .collect();
 
-        let data_owned: Vec<u8> = data.to_vec();
-
-        tokio::task::spawn_blocking(move || {
-            tokio_uring::start(async {
-                // Write block data — write_all_at handles partial writes internally
-                let file = tokio_uring::fs::File::create(&path).await?;
-                let (res, _) = file.write_all_at(data_owned, 0).await;
-                res?;
-                file.sync_all().await?;
-
-                // Write checksum metadata
-                let meta_file = tokio_uring::fs::File::create(&meta_path).await?;
-                let (res, _) = meta_file.write_all_at(meta_bytes, 0).await;
-                res?;
-                meta_file.sync_all().await?;
-                Ok::<(), std::io::Error>(())
-            })
-        })
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        self.io_uring_pool.write(path, data.to_vec()).await?;
+        self.io_uring_pool.write(meta_path, meta_bytes).await
     }
 
-    #[cfg(not(feature = "io-uring"))]
-    async fn write_block_async(&self, block_id: &str, data: &[u8]) -> Result<(), std::io::Error> {
-        self.write_block_local(block_id, data)
-    }
-
-    #[cfg(feature = "io-uring")]
     async fn read_block_async(
         &self,
         block_id: &str,
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, std::io::Error> {
-        let path = self.storage_dir.join(block_id);
-
-        // Get file size synchronously (cheap metadata call, no I/O needed via io_uring)
-        let total_size = std::fs::metadata(&path)?.len();
-
-        if offset >= total_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Offset {} exceeds file size {}", offset, total_size),
-            ));
-        }
-
-        let bytes_to_read = std::cmp::min(length, total_size - offset) as usize;
-
-        tokio::task::spawn_blocking(move || {
-            tokio_uring::start(async move {
-                let file = tokio_uring::fs::File::open(&path).await?;
-                // read_at may return fewer bytes than requested; loop until full
-                let mut buf = vec![0u8; bytes_to_read];
-                let mut filled = 0usize;
-                while filled < bytes_to_read {
-                    let sub_buf = buf[filled..].to_vec();
-                    let (res, ret_buf) = file.read_at(sub_buf, offset + filled as u64).await;
-                    let n = res?;
-                    if n == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "read_at returned 0 bytes before buffer full",
-                        ));
-                    }
-                    buf[filled..filled + n].copy_from_slice(&ret_buf[..n]);
-                    filled += n;
-                }
-                Ok::<Vec<u8>, std::io::Error>(buf)
-            })
-        })
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-    }
-
-    #[cfg(not(feature = "io-uring"))]
-    async fn read_block_async(
-        &self,
-        block_id: &str,
-        offset: u64,
-        length: u64,
-    ) -> Result<Vec<u8>, std::io::Error> {
-        use std::io::{Read, Seek, SeekFrom};
         let path = self.storage_dir.join(block_id);
         let total_size = std::fs::metadata(&path)?.len();
         if offset >= total_size {
@@ -289,11 +218,7 @@ impl MyChunkServer {
             ));
         }
         let bytes_to_read = std::cmp::min(length, total_size - offset) as usize;
-        let mut file = std::fs::File::open(&path)?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; bytes_to_read];
-        file.read_exact(&mut buf)?;
-        Ok(buf)
+        self.io_uring_pool.read(path, offset, bytes_to_read).await
     }
 
     fn verify_block(&self, block_id: &str, data: &[u8]) -> Result<(), String> {
