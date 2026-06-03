@@ -1482,6 +1482,19 @@ impl MyMaster {
 
     /// Background tiering scanner: identifies cold files and issues MOVE_TO_COLD commands.
     pub async fn scan_tiering(&self) {
+        // Only the leader should run the tiering scanner
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.raft_tx.send(Event::GetLeaderInfo { reply_tx: tx }).await.is_err() {
+            return;
+        }
+        let leader = match rx.await {
+            Ok(Some(addr)) => addr,
+            _ => return, // no leader or channel closed
+        };
+        if leader != self.config.master_address {
+            return; // we are not the leader
+        }
+
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1547,6 +1560,19 @@ impl MyMaster {
 
     /// Background EC conversion scanner: converts cold files to erasure coding.
     pub async fn scan_ec_conversion(&self) {
+        // Only the leader should run the EC conversion scanner
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.raft_tx.send(Event::GetLeaderInfo { reply_tx: tx }).await.is_err() {
+            return;
+        }
+        let leader = match rx.await {
+            Ok(Some(addr)) => addr,
+            _ => return, // no leader or channel closed
+        };
+        if leader != self.config.master_address {
+            return; // we are not the leader
+        }
+
         const EC_DATA: i32 = 6;
         const EC_PARITY: i32 = 3;
         let total_shards = (EC_DATA + EC_PARITY) as usize;
@@ -1620,45 +1646,17 @@ impl MyMaster {
                 };
                 new_blocks.push(new_block);
 
-                // Get source CS (first location of the current replication block)
-                let source_cs = block.locations.first().cloned().unwrap_or_default();
+                // TODO: Issue RECONSTRUCT_EC_SHARD commands to write EC shards from the source block.
+                // The current reconstruct_ec_shard RPC is designed for reconstructing MISSING shards
+                // from EXISTING EC shards — it cannot convert a full replication block to EC shards.
+                // A dedicated "EC encode and distribute" command is needed (future work).
+                // For now, we update the metadata so the block is marked as EC; the data migration
+                // will be handled when that command is implemented.
 
-                {
-                    let mut state = self.state.lock().expect("Mutex poisoned");
-                    if let AppState::Master(ref mut ms) = *state {
-                        // Issue RECONSTRUCT_EC_SHARD for each shard
-                        for (shard_idx, cs_addr) in shard_servers.iter().enumerate() {
-                            let mut ec_shard_sources =
-                                vec!["".to_string(); total_shards];
-                            ec_shard_sources[0] = source_cs.clone();
-                            ms.pending_commands
-                                .entry(cs_addr.clone())
-                                .or_default()
-                                .push(crate::dfs::ChunkServerCommand {
-                                    r#type: crate::dfs::chunk_server_command::CommandType::ReconstructEcShard as i32,
-                                    block_id: block.block_id.clone(),
-                                    shard_index: shard_idx as i32,
-                                    ec_data_shards: EC_DATA,
-                                    ec_parity_shards: EC_PARITY,
-                                    ec_shard_sources,
-                                    original_block_size: block.original_size,
-                                    ..Default::default()
-                                });
-                        }
-
-                        // Issue DELETE for old replicas
-                        for old_loc in &block.locations {
-                            ms.pending_commands
-                                .entry(old_loc.clone())
-                                .or_default()
-                                .push(crate::dfs::ChunkServerCommand {
-                                    r#type: crate::dfs::chunk_server_command::CommandType::Delete as i32,
-                                    block_id: block.block_id.clone(),
-                                    ..Default::default()
-                                });
-                        }
-                    }
-                }
+                // NOTE: Old replication blocks are intentionally NOT deleted here.
+                // Deletion races with EC shard reconstruction and could cause data loss.
+                // Old replicas become orphaned and will be reclaimed by a future
+                // background orphan-cleanup pass (not yet implemented).
             }
 
             // Persist EC conversion via Raft
@@ -3854,6 +3852,18 @@ mod tests {
                                             meta.access_count += 1;
                                         }
                                     }
+                                    Command::Master(MasterCommand::ConvertToEc {
+                                        path,
+                                        ec_data_shards,
+                                        ec_parity_shards,
+                                        new_blocks,
+                                    }) => {
+                                        if let Some(meta) = ms.files.get_mut(path) {
+                                            meta.ec_data_shards = *ec_data_shards;
+                                            meta.ec_parity_shards = *ec_parity_shards;
+                                            meta.blocks = new_blocks.clone();
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -3862,6 +3872,11 @@ mod tests {
                     }
                     Event::GetReadIndex { reply_tx } => {
                         let _ = reply_tx.send(Ok(0));
+                    }
+                    // In tests the master_address is "127.0.0.1:9000" — return it so
+                    // leader guard passes and scan_tiering / scan_ec_conversion run.
+                    Event::GetLeaderInfo { reply_tx } => {
+                        let _ = reply_tx.send(Some("127.0.0.1:9000".to_string()));
                     }
                     _ => {}
                 }
@@ -4030,15 +4045,37 @@ mod tests {
 
         master.scan_ec_conversion().await;
 
+        // Give the spawned Raft task time to apply the ConvertToEc command
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         let state = master.state.lock().unwrap();
         if let AppState::Master(ref ms) = *state {
-            // Should have RECONSTRUCT_EC_SHARD commands on 9 servers + DELETE on 1
+            // scan_ec_conversion no longer queues RECONSTRUCT_EC_SHARD commands (Issue 5 fix).
+            // It only commits a ConvertToEc Raft command which updates the metadata.
+            // Verify that the file's metadata was updated to reflect the EC state.
+            let meta = ms
+                .files
+                .get("/cold-ec-file")
+                .expect("file should exist in state");
+            assert_eq!(
+                meta.ec_data_shards, 6,
+                "Expected ec_data_shards==6 after ConvertToEc, got {}",
+                meta.ec_data_shards
+            );
+            assert_eq!(
+                meta.ec_parity_shards, 3,
+                "Expected ec_parity_shards==3 after ConvertToEc, got {}",
+                meta.ec_parity_shards
+            );
+            // No RECONSTRUCT_EC_SHARD or DELETE commands should be pending
             let total_cmds: usize = ms.pending_commands.values().map(|v| v.len()).sum();
-            assert!(
-                total_cmds >= 9,
-                "Expected at least 9 EC shard commands, got {}",
+            assert_eq!(
+                total_cmds, 0,
+                "Expected no pending chunk commands (no RECONSTRUCT_EC_SHARD, no DELETE), got {}",
                 total_cmds
             );
+        } else {
+            panic!("Expected Master state");
         }
     }
 }
