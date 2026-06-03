@@ -1522,6 +1522,29 @@ impl MasterService for MyMaster {
             let req = request.into_inner();
 
             self.monitor.record_request(&req.path, 0); // Read request, 0 bytes for metadata
+
+            // Fire-and-forget access stat update for storage tiering (best effort)
+            {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let raft_tx = self.raft_tx.clone();
+                let path_clone = req.path.clone();
+                tokio::spawn(async move {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    let _ = raft_tx
+                        .send(Event::ClientRequest {
+                            command: Command::Master(MasterCommand::UpdateAccessStats {
+                                path: path_clone,
+                                accessed_at_ms: now_ms,
+                            }),
+                            reply_tx: tx,
+                        })
+                        .await;
+                });
+            }
+
             self.check_shard_ownership(&req.path)?;
             self.ensure_linearizable_read().await?;
 
@@ -3592,5 +3615,127 @@ mod tests {
             "Expected RECONSTRUCT_EC_SHARD for shard 2, got: {:?}",
             all_cmds
         );
+    }
+
+    /// Build a minimal `MyMaster` backed by a fake Raft event loop that:
+    ///   - applies `ClientRequest` commands directly to the shared state, and
+    ///   - immediately acknowledges `GetReadIndex` (linearizable-read bypass).
+    ///
+    /// Returns `(master, shared_state)` so tests can inspect state afterwards.
+    async fn make_test_master() -> (MyMaster, Arc<Mutex<AppState>>) {
+        let master_state = MasterState::default();
+        let app_state = Arc::new(Mutex::new(AppState::Master(master_state)));
+
+        let (raft_tx, mut raft_rx) = mpsc::channel::<Event>(64);
+
+        // Fake Raft event loop
+        let state_clone = app_state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = raft_rx.recv().await {
+                match event {
+                    Event::ClientRequest { command, reply_tx } => {
+                        // Apply command directly to state (single-node shortcut)
+                        {
+                            let mut lock = state_clone.lock().expect("Mutex poisoned");
+                            if let AppState::Master(ref mut ms) = *lock {
+                                match &command {
+                                    Command::Master(MasterCommand::UpdateAccessStats {
+                                        path,
+                                        accessed_at_ms,
+                                    }) => {
+                                        if let Some(meta) = ms.files.get_mut(path) {
+                                            meta.last_access_ms = *accessed_at_ms;
+                                            meta.access_count += 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let _ = reply_tx.send(Ok(()));
+                    }
+                    Event::GetReadIndex { reply_tx } => {
+                        let _ = reply_tx.send(Ok(0));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Build a single-shard ShardMap that owns all paths
+        let shard_id = "test-shard".to_string();
+        let mut shard_map = ShardMap::new_range();
+        shard_map.add_shard(shard_id.clone(), vec!["127.0.0.1:9000".to_string()]);
+
+        let config = MasterConfig {
+            shard_id: shard_id.clone(),
+            config_server_addrs: vec![],
+            master_address: "127.0.0.1:9000".to_string(),
+            split_threshold_rps: 1_000_000.0,
+            split_cooldown_secs: 3600,
+            merge_threshold_rps: 0.0,
+            ca_cert_path: None,
+            domain_name: None,
+        };
+
+        let master = MyMaster::new(
+            app_state.clone(),
+            raft_tx,
+            Arc::new(Mutex::new(shard_map)),
+            config,
+        );
+
+        (master, app_state)
+    }
+
+    #[tokio::test]
+    async fn test_get_file_info_increments_access_count() {
+        let (master, app_state) = make_test_master().await;
+
+        // Pre-insert a file directly into state so get_file_info has something to find
+        {
+            let mut lock = app_state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref mut ms) = *lock {
+                ms.files.insert(
+                    "/access-test".to_string(),
+                    FileMetadata {
+                        path: "/access-test".to_string(),
+                        size: 100,
+                        blocks: vec![],
+                        etag_md5: "".to_string(),
+                        created_at_ms: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        last_access_ms: 0,
+                        access_count: 0,
+                        moved_to_cold_at_ms: 0,
+                    },
+                );
+            }
+        }
+
+        // Call get_file_info — this fires the UpdateAccessStats spawn
+        let req = tonic::Request::new(GetFileInfoRequest {
+            path: "/access-test".to_string(),
+        });
+        let resp = master.get_file_info(req).await;
+        assert!(resp.is_ok(), "get_file_info should succeed");
+        assert!(resp.unwrap().into_inner().found, "file should be found");
+
+        // Give the spawned task time to execute
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify that access_count was incremented
+        let lock = app_state.lock().expect("Mutex poisoned");
+        if let AppState::Master(ref ms) = *lock {
+            let meta = ms.files.get("/access-test").expect("file should exist");
+            assert!(
+                meta.access_count >= 1,
+                "access_count should be >= 1 after get_file_info, got {}",
+                meta.access_count
+            );
+        } else {
+            panic!("Expected Master state");
+        }
     }
 }
