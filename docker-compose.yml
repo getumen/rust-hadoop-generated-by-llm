@@ -1,7 +1,10 @@
 
 services:
   config-server:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-config-server
     command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://config-server:50050
     environment:
@@ -17,11 +20,16 @@ services:
   # Shard 1
   # ==========================================
   master1-shard1:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master1-shard1
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard1:50051 --shard-id shard-1 --config-servers http://config-server:50050 --merge-threshold-rps=-1.0
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
+      - COLD_THRESHOLD_SECS=604800
+      - EC_THRESHOLD_SECS=2592000
     ports:
       - "8081:8080"
     networks:
@@ -37,9 +45,12 @@ services:
       retries: 3
 
   chunkserver1-shard1:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver1-shard1
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard1:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --cold-storage-dir /data/cold --advertise-addr dfs-chunkserver1-shard1:50052
     networks:
       - dfs-sharded-network
     depends_on:
@@ -49,17 +60,23 @@ services:
       - SHARD_CONFIG=/app/shard_config.json
     volumes:
       - cs1-shard1-data:/data/cs1
+      - cs1-shard1-cold:/data/cold
       - ./shard_config.json:/app/shard_config.json:ro
 
   # ==========================================
   # Shard 2
   # ==========================================
   master1-shard2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master1-shard2
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master1-shard2:50051 --shard-id shard-2 --config-servers http://config-server:50050 --merge-threshold-rps=-1.0
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
+      - COLD_THRESHOLD_SECS=604800
+      - EC_THRESHOLD_SECS=2592000
     ports:
       - "8091:8080"
     networks:
@@ -75,9 +92,12 @@ services:
       retries: 3
 
   chunkserver1-shard2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver1-shard2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver1-shard2:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --cold-storage-dir /data/cold --advertise-addr dfs-chunkserver1-shard2:50052
     networks:
       - dfs-sharded-network
     depends_on:
@@ -87,12 +107,16 @@ services:
       - SHARD_CONFIG=/app/shard_config.json
     volumes:
       - cs1-shard2-data:/data/cs1
+      - cs1-shard2-cold:/data/cold
       - ./shard_config.json:/app/shard_config.json:ro
 
   chunkserver-extra:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-extra
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra --cold-storage-dir /data/cold --advertise-addr dfs-chunkserver-extra:50052
     networks:
       - dfs-sharded-network
     depends_on:
@@ -101,12 +125,16 @@ services:
       - SHARD_CONFIG=/app/shard_config.json
     volumes:
       - cs-extra-data:/data/cs-extra
+      - cs-extra-cold:/data/cold
       - ./shard_config.json:/app/shard_config.json:ro
 
   chunkserver-extra2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-extra2
-    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
+    command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs-extra2 --cold-storage-dir /data/cold --advertise-addr dfs-chunkserver-extra2:50052
     networks:
       - dfs-sharded-network
     depends_on:
@@ -115,10 +143,14 @@ services:
       - SHARD_CONFIG=/app/shard_config.json
     volumes:
       - cs-extra2-data:/data/cs-extra2
+      - cs-extra2-cold:/data/cold
       - ./shard_config.json:/app/shard_config.json:ro
 
   s3-server:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-s3-server
     command: /app/s3-server
     environment:
@@ -144,7 +176,15 @@ volumes:
   config-server-data:
   master1-shard1-data:
   cs1-shard1-data:
+  cs1-shard1-cold:
   master1-shard2-data:
   cs1-shard2-data:
+  cs1-shard2-cold:
   cs-extra-data:
+  cs-extra-cold:
   cs-extra2-data:
+  cs-extra2-cold:
+
+secrets:
+  ca_cert:
+    file: ./ca.pem

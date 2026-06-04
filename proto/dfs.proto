@@ -65,6 +65,7 @@ message ChunkServerCommand {
     REPLICATE = 1;
     DELETE = 2; // Future use
     RECONSTRUCT_EC_SHARD = 3;
+    MOVE_TO_COLD = 4;  // Move block from hot storage dir to cold storage dir
   }
   CommandType type = 1;
   string block_id = 2;
@@ -200,6 +201,10 @@ message FileMetadata {
   // Erasure coding policy (both 0 = replicated)
   int32 ec_data_shards = 6;
   int32 ec_parity_shards = 7;
+  // Storage tiering fields
+  uint64 last_access_ms = 8;       // Unix millis of last read; 0 = never accessed
+  uint64 access_count = 9;         // Cumulative read count
+  uint64 moved_to_cold_at_ms = 10; // Unix millis when moved to cold tier; 0 = hot
 }
 
 message BlockInfo {

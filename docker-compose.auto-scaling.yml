@@ -2,7 +2,10 @@ version: '3.8'
 
 services:
   config-server:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-config-server-test
     command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://config-server:50050
     ports:
@@ -13,7 +16,10 @@ services:
       - config-server-data-test:/data/config-raft
 
   master:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master-test
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://dfs-master-test:50051 --shard-id shard-1 --config-servers http://config-server:50050 --split-threshold-rps 2.0 --merge-threshold-rps 0.5 --split-cooldown-secs 10
     ports:
@@ -26,7 +32,10 @@ services:
       - master-data-test:/data/raft
 
   chunkserver:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-test
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://config-server:50050 --storage-dir /data/cs1 --advertise-addr dfs-chunkserver-test:50052
     networks:

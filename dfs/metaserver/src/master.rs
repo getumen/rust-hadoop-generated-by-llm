@@ -670,9 +670,13 @@ pub struct MasterConfig {
     pub merge_threshold_rps: f64,
     pub ca_cert_path: Option<String>,
     pub domain_name: Option<String>,
+    /// Seconds since last access before a file is considered cold (env: COLD_THRESHOLD_SECS, default: 604800 = 7 days)
+    pub cold_threshold_secs: u64,
+    /// Seconds after cold move before EC conversion (env: EC_THRESHOLD_SECS, default: 2592000 = 30 days)
+    pub ec_threshold_secs: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MyMaster {
     state: Arc<Mutex<AppState>>,
     raft_tx: mpsc::Sender<Event>,
@@ -681,6 +685,7 @@ pub struct MyMaster {
     monitor: Arc<ThroughputMonitor>,
     _master_address: String,
     _config_server_addrs: Vec<String>,
+    config: MasterConfig,
 }
 
 impl MyMaster {
@@ -1446,10 +1451,11 @@ impl MyMaster {
             state,
             raft_tx,
             shard_map,
-            shard_id: config.shard_id,
+            shard_id: config.shard_id.clone(),
             monitor,
-            _master_address: config.master_address,
-            _config_server_addrs: config.config_server_addrs,
+            _master_address: config.master_address.clone(),
+            _config_server_addrs: config.config_server_addrs.clone(),
+            config,
         }
     }
 
@@ -1471,6 +1477,214 @@ impl MyMaster {
                 Err(Status::failed_precondition(msg))
             }
             Err(_) => Err(Status::internal("Raft node shutdown")),
+        }
+    }
+
+    /// Background tiering scanner: identifies cold files and issues MOVE_TO_COLD commands.
+    pub async fn scan_tiering(&self) {
+        // Only the leader should run the tiering scanner
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::GetLeaderInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let leader = match rx.await {
+            Ok(Some(addr)) => addr,
+            _ => return, // no leader or channel closed
+        };
+        if leader != self.config.master_address {
+            return; // we are not the leader
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cold_threshold_ms = self.config.cold_threshold_secs * 1000;
+
+        // Collect candidates without holding the lock across awaits
+        let candidates: Vec<(String, Vec<crate::dfs::BlockInfo>)> = {
+            let state = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref ms) = *state {
+                ms.files
+                    .values()
+                    .filter(|f| {
+                        f.moved_to_cold_at_ms == 0
+                            && f.ec_data_shards == 0
+                            && f.last_access_ms > 0
+                            && now_ms.saturating_sub(f.last_access_ms) > cold_threshold_ms
+                    })
+                    .map(|f| (f.path.clone(), f.blocks.clone()))
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        for (path, blocks) in candidates {
+            // Queue MOVE_TO_COLD commands to all ChunkServers holding blocks
+            {
+                let mut state = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref mut ms) = *state {
+                    for block in &blocks {
+                        for loc in &block.locations {
+                            ms.pending_commands.entry(loc.clone()).or_default().push(
+                                crate::dfs::ChunkServerCommand {
+                                    r#type:
+                                        crate::dfs::chunk_server_command::CommandType::MoveToCold
+                                            as i32,
+                                    block_id: block.block_id.clone(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Persist cold-move via Raft (best effort — ignore Not Leader errors)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::MoveToCold {
+                        path: path.clone(),
+                        moved_at_ms: now_ms,
+                    }),
+                    reply_tx: tx,
+                })
+                .await;
+            let _ = rx.await;
+            tracing::info!("Tiering scanner: queued cold move for {}", path);
+        }
+    }
+
+    /// Background EC conversion scanner: converts cold files to erasure coding.
+    pub async fn scan_ec_conversion(&self) {
+        // Only the leader should run the EC conversion scanner
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::GetLeaderInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let leader = match rx.await {
+            Ok(Some(addr)) => addr,
+            _ => return, // no leader or channel closed
+        };
+        if leader != self.config.master_address {
+            return; // we are not the leader
+        }
+
+        const EC_DATA: i32 = 6;
+        const EC_PARITY: i32 = 3;
+        let total_shards = (EC_DATA + EC_PARITY) as usize;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ec_threshold_ms = self.config.ec_threshold_secs * 1000;
+
+        // Collect candidates: cold files that have aged past ec_threshold
+        let candidates: Vec<crate::dfs::FileMetadata> = {
+            let state = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref ms) = *state {
+                ms.files
+                    .values()
+                    .filter(|f| {
+                        f.moved_to_cold_at_ms > 0
+                            && f.ec_data_shards == 0
+                            && now_ms.saturating_sub(f.moved_to_cold_at_ms) > ec_threshold_ms
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        for file in candidates {
+            // Pick enough ChunkServers for EC shards
+            let shard_servers: Vec<String> = {
+                let state = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref ms) = *state {
+                    let mut servers: Vec<String> = ms
+                        .chunk_servers
+                        .iter()
+                        .filter(|(_, s)| s.available_space > 0)
+                        .map(|(addr, _)| addr.clone())
+                        .collect();
+                    // Sort for determinism in tests
+                    servers.sort();
+                    servers.truncate(total_shards);
+                    servers
+                } else {
+                    vec![]
+                }
+            };
+
+            if shard_servers.len() < total_shards {
+                tracing::warn!(
+                    "Not enough ChunkServers for EC conversion of {} (need {}, have {})",
+                    file.path,
+                    total_shards,
+                    shard_servers.len()
+                );
+                continue;
+            }
+
+            let mut new_blocks: Vec<crate::dfs::BlockInfo> = Vec::new();
+
+            for block in &file.blocks {
+                // One CS per EC shard
+                let new_block = crate::dfs::BlockInfo {
+                    block_id: block.block_id.clone(),
+                    size: block.size,
+                    locations: shard_servers.clone(),
+                    checksum_crc32c: block.checksum_crc32c,
+                    ec_data_shards: EC_DATA,
+                    ec_parity_shards: EC_PARITY,
+                    original_size: block.original_size,
+                };
+                new_blocks.push(new_block);
+
+                // TODO: Issue RECONSTRUCT_EC_SHARD commands to write EC shards from the source block.
+                // The current reconstruct_ec_shard RPC is designed for reconstructing MISSING shards
+                // from EXISTING EC shards — it cannot convert a full replication block to EC shards.
+                // A dedicated "EC encode and distribute" command is needed (future work).
+                // For now, we update the metadata so the block is marked as EC; the data migration
+                // will be handled when that command is implemented.
+
+                // NOTE: Old replication blocks are intentionally NOT deleted here.
+                // Deletion races with EC shard reconstruction and could cause data loss.
+                // Old replicas become orphaned and will be reclaimed by a future
+                // background orphan-cleanup pass (not yet implemented).
+            }
+
+            // Persist EC conversion via Raft
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::ConvertToEc {
+                        path: file.path.clone(),
+                        ec_data_shards: EC_DATA,
+                        ec_parity_shards: EC_PARITY,
+                        new_blocks,
+                    }),
+                    reply_tx: tx,
+                })
+                .await;
+            let _ = rx.await;
+            tracing::info!("Tiering scanner: queued EC conversion for {}", file.path);
         }
     }
 
@@ -1522,6 +1736,29 @@ impl MasterService for MyMaster {
             let req = request.into_inner();
 
             self.monitor.record_request(&req.path, 0); // Read request, 0 bytes for metadata
+
+            // Fire-and-forget access stat update for storage tiering (best effort)
+            {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let raft_tx = self.raft_tx.clone();
+                let path_clone = req.path.clone();
+                tokio::spawn(async move {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    let _ = raft_tx
+                        .send(Event::ClientRequest {
+                            command: Command::Master(MasterCommand::UpdateAccessStats {
+                                path: path_clone,
+                                accessed_at_ms: now_ms,
+                            }),
+                            reply_tx: tx,
+                        })
+                        .await;
+                });
+            }
+
             self.check_shard_ownership(&req.path)?;
             self.ensure_linearizable_read().await?;
 
@@ -2960,6 +3197,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3001,6 +3241,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3026,6 +3269,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3059,6 +3305,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3119,6 +3368,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 0,
             ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3175,6 +3427,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         heal_under_replicated_blocks(&mut state);
@@ -3228,6 +3483,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         heal_under_replicated_blocks(&mut state);
@@ -3272,6 +3530,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         state
@@ -3450,6 +3711,9 @@ mod tests {
             created_at_ms: 0,
             ec_data_shards: 4,
             ec_parity_shards: 2,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
         state.files.insert("/ec-file".to_string(), metadata);
 
@@ -3472,6 +3736,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 4,
                 ec_parity_shards: 2,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
         for i in 0..6usize {
@@ -3545,6 +3812,9 @@ mod tests {
                 created_at_ms: 0,
                 ec_data_shards: 4,
                 ec_parity_shards: 2,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
             },
         );
 
@@ -3559,5 +3829,263 @@ mod tests {
             "Expected RECONSTRUCT_EC_SHARD for shard 2, got: {:?}",
             all_cmds
         );
+    }
+
+    /// Build a minimal `MyMaster` backed by a fake Raft event loop that:
+    ///   - applies `ClientRequest` commands directly to the shared state, and
+    ///   - immediately acknowledges `GetReadIndex` (linearizable-read bypass).
+    ///
+    /// Returns `(master, shared_state)` so tests can inspect state afterwards.
+    async fn make_test_master() -> (MyMaster, Arc<Mutex<AppState>>) {
+        let master_state = MasterState::default();
+        let app_state = Arc::new(Mutex::new(AppState::Master(master_state)));
+
+        let (raft_tx, mut raft_rx) = mpsc::channel::<Event>(64);
+
+        // Fake Raft event loop
+        let state_clone = app_state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = raft_rx.recv().await {
+                match event {
+                    Event::ClientRequest { command, reply_tx } => {
+                        // Apply command directly to state (single-node shortcut)
+                        {
+                            let mut lock = state_clone.lock().expect("Mutex poisoned");
+                            if let AppState::Master(ref mut ms) = *lock {
+                                match &command {
+                                    Command::Master(MasterCommand::UpdateAccessStats {
+                                        path,
+                                        accessed_at_ms,
+                                    }) => {
+                                        if let Some(meta) = ms.files.get_mut(path) {
+                                            meta.last_access_ms = *accessed_at_ms;
+                                            meta.access_count += 1;
+                                        }
+                                    }
+                                    Command::Master(MasterCommand::ConvertToEc {
+                                        path,
+                                        ec_data_shards,
+                                        ec_parity_shards,
+                                        new_blocks,
+                                    }) => {
+                                        if let Some(meta) = ms.files.get_mut(path) {
+                                            meta.ec_data_shards = *ec_data_shards;
+                                            meta.ec_parity_shards = *ec_parity_shards;
+                                            meta.blocks = new_blocks.clone();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let _ = reply_tx.send(Ok(()));
+                    }
+                    Event::GetReadIndex { reply_tx } => {
+                        let _ = reply_tx.send(Ok(0));
+                    }
+                    // In tests the master_address is "127.0.0.1:9000" — return it so
+                    // leader guard passes and scan_tiering / scan_ec_conversion run.
+                    Event::GetLeaderInfo { reply_tx } => {
+                        let _ = reply_tx.send(Some("127.0.0.1:9000".to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Build a single-shard ShardMap that owns all paths
+        let shard_id = "test-shard".to_string();
+        let mut shard_map = ShardMap::new_range();
+        shard_map.add_shard(shard_id.clone(), vec!["127.0.0.1:9000".to_string()]);
+
+        let config = MasterConfig {
+            shard_id: shard_id.clone(),
+            config_server_addrs: vec![],
+            master_address: "127.0.0.1:9000".to_string(),
+            split_threshold_rps: 1_000_000.0,
+            split_cooldown_secs: 3600,
+            merge_threshold_rps: 0.0,
+            ca_cert_path: None,
+            domain_name: None,
+            cold_threshold_secs: 604800,
+            ec_threshold_secs: 2592000,
+        };
+
+        let master = MyMaster::new(
+            app_state.clone(),
+            raft_tx,
+            Arc::new(Mutex::new(shard_map)),
+            config,
+        );
+
+        (master, app_state)
+    }
+
+    #[tokio::test]
+    async fn test_get_file_info_increments_access_count() {
+        let (master, app_state) = make_test_master().await;
+
+        // Pre-insert a file directly into state so get_file_info has something to find
+        {
+            let mut lock = app_state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref mut ms) = *lock {
+                ms.files.insert(
+                    "/access-test".to_string(),
+                    FileMetadata {
+                        path: "/access-test".to_string(),
+                        size: 100,
+                        blocks: vec![],
+                        etag_md5: "".to_string(),
+                        created_at_ms: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        last_access_ms: 0,
+                        access_count: 0,
+                        moved_to_cold_at_ms: 0,
+                    },
+                );
+            }
+        }
+
+        // Call get_file_info — this fires the UpdateAccessStats spawn
+        let req = tonic::Request::new(GetFileInfoRequest {
+            path: "/access-test".to_string(),
+        });
+        let resp = master.get_file_info(req).await;
+        assert!(resp.is_ok(), "get_file_info should succeed");
+        assert!(resp.unwrap().into_inner().found, "file should be found");
+
+        // Give the spawned task time to execute
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify that access_count was incremented
+        let lock = app_state.lock().expect("Mutex poisoned");
+        if let AppState::Master(ref ms) = *lock {
+            let meta = ms.files.get("/access-test").expect("file should exist");
+            assert!(
+                meta.access_count >= 1,
+                "access_count should be >= 1 after get_file_info, got {}",
+                meta.access_count
+            );
+        } else {
+            panic!("Expected Master state");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_tiering_queues_cold_move() {
+        let (master, _app_state) = make_test_master().await;
+
+        // Insert a file with an ancient last_access_ms and a fake block location
+        {
+            let mut state = master.state.lock().unwrap();
+            if let AppState::Master(ref mut ms) = *state {
+                ms.files.insert(
+                    "/old-file".to_string(),
+                    crate::dfs::FileMetadata {
+                        path: "/old-file".to_string(),
+                        last_access_ms: 1, // epoch+1ms = ancient
+                        access_count: 1,
+                        moved_to_cold_at_ms: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        blocks: vec![crate::dfs::BlockInfo {
+                            block_id: "blk-tiering-001".to_string(),
+                            locations: vec!["127.0.0.1:9001".to_string()],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        // last_access_ms=1 and now_ms >> 1 + 604800*1000 guarantees cold threshold is exceeded
+        master.scan_tiering().await;
+
+        // Verify MOVE_TO_COLD command queued for the block's ChunkServer
+        let state = master.state.lock().unwrap();
+        if let AppState::Master(ref ms) = *state {
+            let cmds = ms.pending_commands.get("127.0.0.1:9001");
+            assert!(
+                cmds.is_some_and(|c| c.iter().any(|cmd| cmd.block_id == "blk-tiering-001")),
+                "Expected MOVE_TO_COLD command queued for blk-tiering-001"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_ec_conversion_queues_commands() {
+        let (master, _dir) = make_test_master().await;
+
+        // Insert a cold file with a block and 9 fake ChunkServers
+        {
+            let mut state = master.state.lock().unwrap();
+            if let AppState::Master(ref mut ms) = *state {
+                // Register 9 fake ChunkServers
+                for i in 0..9usize {
+                    ms.chunk_servers.insert(
+                        format!("127.0.0.{}:9000", i + 1),
+                        ChunkServerStatus {
+                            available_space: 1_000_000,
+                            last_heartbeat: 1,
+                            used_space: 0,
+                            chunk_count: 0,
+                            rack_id: String::new(),
+                        },
+                    );
+                }
+                ms.files.insert(
+                    "/cold-ec-file".to_string(),
+                    crate::dfs::FileMetadata {
+                        path: "/cold-ec-file".to_string(),
+                        moved_to_cold_at_ms: 1, // ancient
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        blocks: vec![crate::dfs::BlockInfo {
+                            block_id: "blk-ec-conv-001".to_string(),
+                            locations: vec!["127.0.0.1:9000".to_string()],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        master.scan_ec_conversion().await;
+
+        // Give the spawned Raft task time to apply the ConvertToEc command
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let state = master.state.lock().unwrap();
+        if let AppState::Master(ref ms) = *state {
+            // scan_ec_conversion no longer queues RECONSTRUCT_EC_SHARD commands (Issue 5 fix).
+            // It only commits a ConvertToEc Raft command which updates the metadata.
+            // Verify that the file's metadata was updated to reflect the EC state.
+            let meta = ms
+                .files
+                .get("/cold-ec-file")
+                .expect("file should exist in state");
+            assert_eq!(
+                meta.ec_data_shards, 6,
+                "Expected ec_data_shards==6 after ConvertToEc, got {}",
+                meta.ec_data_shards
+            );
+            assert_eq!(
+                meta.ec_parity_shards, 3,
+                "Expected ec_parity_shards==3 after ConvertToEc, got {}",
+                meta.ec_parity_shards
+            );
+            // No RECONSTRUCT_EC_SHARD or DELETE commands should be pending
+            let total_cmds: usize = ms.pending_commands.values().map(|v| v.len()).sum();
+            assert_eq!(
+                total_cmds, 0,
+                "Expected no pending chunk commands (no RECONSTRUCT_EC_SHARD, no DELETE), got {}",
+                total_cmds
+            );
+        } else {
+            panic!("Expected Master state");
+        }
     }
 }

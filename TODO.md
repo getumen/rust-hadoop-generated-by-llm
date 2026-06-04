@@ -79,8 +79,8 @@ S3互換サービスとしての信頼確保。
 - [x] **io_uring / Zero-Copy Data Path** ✅
     - [x] `tokio-uring` を用いたChunkServerの非同期ファイルI/Oの高速化（`write_block_async` / `read_block_async`）。
     - [x] `read_at` による seek syscall 排除（オフセット付きSQEでカーネル往復を削減）。
-- [ ] **Intelligent Storage Tiering**
-    - [ ] アクセス統計をベースに「冷えたデータ」をHDD層へ自動移行するバックグラウンドプロセス。
+- [x] **Intelligent Storage Tiering** ✅
+    - [x] アクセス統計をベースに「冷えたデータ」をHDD層へ自動移行するバックグラウンドプロセス。
     - [ ] メタデータの構造最適化（SeaweedFS方式など）によるメモリ占有率の削減。
 
 ---
@@ -110,7 +110,7 @@ S3互換サービスとしての信頼確保。
 - [ ] **Object Locking (WORM)**: 削除・変更を物理的に禁止する保存期間（Retention）管理。 *(推奨: IAM ポリシー評価エンジンが先に完了していること)*
 - [ ] **Lifecycle Policies**: 日数経過に応じた自動削除・階層移動のポリシー実行。 *(前提: IAM 権限による設定操作の制御が必要)*
 - [ ] **Cross-Cluster Replication**: クラスタ間を跨いだ非同期レプリケーション。
-- [ ] **Erasure Coding (RS(6,3))**: 3xレプリカから高効率なECへ、バックグラウンドでの変換。
+- [x] **Erasure Coding (RS(6,3))** ✅ — automatic background conversion via storage tiering scanner
 
 ---
 

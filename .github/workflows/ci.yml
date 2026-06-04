@@ -51,6 +51,7 @@ jobs:
 
       - name: Setup Docker environment
         run: |
+          touch ca.pem
           docker compose up -d --build
           # Wait for cluster to be healthy
           sleep 15

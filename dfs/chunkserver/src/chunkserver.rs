@@ -21,6 +21,7 @@ struct CachedBlock {
 #[derive(Debug, Clone)]
 pub struct MyChunkServer {
     storage_dir: PathBuf,
+    cold_storage_dir: Option<PathBuf>, // None = tiering disabled
     config_server_addrs: Vec<String>,
     pub shard_map: Arc<Mutex<ShardMap>>,
     // LRU cache for frequently accessed blocks
@@ -35,11 +36,15 @@ pub struct MyChunkServer {
 impl MyChunkServer {
     pub fn new(
         storage_dir: PathBuf,
+        cold_storage_dir: Option<PathBuf>,
         config_server_addrs: Vec<String>,
         ca_cert_path: Option<String>,
         domain_name: Option<String>,
     ) -> Self {
         fs::create_dir_all(&storage_dir).expect("Failed to create storage directory");
+        if let Some(ref cold) = cold_storage_dir {
+            fs::create_dir_all(cold).expect("Failed to create cold storage directory");
+        }
 
         // Load shard map from config file if available
         let shard_config_path = std::env::var("SHARD_CONFIG").ok();
@@ -70,6 +75,7 @@ impl MyChunkServer {
 
         MyChunkServer {
             storage_dir,
+            cold_storage_dir,
             config_server_addrs,
             shard_map,
             block_cache,
@@ -117,6 +123,42 @@ impl MyChunkServer {
 
     pub fn get_storage_dir(&self) -> PathBuf {
         self.storage_dir.clone()
+    }
+
+    /// Returns the path to a block file, checking hot dir first then cold dir.
+    fn block_path(&self, block_id: &str) -> PathBuf {
+        let hot = self.storage_dir.join(block_id);
+        if hot.exists() {
+            return hot;
+        }
+        if let Some(ref cold) = self.cold_storage_dir {
+            let cold_path = cold.join(block_id);
+            if cold_path.exists() {
+                return cold_path;
+            }
+        }
+        hot // fallback — will produce NotFound naturally on read
+    }
+
+    /// Atomically moves a block (and its .meta file) from hot to cold storage.
+    pub async fn move_block_to_cold(&self, block_id: &str) -> std::io::Result<()> {
+        let cold_dir = self
+            .cold_storage_dir
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("cold_storage_dir not configured"))?;
+        let src = self.storage_dir.join(block_id);
+        let src_meta = self.storage_dir.join(format!("{}.meta", block_id));
+        let dst = cold_dir.join(block_id);
+        let dst_meta = cold_dir.join(format!("{}.meta", block_id));
+        tokio::task::spawn_blocking(move || {
+            std::fs::rename(&src, &dst)?;
+            if src_meta.exists() {
+                std::fs::rename(&src_meta, &dst_meta)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
     }
 
     pub async fn refresh_shard_map(&self) -> Result<(), String> {
@@ -192,7 +234,7 @@ impl MyChunkServer {
         length: u64,
     ) -> Result<Vec<u8>, std::io::Error> {
         use std::io::{Seek, SeekFrom};
-        let path = self.storage_dir.join(block_id);
+        let path = self.block_path(block_id);
         let total_size = std::fs::metadata(&path)?.len();
         if offset >= total_size {
             return Err(std::io::Error::new(
@@ -213,7 +255,20 @@ impl MyChunkServer {
     }
 
     fn verify_block(&self, block_id: &str, data: &[u8]) -> Result<(), String> {
-        let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
+        // Check hot storage first, then cold storage for the .meta file
+        let hot_meta = self.storage_dir.join(format!("{}.meta", block_id));
+        let meta_path = if hot_meta.exists() {
+            hot_meta
+        } else if let Some(ref cold) = self.cold_storage_dir {
+            let cold_meta = cold.join(format!("{}.meta", block_id));
+            if cold_meta.exists() {
+                cold_meta
+            } else {
+                hot_meta // fallback — will produce "missing" error below
+            }
+        } else {
+            hot_meta
+        };
         if !meta_path.exists() {
             // If meta file is missing, we can't verify.
             // For now, treat as error to enforce integrity.
@@ -370,7 +425,7 @@ impl MyChunkServer {
         target_addr: &str,
     ) -> Result<(), String> {
         // 1. Read block data locally
-        let path = self.storage_dir.join(block_id);
+        let path = self.block_path(block_id);
         let data = match fs::read(&path) {
             Ok(d) => d,
             Err(e) => return Err(format!("Failed to read block {}: {}", block_id, e)),
@@ -712,7 +767,7 @@ impl ChunkServerService for MyChunkServer {
         let span = tracing::info_span!("read_block", request_id = %request_id);
         async move {
             let req = request.into_inner();
-            let path = self.storage_dir.join(&req.block_id);
+            let path = self.block_path(&req.block_id);
 
             // Get total file size for validation and cache check
             let total_size = match std::fs::metadata(&path) {
@@ -919,7 +974,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_test_server(dir: &std::path::Path) -> MyChunkServer {
-        MyChunkServer::new(dir.to_path_buf(), vec![], None, None)
+        MyChunkServer::new(dir.to_path_buf(), None, vec![], None, None)
     }
 
     #[test]
@@ -943,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_verification() {
         let dir = tempdir().unwrap();
-        let server = MyChunkServer::new(dir.path().to_path_buf(), vec![], None, None);
+        let server = MyChunkServer::new(dir.path().to_path_buf(), None, vec![], None, None);
         let block_id = "test_block";
         let data = b"Hello, world! This is a test block for checksum verification.";
 
@@ -1021,5 +1076,54 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 4096);
         assert_eq!(result, data[32768..32768 + 4096].to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_move_block_to_cold() {
+        let hot_dir = tempfile::TempDir::new().unwrap();
+        let cold_dir = tempfile::TempDir::new().unwrap();
+        let server = MyChunkServer::new(
+            hot_dir.path().to_path_buf(),
+            Some(cold_dir.path().to_path_buf()),
+            vec![],
+            None,
+            None,
+        );
+        let data = b"cold block data";
+        server.write_block_async("cold-block", data).await.unwrap();
+        assert!(
+            hot_dir.path().join("cold-block").exists(),
+            "should be in hot dir after write"
+        );
+        server.move_block_to_cold("cold-block").await.unwrap();
+        assert!(
+            !hot_dir.path().join("cold-block").exists(),
+            "should no longer be in hot dir"
+        );
+        assert!(
+            cold_dir.path().join("cold-block").exists(),
+            "should now be in cold dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_block_finds_cold_block() {
+        let hot_dir = tempfile::TempDir::new().unwrap();
+        let cold_dir = tempfile::TempDir::new().unwrap();
+        let server = MyChunkServer::new(
+            hot_dir.path().to_path_buf(),
+            Some(cold_dir.path().to_path_buf()),
+            vec![],
+            None,
+            None,
+        );
+        let data: Vec<u8> = (0u8..16).collect();
+        // Write directly to cold dir to simulate an already-migrated block
+        std::fs::write(cold_dir.path().join("cold-test"), &data).unwrap();
+        let result = server
+            .read_block_async("cold-test", 0, data.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(result, data);
     }
 }
