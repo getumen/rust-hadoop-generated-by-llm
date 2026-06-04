@@ -1345,6 +1345,13 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
                     for (k, v) in metadata.headers {
                         if k == "ETag" {
                             etag = v;
+                        } else if k == "x-amz-sse-encrypted-dek" {
+                            extra_headers.insert(
+                                "x-amz-server-side-encryption"
+                                    .parse::<axum::http::HeaderName>()
+                                    .unwrap(),
+                                "AES256".parse().unwrap(),
+                            );
                         } else if k.starts_with("x-amz-meta-") {
                             if let (Ok(name), Ok(value)) = (
                                 k.parse::<axum::http::HeaderName>(),

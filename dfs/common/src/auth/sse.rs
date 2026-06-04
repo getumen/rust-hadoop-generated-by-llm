@@ -18,11 +18,11 @@ impl SseManager {
 
     pub fn encrypt_object(&self, plaintext: &[u8]) -> Result<(Vec<u8>, String), AuthError> {
         // Generate a random 256-bit DEK
-        let mut dek = [0u8; 32];
-        rand::rng().fill(&mut dek);
+        let mut dek = Zeroizing::new([0u8; 32]);
+        rand::rng().fill(dek.as_mut());
 
         // Encrypt plaintext with DEK
-        let data_cipher = Aes256Gcm::new_from_slice(&dek)
+        let data_cipher = Aes256Gcm::new_from_slice(dek.as_ref())
             .map_err(|e| AuthError::InternalError(format!("Invalid DEK: {}", e)))?;
 
         let mut data_nonce_bytes = [0u8; 12];
