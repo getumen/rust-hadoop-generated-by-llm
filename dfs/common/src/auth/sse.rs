@@ -28,6 +28,7 @@ impl SseManager {
         rand::rng().fill(&mut data_nonce_bytes);
         let data_nonce = Nonce::from_slice(&data_nonce_bytes);
 
+        // TODO: add per-object AAD (object path) to bind ciphertext to identity
         let data_ciphertext = data_cipher
             .encrypt(data_nonce, plaintext)
             .map_err(|e| AuthError::InternalError(format!("Data encryption failed: {}", e)))?;
@@ -65,7 +66,7 @@ impl SseManager {
             .decode(dek_b64)
             .map_err(|e| AuthError::InvalidToken(format!("Invalid base64 DEK: {}", e)))?;
 
-        if dek_blob.len() < 12 {
+        if dek_blob.len() < 60 {
             return Err(AuthError::InvalidToken(
                 "Encrypted DEK too short".to_string(),
             ));
@@ -81,8 +82,15 @@ impl SseManager {
             .decrypt(kek_nonce, encrypted_dek)
             .map_err(|e| AuthError::InvalidToken(format!("DEK decryption failed: {}", e)))?;
 
+        // TODO: zeroize DEK after use
+        if dek.len() != 32 {
+            return Err(AuthError::InternalError(
+                "Decrypted DEK has wrong length".into(),
+            ));
+        }
+
         // Decrypt data with DEK
-        if ciphertext.len() < 12 {
+        if ciphertext.len() < 28 {
             return Err(AuthError::InvalidToken("Ciphertext too short".to_string()));
         }
 
@@ -124,5 +132,40 @@ mod tests {
         let plaintext = b"secret";
         let (ciphertext, dek_b64) = mgr1.encrypt_object(plaintext).unwrap();
         assert!(mgr2.decrypt_object(&ciphertext, &dek_b64).is_err());
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_rejected() {
+        let kek = [7u8; 32];
+        let mgr = SseManager::new(kek);
+        let (mut ciphertext, dek_b64) = mgr.encrypt_object(b"sensitive").unwrap();
+        ciphertext[13] ^= 0xff; // flip a byte in the ciphertext
+        assert!(mgr.decrypt_object(&ciphertext, &dek_b64).is_err());
+    }
+
+    #[test]
+    fn test_tampered_dek_rejected() {
+        let kek = [8u8; 32];
+        let mgr = SseManager::new(kek);
+        let (ciphertext, mut dek_b64) = mgr.encrypt_object(b"sensitive").unwrap();
+        // flip a byte in the base64-decoded DEK blob
+        let mut dek_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&dek_b64)
+            .unwrap();
+        dek_bytes[13] ^= 0xff;
+        dek_b64 = base64::engine::general_purpose::STANDARD.encode(&dek_bytes);
+        assert!(mgr.decrypt_object(&ciphertext, &dek_b64).is_err());
+    }
+
+    #[test]
+    fn test_truncated_inputs_rejected() {
+        let kek = [9u8; 32];
+        let mgr = SseManager::new(kek);
+        let (ciphertext, dek_b64) = mgr.encrypt_object(b"data").unwrap();
+        // Truncated ciphertext
+        assert!(mgr.decrypt_object(&ciphertext[..5], &dek_b64).is_err());
+        // Truncated DEK blob
+        let short_dek = base64::engine::general_purpose::STANDARD.encode(&[0u8; 5]);
+        assert!(mgr.decrypt_object(&ciphertext, &short_dek).is_err());
     }
 }
