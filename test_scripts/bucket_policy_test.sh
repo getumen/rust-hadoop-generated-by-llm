@@ -14,7 +14,47 @@ aws_cmd() {
     aws --endpoint-url "$ENDPOINT" --no-verify-ssl "$@"
 }
 
+cleanup() {
+    echo "🧹 Cleaning up Docker cluster..."
+    docker compose down -v 2>/dev/null || true
+}
+trap cleanup EXIT
+
 echo "=== Bucket Policy Integration Test ==="
+
+# Start cluster
+echo "🚀 Starting cluster..."
+docker compose down -v 2>/dev/null || true
+docker compose up -d --no-build
+
+# Wait for S3 server
+echo "Waiting for S3 server at $ENDPOINT..."
+for i in $(seq 1 30); do
+    if curl -s -o /dev/null -w '%{http_code}' "$ENDPOINT/health" 2>/dev/null | grep -q "200"; then
+        echo "  S3 server ready (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "Error: S3 server did not start"
+        exit 1
+    fi
+    sleep 1
+done
+
+# Wait for Raft leader
+echo "Waiting for Raft leader..."
+for i in $(seq 1 20); do
+    LEADER=$(curl -s http://localhost:8080/raft/state 2>/dev/null | grep -o '"role":"Leader"' || true)
+    if [ -n "$LEADER" ]; then
+        echo "  Raft leader elected (attempt $i)"
+        break
+    fi
+    if [ "$i" -eq 20 ]; then
+        echo "Warning: Raft leader not confirmed, proceeding..."
+        break
+    fi
+    sleep 1
+done
 
 BUCKET="policy-test-bucket-$$"
 
@@ -60,8 +100,7 @@ echo "✓ Bucket policy PUT succeeded"
 # --- Test 3: GET the policy back ---
 echo ""
 echo "Test 3: GET bucket policy"
-RETRIEVED=$(aws_cmd s3api get-bucket-policy --bucket "${BUCKET}" --query Policy --output text 2>/dev/null || \
-            aws_cmd s3api get-bucket-policy --bucket "${BUCKET}" 2>/dev/null || true)
+RETRIEVED=$(aws_cmd s3api get-bucket-policy --bucket "${BUCKET}" 2>/dev/null || true)
 if echo "$RETRIEVED" | grep -q "Deny"; then
     echo "✓ Policy retrieved and contains Deny statement"
 else
@@ -88,15 +127,12 @@ fi
 echo ""
 echo "Test 6: PUT malformed policy JSON"
 STATUS=$(aws_cmd s3api put-bucket-policy --bucket "${BUCKET}" --policy 'not-valid-json' 2>&1 || true)
-if echo "$STATUS" | grep -qE "MalformedPolicy|InvalidArgument|error"; then
+if echo "$STATUS" | grep -qE "MalformedPolicy|InvalidArgument|error|Error"; then
     echo "✓ Malformed policy rejected"
 else
     echo "WARN: expected rejection for malformed JSON: $STATUS"
 fi
 
-# Cleanup
-aws_cmd s3 rm "s3://${BUCKET}/test-obj.txt" 2>/dev/null || true
-aws_cmd s3 rb "s3://${BUCKET}" 2>/dev/null || true
 rm -f /tmp/bucket_policy_$$.json
 
 echo ""
