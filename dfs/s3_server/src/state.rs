@@ -18,6 +18,5 @@ pub struct AppState {
     pub sts_token_manager: Option<Arc<StsTokenManager>>,
     pub policy_evaluator: Option<Arc<PolicyEvaluator>>,
     pub audit_logger: Option<Arc<crate::audit::AuditLogger>>,
-    #[allow(dead_code)]
     pub sse_manager: Option<Arc<SseManager>>,
 }
