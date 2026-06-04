@@ -21,7 +21,7 @@ struct CachedBlock {
 #[derive(Debug, Clone)]
 pub struct MyChunkServer {
     storage_dir: PathBuf,
-    cold_storage_dir: Option<PathBuf>,  // None = tiering disabled
+    cold_storage_dir: Option<PathBuf>, // None = tiering disabled
     config_server_addrs: Vec<String>,
     pub shard_map: Arc<Mutex<ShardMap>>,
     // LRU cache for frequently accessed blocks
@@ -142,9 +142,10 @@ impl MyChunkServer {
 
     /// Atomically moves a block (and its .meta file) from hot to cold storage.
     pub async fn move_block_to_cold(&self, block_id: &str) -> std::io::Result<()> {
-        let cold_dir = self.cold_storage_dir.as_ref().ok_or_else(|| {
-            std::io::Error::other("cold_storage_dir not configured")
-        })?;
+        let cold_dir = self
+            .cold_storage_dir
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("cold_storage_dir not configured"))?;
         let src = self.storage_dir.join(block_id);
         let src_meta = self.storage_dir.join(format!("{}.meta", block_id));
         let dst = cold_dir.join(block_id);
@@ -1090,10 +1091,19 @@ mod tests {
         );
         let data = b"cold block data";
         server.write_block_async("cold-block", data).await.unwrap();
-        assert!(hot_dir.path().join("cold-block").exists(), "should be in hot dir after write");
+        assert!(
+            hot_dir.path().join("cold-block").exists(),
+            "should be in hot dir after write"
+        );
         server.move_block_to_cold("cold-block").await.unwrap();
-        assert!(!hot_dir.path().join("cold-block").exists(), "should no longer be in hot dir");
-        assert!(cold_dir.path().join("cold-block").exists(), "should now be in cold dir");
+        assert!(
+            !hot_dir.path().join("cold-block").exists(),
+            "should no longer be in hot dir"
+        );
+        assert!(
+            cold_dir.path().join("cold-block").exists(),
+            "should now be in cold dir"
+        );
     }
 
     #[tokio::test]

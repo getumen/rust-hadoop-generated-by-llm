@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
 
     let storage_dir = args.storage_dir.clone(); // Define storage_dir here
     let chunk_server = MyChunkServer::new(
-        storage_dir.clone(),         // Pass storage_dir
+        storage_dir.clone(), // Pass storage_dir
         args.cold_storage_dir.clone(),
         args.config_servers.clone(), // Use config_servers as it's defined in Args
         args.ca_cert.clone(),
@@ -260,7 +260,8 @@ async fn main() -> anyhow::Result<()> {
                                         Ok(CommandType::Replicate) => {
                                             let chunk_server_clone = chunk_server_heartbeat.clone();
                                             let block_id = command.block_id.clone();
-                                            let target = command.target_chunk_server_address.clone();
+                                            let target =
+                                                command.target_chunk_server_address.clone();
 
                                             tokio::spawn(async move {
                                                 let _ = chunk_server_clone
@@ -300,13 +301,25 @@ async fn main() -> anyhow::Result<()> {
                                             let server_clone = chunk_server_heartbeat.clone();
                                             let block_id = command.block_id.clone();
                                             tokio::spawn(async move {
-                                                match server_clone.move_block_to_cold(&block_id).await {
-                                                    Ok(()) => tracing::info!("Moved block {} to cold tier", block_id),
-                                                    Err(e) => tracing::warn!("Failed to move block {} to cold: {}", block_id, e),
+                                                match server_clone
+                                                    .move_block_to_cold(&block_id)
+                                                    .await
+                                                {
+                                                    Ok(()) => tracing::info!(
+                                                        "Moved block {} to cold tier",
+                                                        block_id
+                                                    ),
+                                                    Err(e) => tracing::warn!(
+                                                        "Failed to move block {} to cold: {}",
+                                                        block_id,
+                                                        e
+                                                    ),
                                                 }
                                             });
                                         }
-                                        Ok(CommandType::Unknown) | Ok(CommandType::Delete) | Err(_) => {
+                                        Ok(CommandType::Unknown)
+                                        | Ok(CommandType::Delete)
+                                        | Err(_) => {
                                             // No-op for unhandled command types
                                         }
                                     }

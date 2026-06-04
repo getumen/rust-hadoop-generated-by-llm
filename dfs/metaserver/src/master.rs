@@ -1484,7 +1484,12 @@ impl MyMaster {
     pub async fn scan_tiering(&self) {
         // Only the leader should run the tiering scanner
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.raft_tx.send(Event::GetLeaderInfo { reply_tx: tx }).await.is_err() {
+        if self
+            .raft_tx
+            .send(Event::GetLeaderInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
             return;
         }
         let leader = match rx.await {
@@ -1527,15 +1532,15 @@ impl MyMaster {
                 if let AppState::Master(ref mut ms) = *state {
                     for block in &blocks {
                         for loc in &block.locations {
-                            ms.pending_commands
-                                .entry(loc.clone())
-                                .or_default()
-                                .push(crate::dfs::ChunkServerCommand {
-                                    r#type: crate::dfs::chunk_server_command::CommandType::MoveToCold
-                                        as i32,
+                            ms.pending_commands.entry(loc.clone()).or_default().push(
+                                crate::dfs::ChunkServerCommand {
+                                    r#type:
+                                        crate::dfs::chunk_server_command::CommandType::MoveToCold
+                                            as i32,
                                     block_id: block.block_id.clone(),
                                     ..Default::default()
-                                });
+                                },
+                            );
                         }
                     }
                 }
@@ -1562,7 +1567,12 @@ impl MyMaster {
     pub async fn scan_ec_conversion(&self) {
         // Only the leader should run the EC conversion scanner
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.raft_tx.send(Event::GetLeaderInfo { reply_tx: tx }).await.is_err() {
+        if self
+            .raft_tx
+            .send(Event::GetLeaderInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
             return;
         }
         let leader = match rx.await {

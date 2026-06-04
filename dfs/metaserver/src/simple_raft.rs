@@ -3129,7 +3129,10 @@ impl RaftNode {
                             master_state.shuffling_prefixes.remove(prefix.as_str());
                             tracing::info!("Stopped background shuffling for prefix: {}", prefix);
                         }
-                        MasterCommand::UpdateAccessStats { path, accessed_at_ms } => {
+                        MasterCommand::UpdateAccessStats {
+                            path,
+                            accessed_at_ms,
+                        } => {
                             if let Some(meta) = master_state.files.get_mut(path) {
                                 meta.last_access_ms = *accessed_at_ms;
                                 meta.access_count += 1;
@@ -3141,12 +3144,22 @@ impl RaftNode {
                                 tracing::info!("Moved file {} to cold tier", path);
                             }
                         }
-                        MasterCommand::ConvertToEc { path, ec_data_shards, ec_parity_shards, new_blocks } => {
+                        MasterCommand::ConvertToEc {
+                            path,
+                            ec_data_shards,
+                            ec_parity_shards,
+                            new_blocks,
+                        } => {
                             if let Some(meta) = master_state.files.get_mut(path) {
                                 meta.ec_data_shards = *ec_data_shards;
                                 meta.ec_parity_shards = *ec_parity_shards;
                                 meta.blocks = new_blocks.clone();
-                                tracing::info!("Converted file {} to EC({},{})", path, ec_data_shards, ec_parity_shards);
+                                tracing::info!(
+                                    "Converted file {} to EC({},{})",
+                                    path,
+                                    ec_data_shards,
+                                    ec_parity_shards
+                                );
                             }
                         }
                     }
@@ -3455,7 +3468,11 @@ mod tests {
         let mut state = app_state.lock().unwrap();
         if let AppState::Master(ref mut master_state) = *state {
             match &cmd {
-                MasterCommand::CreateFile { path, ec_data_shards, ec_parity_shards } => {
+                MasterCommand::CreateFile {
+                    path,
+                    ec_data_shards,
+                    ec_parity_shards,
+                } => {
                     master_state.files.insert(
                         path.clone(),
                         crate::dfs::FileMetadata {
@@ -3472,7 +3489,10 @@ mod tests {
                         },
                     );
                 }
-                MasterCommand::UpdateAccessStats { path, accessed_at_ms } => {
+                MasterCommand::UpdateAccessStats {
+                    path,
+                    accessed_at_ms,
+                } => {
                     if let Some(meta) = master_state.files.get_mut(path) {
                         meta.last_access_ms = *accessed_at_ms;
                         meta.access_count += 1;
@@ -3483,7 +3503,11 @@ mod tests {
                         meta.moved_to_cold_at_ms = *moved_at_ms;
                     }
                 }
-                MasterCommand::AllocateBlock { path, block_id, locations } => {
+                MasterCommand::AllocateBlock {
+                    path,
+                    block_id,
+                    locations,
+                } => {
                     if let Some(meta) = master_state.files.get_mut(path) {
                         let ec_data = meta.ec_data_shards;
                         let ec_parity = meta.ec_parity_shards;
@@ -3498,7 +3522,12 @@ mod tests {
                         });
                     }
                 }
-                MasterCommand::ConvertToEc { path, ec_data_shards, ec_parity_shards, new_blocks } => {
+                MasterCommand::ConvertToEc {
+                    path,
+                    ec_data_shards,
+                    ec_parity_shards,
+                    new_blocks,
+                } => {
                     if let Some(meta) = master_state.files.get_mut(path) {
                         meta.ec_data_shards = *ec_data_shards;
                         meta.ec_parity_shards = *ec_parity_shards;
