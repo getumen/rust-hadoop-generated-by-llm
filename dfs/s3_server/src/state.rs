@@ -1,7 +1,7 @@
 use dfs_client::Client;
 pub use dfs_common::auth::{
     cache::SigningKeyCache, credentials::CredentialProvider, oidc::OidcValidator,
-    policy::PolicyEvaluator, sts::StsTokenManager,
+    policy::PolicyEvaluator, sse::SseManager, sts::StsTokenManager,
 };
 use std::sync::Arc;
 
@@ -18,4 +18,6 @@ pub struct AppState {
     pub sts_token_manager: Option<Arc<StsTokenManager>>,
     pub policy_evaluator: Option<Arc<PolicyEvaluator>>,
     pub audit_logger: Option<Arc<crate::audit::AuditLogger>>,
+    #[allow(dead_code)]
+    pub sse_manager: Option<Arc<SseManager>>,
 }
