@@ -802,7 +802,6 @@ async fn put_object(
     headers: HeaderMap,
 ) -> Response {
     let dest_path = format!("/{}/{}", bucket, key);
-    let mut temp_file = NamedTempFile::new().unwrap();
     let content_sha256 = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
@@ -814,12 +813,9 @@ async fn put_object(
         body
     };
 
-    if let Err(e) = temp_file.write_all(&body) {
-        tracing::error!("Failed to write temp file: {}", e);
-        return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    let temp_path = temp_file.path();
+    // ETag is always from the plaintext
     let etag = format!("\"{:x}\"", Md5::digest(&body));
+
     tracing::info!(
         "PutObject: key={}, size={}, sha256={}, etag={}",
         key,
@@ -828,9 +824,43 @@ async fn put_object(
         etag
     );
 
-    match state.client.create_file(temp_path, &dest_path).await {
+    // SSE: encrypt if sse_manager is configured (always encrypt when key is set)
+    let (write_body, encrypted_dek_opt): (Bytes, Option<String>) =
+        if let Some(mgr) = &state.sse_manager {
+            match mgr.encrypt_object(&body) {
+                Ok((ciphertext, dek_b64)) => (Bytes::from(ciphertext), Some(dek_b64)),
+                Err(e) => {
+                    tracing::error!("SSE encryption failed: {}", e);
+                    return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        } else {
+            (body, None)
+        };
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    if let Err(e) = temp_file.write_all(&write_body) {
+        tracing::error!("Failed to write temp file: {}", e);
+        return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let temp_path = temp_file.path().to_owned();
+
+    // Try to create; on conflict delete-and-retry once (S3 overwrite semantics)
+    let create_result = state.client.create_file(&temp_path, &dest_path).await;
+    let create_result = if create_result
+        .as_ref()
+        .is_err_and(|e| e.to_string().contains("already exists"))
+    {
+        tracing::info!("File {} exists, deleting for overwrite", dest_path);
+        let _ = state.client.delete_file(&dest_path).await;
+        state.client.create_file(&temp_path, &dest_path).await
+    } else {
+        create_result
+    };
+
+    match create_result {
         Ok(_) => {
-            // Metadata handling
+            // Build metadata
             let mut meta_map = std::collections::HashMap::new();
             meta_map.insert("ETag".to_string(), etag.clone());
             for (k, v) in headers.iter() {
@@ -841,54 +871,30 @@ async fn put_object(
                     }
                 }
             }
-            if !meta_map.is_empty() {
-                let metadata = Metadata { headers: meta_map };
-                if let Ok(json) = serde_json::to_string(&metadata) {
-                    let meta_path = format!("{}.meta", dest_path);
-                    let mut meta_temp = NamedTempFile::new().unwrap();
-                    let _ = meta_temp.write_all(json.as_bytes());
-                    let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
-                }
+            if let Some(dek_b64) = &encrypted_dek_opt {
+                meta_map.insert("x-amz-sse-encrypted-dek".to_string(), dek_b64.clone());
             }
-            Response::builder()
+            let metadata = Metadata { headers: meta_map };
+            if let Ok(json) = serde_json::to_string(&metadata) {
+                let meta_path = format!("{}.meta", dest_path);
+                let mut meta_temp = NamedTempFile::new().unwrap();
+                let _ = meta_temp.write_all(json.as_bytes());
+                // Delete old meta before overwriting (same semantics as object)
+                let _ = state.client.delete_file(&meta_path).await;
+                let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
+            }
+
+            let mut builder = Response::builder()
                 .status(StatusCode::OK)
-                .header(ETAG, etag)
-                .body(Body::empty())
-                .unwrap()
+                .header(ETAG, etag);
+            if encrypted_dek_opt.is_some() {
+                builder = builder.header("x-amz-server-side-encryption", "AES256");
+            }
+            builder.body(Body::empty()).unwrap()
         }
         Err(e) => {
-            if e.to_string().contains("already exists") {
-                // S3 semantics: overwrite. Delete and retry.
-                tracing::info!("File {} exists, deleting for overwrite", dest_path);
-                let _ = state.client.delete_file(&dest_path).await;
-                match state.client.create_file(temp_path, &dest_path).await {
-                    Ok(_) => {
-                        // Re-save metadata on retry
-                        let mut meta_map = std::collections::HashMap::new();
-                        meta_map.insert("ETag".to_string(), etag.clone());
-                        let metadata = Metadata { headers: meta_map };
-                        if let Ok(json) = serde_json::to_string(&metadata) {
-                            let meta_path = format!("{}.meta", dest_path);
-                            let mut meta_temp = NamedTempFile::new().unwrap();
-                            let _ = meta_temp.write_all(json.as_bytes());
-                            let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
-                        }
-
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header(ETAG, etag)
-                            .body(Body::empty())
-                            .unwrap()
-                    }
-                    Err(e2) => {
-                        tracing::error!("PutObject retry failed: {}", e2);
-                        empty_response(StatusCode::INTERNAL_SERVER_ERROR)
-                    }
-                }
-            } else {
-                tracing::error!("PutObject failed: {}", e);
-                empty_response(StatusCode::INTERNAL_SERVER_ERROR)
-            }
+            tracing::error!("PutObject failed: {}", e);
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
