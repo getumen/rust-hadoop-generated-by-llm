@@ -5,6 +5,7 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::RngExt;
+use zeroize::Zeroizing;
 
 pub struct SseManager {
     kek: [u8; 32],
@@ -78,11 +79,12 @@ impl SseManager {
         let kek_cipher = Aes256Gcm::new_from_slice(&self.kek)
             .map_err(|e| AuthError::InternalError(format!("Invalid KEK: {}", e)))?;
 
-        let dek = kek_cipher
-            .decrypt(kek_nonce, encrypted_dek)
-            .map_err(|e| AuthError::InvalidToken(format!("DEK decryption failed: {}", e)))?;
+        let dek = Zeroizing::new(
+            kek_cipher
+                .decrypt(kek_nonce, encrypted_dek)
+                .map_err(|e| AuthError::InvalidToken(format!("DEK decryption failed: {}", e)))?,
+        );
 
-        // TODO: zeroize DEK after use
         if dek.len() != 32 {
             return Err(AuthError::InternalError(
                 "Decrypted DEK has wrong length".into(),

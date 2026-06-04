@@ -495,7 +495,7 @@ async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -
 
     tracing::info!("CopyObject: source={} -> dest={}", source_path, dest);
 
-    // Naive copy: Download to temp, upload to dest
+    // Download source file
     let temp_dir = std::env::temp_dir();
     let temp_path = temp_dir.join(Uuid::new_v4().to_string());
 
@@ -508,27 +508,82 @@ async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -
         return empty_response(StatusCode::NOT_FOUND);
     }
 
-    // Calculate ETag from downloaded file
     let mut file = std::fs::File::open(&temp_path).unwrap();
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).unwrap();
-    let etag = format!("\"{:x}\"", Md5::digest(&buffer));
+    let mut src_body = Vec::new();
+    file.read_to_end(&mut src_body).unwrap();
+    drop(file);
+    let _ = std::fs::remove_file(&temp_path);
 
-    if let Err(e) = state.client.create_file(&temp_path, &dest).await {
-        tracing::error!("CopyObject: Failed to upload to {}: {}", dest, e);
-        let _ = std::fs::remove_file(temp_path);
+    // Read source .meta to detect SSE
+    let src_meta_path = format!("{}.meta", source_path);
+    let src_encrypted_dek: Option<String> =
+        if let Ok(meta_bytes) = state.client.get_file_content(&src_meta_path).await {
+            if let Ok(json) = std::str::from_utf8(&meta_bytes) {
+                if let Ok(metadata) = serde_json::from_str::<Metadata>(json) {
+                    metadata.headers.get("x-amz-sse-encrypted-dek").cloned()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // Decrypt source if it was encrypted
+    let src_body = if let (Some(dek_b64), Some(mgr)) = (&src_encrypted_dek, &state.sse_manager) {
+        match mgr.decrypt_object(&src_body, dek_b64) {
+            Ok(plain) => plain,
+            Err(e) => {
+                tracing::error!("SSE decrypt failed during CopyObject: {}", e);
+                return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    } else {
+        src_body
+    };
+
+    // ETag is always computed on plaintext
+    let etag = format!("\"{:x}\"", Md5::digest(&src_body));
+
+    // Re-encrypt for destination if sse_manager is configured
+    let (write_body, dst_encrypted_dek): (Vec<u8>, Option<String>) =
+        if let Some(mgr) = &state.sse_manager {
+            match mgr.encrypt_object(&src_body) {
+                Ok((ct, dek_b64)) => (ct, Some(dek_b64)),
+                Err(e) => {
+                    tracing::error!("SSE encrypt failed during CopyObject: {}", e);
+                    return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        } else {
+            (src_body, None)
+        };
+
+    // Write destination
+    let mut dest_temp = NamedTempFile::new().unwrap();
+    if dest_temp.write_all(&write_body).is_err() {
         return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    let _ = std::fs::remove_file(temp_path);
+
+    if let Err(e) = state.client.create_file(dest_temp.path(), &dest).await {
+        tracing::error!("CopyObject: Failed to upload to {}: {}", dest, e);
+        return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // Save metadata for the copy
     let mut meta_map = std::collections::HashMap::new();
     meta_map.insert("ETag".to_string(), etag.clone());
+    if let Some(dek_b64) = &dst_encrypted_dek {
+        meta_map.insert("x-amz-sse-encrypted-dek".to_string(), dek_b64.clone());
+    }
     let metadata = Metadata { headers: meta_map };
     if let Ok(json) = serde_json::to_string(&metadata) {
         let meta_path = format!("{}.meta", dest);
         let mut meta_temp = NamedTempFile::new().unwrap();
         let _ = meta_temp.write_all(json.as_bytes());
+        let _ = state.client.delete_file(&meta_path).await;
         let _ = state.client.create_file(meta_temp.path(), &meta_path).await;
     }
 
@@ -1057,81 +1112,89 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
     // Normal Object
     let source_path = format!("/{}/{}", bucket, key);
 
-    // Check if Range header is present to optimize download
-    if let Some(range_val) = headers.get(RANGE) {
-        if let Ok(range_str) = range_val.to_str() {
-            if let Some(range_part) = range_str.strip_prefix("bytes=") {
-                // First, get file info to determine total size
-                if let Ok(true) = state.client.exists(&source_path).await {
-                    // Parse range
-                    let parts: Vec<&str> = range_part.split('-').collect();
-                    if parts.len() == 2 {
-                        // Get file metadata to determine total size
-                        let temp_dir = std::env::temp_dir();
-                        let dest_path =
-                            temp_dir.join(format!("s3_get_{}_{}", bucket, key.replace('/', "_")));
+    // Only use optimized range path for non-encrypted objects.
+    // Encrypted objects must be fully downloaded and decrypted first.
+    if encrypted_dek_opt.is_none() {
+        // Check if Range header is present to optimize download
+        if let Some(range_val) = headers.get(RANGE) {
+            if let Ok(range_str) = range_val.to_str() {
+                if let Some(range_part) = range_str.strip_prefix("bytes=") {
+                    // First, get file info to determine total size
+                    if let Ok(true) = state.client.exists(&source_path).await {
+                        // Parse range
+                        let parts: Vec<&str> = range_part.split('-').collect();
+                        if parts.len() == 2 {
+                            // Get file metadata to determine total size
+                            let temp_dir = std::env::temp_dir();
+                            let dest_path = temp_dir.join(format!(
+                                "s3_get_{}_{}",
+                                bucket,
+                                key.replace('/', "_")
+                            ));
 
-                        // Download full file first to get total size
-                        // TODO: Add get_file_metadata API to avoid this download
-                        if state
-                            .client
-                            .get_file(&source_path, &dest_path)
-                            .await
-                            .is_ok()
-                        {
-                            let total_size = std::fs::metadata(&dest_path).unwrap().len();
-                            let _ = std::fs::remove_file(dest_path);
+                            // Download full file first to get total size
+                            // TODO: Add get_file_metadata API to avoid this download
+                            if state
+                                .client
+                                .get_file(&source_path, &dest_path)
+                                .await
+                                .is_ok()
+                            {
+                                let total_size = std::fs::metadata(&dest_path).unwrap().len();
+                                let _ = std::fs::remove_file(dest_path);
 
-                            let start = parts[0].parse::<u64>().unwrap_or(0);
-                            let end = if parts[1].is_empty() {
-                                total_size - 1
-                            } else {
-                                parts[1].parse::<u64>().unwrap_or(total_size - 1)
-                            };
-                            let end = std::cmp::min(end, total_size - 1);
+                                let start = parts[0].parse::<u64>().unwrap_or(0);
+                                let end = if parts[1].is_empty() {
+                                    total_size - 1
+                                } else {
+                                    parts[1].parse::<u64>().unwrap_or(total_size - 1)
+                                };
+                                let end = std::cmp::min(end, total_size - 1);
 
-                            if start <= end {
-                                let length = end - start + 1;
+                                if start <= end {
+                                    let length = end - start + 1;
 
-                                tracing::info!(
+                                    tracing::info!(
                                     "Range request: path={}, start={}, end={}, length={}, total_size={}",
                                     source_path, start, end, length, total_size
                                 );
 
-                                // Use optimized partial read
-                                match state
-                                    .client
-                                    .read_file_range(&source_path, start, length)
-                                    .await
-                                {
-                                    Ok(data) => {
-                                        tracing::info!(
-                                            "Range read successful: {} bytes returned",
-                                            data.len()
-                                        );
-                                        response_headers.insert(
-                                            CONTENT_RANGE,
-                                            format!("bytes {}-{}/{}", start, end, total_size)
-                                                .parse()
-                                                .unwrap(),
-                                        );
-                                        response_headers.insert(
-                                            CONTENT_LENGTH,
-                                            length.to_string().parse().unwrap(),
-                                        );
+                                    // Use optimized partial read
+                                    match state
+                                        .client
+                                        .read_file_range(&source_path, start, length)
+                                        .await
+                                    {
+                                        Ok(data) => {
+                                            tracing::info!(
+                                                "Range read successful: {} bytes returned",
+                                                data.len()
+                                            );
+                                            response_headers.insert(
+                                                CONTENT_RANGE,
+                                                format!("bytes {}-{}/{}", start, end, total_size)
+                                                    .parse()
+                                                    .unwrap(),
+                                            );
+                                            response_headers.insert(
+                                                CONTENT_LENGTH,
+                                                length.to_string().parse().unwrap(),
+                                            );
 
-                                        let mut resp_builder =
-                                            Response::builder().status(StatusCode::PARTIAL_CONTENT);
-                                        {
-                                            let headers_map = resp_builder.headers_mut().unwrap();
-                                            *headers_map = response_headers;
-                                            headers_map.insert(ETAG, etag.parse().unwrap());
+                                            let mut resp_builder = Response::builder()
+                                                .status(StatusCode::PARTIAL_CONTENT);
+                                            {
+                                                let headers_map =
+                                                    resp_builder.headers_mut().unwrap();
+                                                *headers_map = response_headers;
+                                                headers_map.insert(ETAG, etag.parse().unwrap());
+                                            }
+                                            return resp_builder.body(Body::from(data)).unwrap();
                                         }
-                                        return resp_builder.body(Body::from(data)).unwrap();
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to read file range: {}", e);
-                                        // Fall back to full download below
+                                        Err(e) => {
+                                            tracing::error!("Failed to read file range: {}", e);
+                                            // Fall back to full download below
+                                        }
                                     }
                                 }
                             }
@@ -1140,9 +1203,9 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
                 }
             }
         }
-    }
+    } // end if encrypted_dek_opt.is_none() (range optimization)
 
-    // Fall back to full file download (for non-range requests or if range optimization failed)
+    // Fall back to full file download (for non-range requests, range optimization failed, or encrypted objects)
     let temp_dir = std::env::temp_dir();
     let dest_path = temp_dir.join(format!("s3_get_{}_{}", bucket, key.replace('/', "_")));
 
@@ -1155,7 +1218,7 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
             let _ = file.read_exact(&mut raw_data);
             let _ = std::fs::remove_file(dest_path);
 
-            let body_bytes =
+            let plaintext =
                 if let (Some(dek_b64), Some(mgr)) = (&encrypted_dek_opt, &state.sse_manager) {
                     match mgr.decrypt_object(&raw_data, dek_b64) {
                         Ok(plain) => plain,
@@ -1168,12 +1231,57 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
                     raw_data
                 };
 
+            // For encrypted objects (or range fallback), apply range slicing on plaintext
+            let plaintext_total = plaintext.len() as u64;
+            let (body_bytes, status, range_headers) = if let Some(range_val) = headers.get(RANGE) {
+                if let Ok(range_str) = range_val.to_str() {
+                    if let Some(range_part) = range_str.strip_prefix("bytes=") {
+                        let rparts: Vec<&str> = range_part.split('-').collect();
+                        if rparts.len() == 2 {
+                            let start = rparts[0].parse::<u64>().unwrap_or(0);
+                            let end = if rparts[1].is_empty() {
+                                plaintext_total - 1
+                            } else {
+                                rparts[1].parse::<u64>().unwrap_or(plaintext_total - 1)
+                            };
+                            let end = std::cmp::min(end, plaintext_total - 1);
+                            if start <= end {
+                                let slice = plaintext[start as usize..=end as usize].to_vec();
+                                (
+                                    slice,
+                                    StatusCode::PARTIAL_CONTENT,
+                                    Some((start, end, plaintext_total)),
+                                )
+                            } else {
+                                (plaintext, StatusCode::OK, None)
+                            }
+                        } else {
+                            (plaintext, StatusCode::OK, None)
+                        }
+                    } else {
+                        (plaintext, StatusCode::OK, None)
+                    }
+                } else {
+                    (plaintext, StatusCode::OK, None)
+                }
+            } else {
+                (plaintext, StatusCode::OK, None)
+            };
+
+            if let Some((start, end, total)) = range_headers {
+                response_headers.insert(
+                    CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, total)
+                        .parse()
+                        .unwrap(),
+                );
+            }
             response_headers.insert(
                 CONTENT_LENGTH,
                 body_bytes.len().to_string().parse().unwrap(),
             );
 
-            let mut resp_builder = Response::builder().status(StatusCode::OK);
+            let mut resp_builder = Response::builder().status(status);
             {
                 let headers_map = resp_builder.headers_mut().unwrap();
                 *headers_map = response_headers;
@@ -1285,6 +1393,12 @@ async fn head_object(state: S3AppState, bucket: &str, key: &str) -> Response {
                         for (k, v) in metadata.headers {
                             if k == "ETag" {
                                 etag = v;
+                            } else if k == "x-amz-sse-encrypted-dek" {
+                                // Don't expose the DEK; just signal that SSE is applied
+                                extra_headers.insert(
+                                    "x-amz-server-side-encryption",
+                                    "AES256".parse().unwrap(),
+                                );
                             } else if k.starts_with("x-amz-meta-") {
                                 if let (Ok(name), Ok(value)) = (
                                     k.parse::<axum::http::HeaderName>(),
