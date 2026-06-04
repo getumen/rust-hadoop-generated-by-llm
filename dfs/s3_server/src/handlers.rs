@@ -37,6 +37,7 @@ pub struct S3Query {
     pub start_after: Option<String>,
     #[serde(rename = "max-keys")]
     pub max_keys: Option<i32>,
+    pub policy: Option<String>,
 }
 
 // Helper to return XML response
@@ -159,6 +160,14 @@ pub async fn handle_request(
         let key = if parts.len() > 1 { parts[1] } else { "" };
 
         if key.is_empty() {
+            if params.policy.is_some() {
+                return match method {
+                    Method::GET => get_bucket_policy(state, bucket).await,
+                    Method::PUT => put_bucket_policy(state, bucket, body_bytes).await,
+                    Method::DELETE => delete_bucket_policy(state, bucket).await,
+                    _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                };
+            }
             match method {
                 Method::PUT => create_bucket(state, bucket).await,
                 Method::DELETE => delete_bucket(state, bucket).await,
@@ -596,6 +605,63 @@ async fn copy_object(state: S3AppState, bucket: &str, key: &str, source: &str) -
         Ok(xml) => xml_response(StatusCode::OK, xml),
         Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+async fn get_bucket_policy(state: S3AppState, bucket: &str) -> Response {
+    let path = format!("/{bucket}/.s3_bucket_policy");
+    match state.client.get_file_content(&path).await {
+        Ok(data) => {
+            if serde_json::from_slice::<serde_json::Value>(&data).is_err() {
+                return bucket_policy_not_found(bucket);
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(data))
+                .unwrap()
+        }
+        Err(_) => bucket_policy_not_found(bucket),
+    }
+}
+
+async fn put_bucket_policy(state: S3AppState, bucket: &str, body: Bytes) -> Response {
+    use dfs_common::auth::bucket_policy::BucketPolicyDocument;
+    if serde_json::from_slice::<BucketPolicyDocument>(&body).is_err() {
+        return xml_response(
+            StatusCode::BAD_REQUEST,
+            "<Error><Code>MalformedPolicy</Code><Message>Bucket policy must be valid JSON</Message></Error>".to_string(),
+        );
+    }
+    let path = format!("/{bucket}/.s3_bucket_policy");
+    match state
+        .client
+        .create_file_from_buffer(body.to_vec(), &path)
+        .await
+    {
+        Ok(_) => empty_response(StatusCode::NO_CONTENT),
+        Err(e) => {
+            tracing::error!("Failed to write bucket policy: {}", e);
+            xml_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "<Error><Code>InternalError</Code><Message>Failed to store bucket policy</Message></Error>".to_string(),
+            )
+        }
+    }
+}
+
+async fn delete_bucket_policy(state: S3AppState, bucket: &str) -> Response {
+    let path = format!("/{bucket}/.s3_bucket_policy");
+    let _ = state.client.delete_file(&path).await;
+    empty_response(StatusCode::NO_CONTENT)
+}
+
+fn bucket_policy_not_found(bucket: &str) -> Response {
+    xml_response(
+        StatusCode::NOT_FOUND,
+        format!(
+            "<Error><Code>NoSuchBucketPolicy</Code><Message>The bucket policy does not exist</Message><BucketName>{bucket}</BucketName></Error>"
+        ),
+    )
 }
 
 async fn create_bucket(state: S3AppState, bucket: &str) -> Response {
