@@ -920,6 +920,7 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
     let mut response_headers = HeaderMap::new();
     let mut etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
     let mut last_modified = "Wed, 01 Jan 2025 00:00:00 GMT".to_string();
+    let mut encrypted_dek_opt: Option<String> = None;
 
     if let Ok(Some(info)) = state.client.get_file_info(&full_path).await {
         if !info.etag_md5.is_empty() {
@@ -941,6 +942,8 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
                 for (k, v) in metadata.headers {
                     if k == "ETag" {
                         etag = v;
+                    } else if k == "x-amz-sse-encrypted-dek" {
+                        encrypted_dek_opt = Some(v);
                     } else if k.starts_with("x-amz-meta-") {
                         if let (Ok(name), Ok(value)) = (
                             k.parse::<axum::http::HeaderName>(),
@@ -952,6 +955,10 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
                 }
             }
         }
+    }
+
+    if encrypted_dek_opt.is_some() {
+        response_headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
     }
 
     response_headers.insert(ETAG, etag.parse().unwrap());
@@ -980,7 +987,25 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
         for (_, path) in parts {
             let dest_path = temp_dir.join(Uuid::new_v4().to_string());
             if state.client.get_file(&path, &dest_path).await.is_ok() {
-                if let Ok(mut data) = std::fs::read(&dest_path) {
+                if let Ok(part_bytes) = std::fs::read(&dest_path) {
+                    let mut data = if let (Some(dek_b64), Some(mgr)) =
+                        (&encrypted_dek_opt, &state.sse_manager)
+                    {
+                        match mgr.decrypt_object(&part_bytes, dek_b64) {
+                            Ok(plain) => plain,
+                            Err(e) => {
+                                tracing::error!(
+                                    "SSE decryption failed for MPU part {}: {}",
+                                    path,
+                                    e
+                                );
+                                let _ = std::fs::remove_file(dest_path);
+                                return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+                            }
+                        }
+                    } else {
+                        part_bytes
+                    };
                     combined.append(&mut data);
                 }
                 let _ = std::fs::remove_file(dest_path);
@@ -1126,11 +1151,27 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
             let mut file = std::fs::File::open(&dest_path).unwrap();
             let total_size = file.metadata().unwrap().len();
 
-            let mut data = vec![0u8; total_size as usize];
-            let _ = file.read_exact(&mut data);
+            let mut raw_data = vec![0u8; total_size as usize];
+            let _ = file.read_exact(&mut raw_data);
             let _ = std::fs::remove_file(dest_path);
 
-            response_headers.insert(CONTENT_LENGTH, total_size.to_string().parse().unwrap());
+            let body_bytes =
+                if let (Some(dek_b64), Some(mgr)) = (&encrypted_dek_opt, &state.sse_manager) {
+                    match mgr.decrypt_object(&raw_data, dek_b64) {
+                        Ok(plain) => plain,
+                        Err(e) => {
+                            tracing::error!("SSE decryption failed for {}: {}", full_path, e);
+                            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+                        }
+                    }
+                } else {
+                    raw_data
+                };
+
+            response_headers.insert(
+                CONTENT_LENGTH,
+                body_bytes.len().to_string().parse().unwrap(),
+            );
 
             let mut resp_builder = Response::builder().status(StatusCode::OK);
             {
@@ -1138,7 +1179,7 @@ async fn get_object(state: S3AppState, bucket: &str, key: &str, headers: HeaderM
                 *headers_map = response_headers;
                 headers_map.insert(ETAG, etag.parse().unwrap());
             }
-            resp_builder.body(Body::from(data)).unwrap()
+            resp_builder.body(Body::from(body_bytes)).unwrap()
         }
         Err(e) => {
             tracing::error!("GetObject failed: {}", e);
