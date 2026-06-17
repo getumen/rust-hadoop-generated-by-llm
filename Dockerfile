@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Install corporate CA certificates (for SSL-intercepting proxies)
+COPY corporate-ca.pem /usr/local/share/ca-certificates/corporate.crt
+RUN update-ca-certificates
+
 # Optimize build by caching dependencies
 COPY Cargo.toml Cargo.lock ./
 # Note: This is a common trick to cache dependencies, but since we have multiple members,

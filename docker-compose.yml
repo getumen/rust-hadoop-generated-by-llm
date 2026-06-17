@@ -13,6 +13,7 @@ services:
       - dfs-sharded-network
     volumes:
       - config-server-data:/data/config-raft
+    mem_limit: 512m
 
   # ==========================================
   # Shard 1
@@ -32,6 +33,7 @@ services:
       - config-server
     volumes:
       - master1-shard1-data:/data/raft
+    mem_limit: 512m
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -54,6 +56,7 @@ services:
     volumes:
       - cs1-shard1-data:/data/cs1
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
   # ==========================================
   # Shard 2
@@ -73,6 +76,7 @@ services:
       - config-server
     volumes:
       - master1-shard2-data:/data/raft
+    mem_limit: 512m
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -95,6 +99,7 @@ services:
     volumes:
       - cs1-shard2-data:/data/cs1
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
   chunkserver-extra:
     build: .
@@ -111,6 +116,7 @@ services:
     volumes:
       - cs-extra-data:/data/cs-extra
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
   chunkserver-extra2:
     build: .
@@ -127,6 +133,7 @@ services:
     volumes:
       - cs-extra2-data:/data/cs-extra2
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
   s3-server:
     build: .
@@ -146,6 +153,7 @@ services:
     depends_on:
       - master1-shard1
       - config-server
+    mem_limit: 512m
 
 networks:
   dfs-sharded-network:

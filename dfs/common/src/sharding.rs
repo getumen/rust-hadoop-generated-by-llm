@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use tracing::{debug, warn};
 
 /// ShardId is a unique identifier for a Raft Group (Shard).
 pub type ShardId = String;
@@ -67,7 +68,7 @@ impl ShardMap {
 
     /// Add a new Shard to the map with its peers.
     pub fn add_shard(&mut self, shard_id: ShardId, peers: Vec<String>) {
-        eprintln!("DEBUG: add_shard called for {}", shard_id);
+        debug!("add_shard called for {}", shard_id);
         if self.shards.contains(&shard_id) {
             // Update peers if already exists? For now, we update.
             self.shard_peers.insert(shard_id.clone(), peers.clone());
@@ -75,8 +76,8 @@ impl ShardMap {
         }
         self.shards.insert(shard_id.clone());
         self.shard_peers.insert(shard_id.clone(), peers.clone());
-        eprintln!(
-            "DEBUG: add_shard inserted {}. Shards now: {:?}",
+        debug!(
+            "add_shard inserted {}. Shards now: {:?}",
             shard_id, self.shards
         );
 
@@ -274,7 +275,7 @@ impl ShardMap {
     /// Get all registered shards
     pub fn get_all_shards(&self) -> Vec<ShardId> {
         let shards: Vec<ShardId> = self.shards.iter().cloned().collect();
-        eprintln!("DEBUG: get_all_shards returning: {:?}", shards);
+        debug!("get_all_shards returning: {:?}", shards);
         shards
     }
 
@@ -332,7 +333,7 @@ pub fn load_shard_map_from_config(path: Option<&str>, virtual_nodes: usize) -> S
                 return config.to_shard_map(virtual_nodes);
             }
             Err(e) => {
-                eprintln!("Failed to load shard config: {}. Using empty map.", e);
+                warn!("Failed to load shard config: {}. Using empty map.", e);
             }
         }
     }

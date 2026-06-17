@@ -20,8 +20,12 @@ docker_cleanup() {
     fi
     # Remove any remaining project containers by label
     docker ps -aq --filter "name=dfs-" | xargs docker rm -f 2>/dev/null || true
-    # Prune orphaned networks
+    # Prune orphaned networks and unused images/volumes to free VM memory
     docker network prune -f 2>/dev/null || true
+    docker system prune -f 2>/dev/null || true
+    # Cooldown: let the Docker VM stabilize before next test
+    echo "🧹 [run_all_tests] Cooldown (10s)..."
+    sleep 10
     echo "🧹 [run_all_tests] Docker cleanup done."
 }
 

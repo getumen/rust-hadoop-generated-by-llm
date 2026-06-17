@@ -12,6 +12,7 @@ services:
       - "60152:60052" # Proxy for chunkserver1-shard1
     networks:
       - dfs-sharded-network
+    mem_limit: 128m
     healthcheck:
       test: [ "CMD", "wget", "-q", "--spider", "http://localhost:8474/version" ]
       interval: 5s
@@ -32,6 +33,7 @@ services:
       - dfs-sharded-network
     volumes:
       - config-server-data:/data/config-raft
+    mem_limit: 512m
 
   # Shard 1 Master
   master1-shard1:
@@ -49,6 +51,7 @@ services:
       - config-server
     volumes:
       - master1-shard1-data:/data/raft
+    mem_limit: 512m
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -71,6 +74,7 @@ services:
       - config-server
     volumes:
       - master1-shard2-data:/data/raft
+    mem_limit: 512m
     healthcheck:
       test: [ "CMD", "sh", "-c", "netstat -an | grep 50051 || exit 1" ]
       interval: 5s
@@ -94,6 +98,7 @@ services:
     volumes:
       - cs1-shard1-data:/data/cs1
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
   # Extra services maintained for compatibility but not primary test targets
   chunkserver-extra:
@@ -111,6 +116,7 @@ services:
     volumes:
       - cs-extra-data:/data/cs-extra
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
   chunkserver-extra2:
     build: .
@@ -127,6 +133,7 @@ services:
     volumes:
       - cs-extra2-data:/data/cs-extra2
       - ./shard_config.json:/app/shard_config.json:ro
+    mem_limit: 256m
 
 volumes:
   config-server-data:

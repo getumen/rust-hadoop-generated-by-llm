@@ -20,6 +20,7 @@ use tonic::transport::Channel;
 
 const MAX_RETRIES: usize = 5;
 const INITIAL_BACKOFF_MS: u64 = 500;
+const MAX_GRPC_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct Client {
@@ -85,34 +86,13 @@ impl Client {
     }
 
     async fn connect_endpoint(&self, url: &str) -> anyhow::Result<Channel> {
-        let mut addr = url.to_string();
-        if self.ca_cert_path.is_some() && addr.starts_with("http://") {
-            addr = addr.replace("http://", "https://");
-        }
-        let resolved_addr = self.resolve_url(&addr);
-        let mut endpoint = tonic::transport::Endpoint::from_shared(resolved_addr.clone())?;
-
-        if let Some(ca_path) = &self.ca_cert_path {
-            let domain = self.domain_name.clone().unwrap_or_else(|| {
-                addr.split("://")
-                    .last()
-                    .unwrap_or("")
-                    .split(':')
-                    .next()
-                    .unwrap_or("localhost")
-                    .to_string()
-            });
-            if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
-                endpoint = endpoint
-                    .tls_config(tls_config)
-                    .expect("Failed to apply TLS config");
-            }
-        }
-
-        endpoint
-            .connect()
-            .await
-            .map_err(|e| anyhow!("Failed to connect to {}: {}", resolved_addr, e))
+        let resolved = self.resolve_url(url);
+        dfs_common::security::connect_endpoint(
+            &resolved,
+            self.ca_cert_path.as_deref(),
+            self.domain_name.as_deref(),
+        )
+        .await
     }
 
     pub async fn list_files(&self, path: &str) -> anyhow::Result<Vec<String>> {
@@ -302,7 +282,7 @@ impl Client {
                 dfs_common::telemetry::tracing_interceptor
                     as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
             )
-            .max_decoding_message_size(100 * 1024 * 1024);
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
         // Calculate checksums
         let mut hasher_crc = crc32fast::Hasher::new();
@@ -419,7 +399,7 @@ impl Client {
                                 )
                                     -> Result<tonic::Request<()>, tonic::Status>,
                         )
-                        .max_decoding_message_size(100 * 1024 * 1024);
+                        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
                         let request = tonic::Request::new(ReadBlockRequest {
                             block_id: block.block_id.clone(),
                             offset: 0,
@@ -557,7 +537,7 @@ impl Client {
                                 )
                                     -> Result<tonic::Request<()>, tonic::Status>,
                         )
-                        .max_decoding_message_size(100 * 1024 * 1024);
+                        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
                         let request = tonic::Request::new(ReadBlockRequest {
                             block_id: block.block_id.clone(),
                             offset: block_offset,
@@ -693,7 +673,7 @@ impl Client {
                         dfs_common::telemetry::tracing_interceptor
                             as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
                     )
-                    .max_decoding_message_size(100 * 1024 * 1024);
+                    .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
                     let request = tonic::Request::new(ReadBlockRequest {
                         block_id: block.block_id.clone(),
@@ -982,7 +962,7 @@ impl Client {
                     dfs_common::telemetry::tracing_interceptor
                         as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
                 );
-                let client = client.max_decoding_message_size(100 * 1024 * 1024);
+                let client = client.max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
 
                 match f(client).await {
                     Ok(res) => return Ok((res, master_addr)),

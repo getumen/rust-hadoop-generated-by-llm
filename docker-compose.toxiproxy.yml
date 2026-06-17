@@ -11,6 +11,7 @@ services:
       - "60053:60053"  # Proxy for master3
     networks:
       - dfs-network
+    mem_limit: 128m
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8474/version"]
       interval: 5s
@@ -35,6 +36,7 @@ services:
     ports:
       - "50051:50051"
       - "8081:8080"  # HTTP API
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -58,6 +60,7 @@ services:
     ports:
       - "50052:50052"
       - "8082:8080"
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -81,6 +84,7 @@ services:
     ports:
       - "50053:50053"
       - "8083:8080"
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s

@@ -6,7 +6,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use dfs_chunkserver::chunkserver::MyChunkServer;
+use dfs_chunkserver::chunkserver::{MyChunkServer, MAX_GRPC_MESSAGE_SIZE};
 use dfs_chunkserver::dfs::chunk_server_service_server::ChunkServerServiceServer;
 use dfs_chunkserver::dfs::master_service_client::MasterServiceClient;
 use dfs_chunkserver::dfs::HeartbeatRequest;
@@ -276,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
     server
         .add_service(
             ChunkServerServiceServer::new(chunk_server)
-                .max_decoding_message_size(100 * 1024 * 1024),
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE),
         )
         .serve(addr)
         .await?;
