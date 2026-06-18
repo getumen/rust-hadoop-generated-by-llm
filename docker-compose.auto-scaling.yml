@@ -14,6 +14,7 @@ services:
       - dfs-test-network
     volumes:
       - config-server-data-test:/data/config-raft
+    mem_limit: 512m
 
   master:
     build:
@@ -30,6 +31,7 @@ services:
       - config-server
     volumes:
       - master-data-test:/data/raft
+    mem_limit: 512m
 
   chunkserver:
     build:
@@ -44,6 +46,7 @@ services:
       - master
     volumes:
       - cs-test-data:/data/cs1
+    mem_limit: 256m
 
 networks:
   dfs-test-network:

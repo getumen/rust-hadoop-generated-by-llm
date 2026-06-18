@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use tonic::transport::Server;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+const MAX_GRPC_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -244,7 +245,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     server
-        .add_service(MasterServiceServer::new(master).max_decoding_message_size(100 * 1024 * 1024))
+        .add_service(
+            MasterServiceServer::new(master).max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE),
+        )
         .serve(addr)
         .await?;
 

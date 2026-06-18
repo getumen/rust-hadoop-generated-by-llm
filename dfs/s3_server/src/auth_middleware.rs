@@ -10,6 +10,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use dfs_common::auth::audit::AuditRecord;
 use dfs_common::auth::bucket_policy::{BucketPolicyDocument, BucketPolicyEvaluator, PolicyResult};
+use dfs_common::auth::policy::EvaluationContext;
 use dfs_common::auth::{parse_credentials, AuthError, SigningInput};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -100,17 +101,7 @@ pub async fn auth_middleware(
             c
         }
         Err(e) => {
-            let error_type = classify_auth_error(&e);
-            IAM_AUTH_REQUESTS
-                .with_label_values(&["failure", &error_type])
-                .inc();
-            IAM_AUTH_DURATION
-                .with_label_values(&["failure"])
-                .observe(auth_timer.elapsed().as_secs_f64());
-            let res = s3_error_response(e.clone());
-            let (err_code, _) = e.to_s3_error();
-            audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-            return res;
+            return auth_failure(&e, &auth_timer, &audit_ctx, &state, &query_params);
         }
     };
 
@@ -163,20 +154,13 @@ pub async fn auth_middleware(
                 return res;
             }
             if presigned_is_expired(&credentials.timestamp, expires_secs, now) {
-                IAM_AUTH_REQUESTS
-                    .with_label_values(&["failure", "expired_token"])
-                    .inc();
-                IAM_AUTH_DURATION
-                    .with_label_values(&["failure"])
-                    .observe(auth_timer.elapsed().as_secs_f64());
-                let res = s3_error_response(AuthError::ExpiredToken);
-                audit_ctx.log(
+                return auth_failure(
+                    &AuthError::ExpiredToken,
+                    &auth_timer,
+                    &audit_ctx,
                     &state,
-                    res.status().as_u16(),
-                    Some("ExpiredToken".to_string()),
                     &query_params,
                 );
-                return res;
             }
         } else {
             let skew = (now - req_time.with_timezone(&Utc)).num_minutes().abs();
@@ -185,16 +169,7 @@ pub async fn auth_middleware(
                     server_time: now.to_rfc3339(),
                     request_time: req_time.to_rfc3339(),
                 };
-                IAM_AUTH_REQUESTS
-                    .with_label_values(&["failure", "clock_skew"])
-                    .inc();
-                IAM_AUTH_DURATION
-                    .with_label_values(&["failure"])
-                    .observe(auth_timer.elapsed().as_secs_f64());
-                let res = s3_error_response(err.clone());
-                let (err_code, _) = err.to_s3_error();
-                audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-                return res;
+                return auth_failure(&err, &auth_timer, &audit_ctx, &state, &query_params);
             }
         }
     }
@@ -211,101 +186,27 @@ pub async fn auth_middleware(
                 credentials.date, credentials.region, credentials.service, "aws4_request"
             ),
         };
-        IAM_AUTH_REQUESTS
-            .with_label_values(&["failure", "invalid_credential_scope"])
-            .inc();
-        IAM_AUTH_DURATION
-            .with_label_values(&["failure"])
-            .observe(auth_timer.elapsed().as_secs_f64());
-        let res = s3_error_response(err.clone());
-        let (err_code, _) = err.to_s3_error();
-        audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-        return res;
+        return auth_failure(&err, &auth_timer, &audit_ctx, &state, &query_params);
     }
 
-    // 7. Retrieve secret key
-    let mut evaluation_context = None;
-    let mut role_arn_from_token = None;
-
-    // Check for STS token in headers or query
+    // 7. Retrieve secret key (STS token or credential provider)
     let sts_token = req
         .headers()
         .get("x-amz-security-token")
         .and_then(|v| v.to_str().ok())
-        .or_else(|| query_params.get("X-Amz-Security-Token").map(|s| s.as_str()));
+        .map(|s| s.to_string())
+        .or_else(|| query_params.get("X-Amz-Security-Token").cloned());
 
-    let secret_key = if let Some(token) = sts_token {
-        let sts_mgr = match state.sts_token_manager.as_ref() {
-            Some(m) => m,
-            None => {
-                return s3_error_response(AuthError::InternalError(
-                    "STS is not enabled on this server".to_string(),
-                ));
-            }
-        };
-
-        let session_data = match sts_mgr.decrypt_token(token) {
-            Ok(data) => data,
-            Err(e) => {
-                let error_type = classify_auth_error(&e);
-                IAM_AUTH_REQUESTS
-                    .with_label_values(&["failure", &error_type])
-                    .inc();
-                IAM_AUTH_DURATION
-                    .with_label_values(&["failure"])
-                    .observe(auth_timer.elapsed().as_secs_f64());
-                let res = s3_error_response(e.clone());
-                let (err_code, _) = e.to_s3_error();
-                audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-                return res;
-            }
-        };
-
-        // Check session expiration
-        let now = Utc::now().timestamp() as u64;
-        if session_data.expiration < now {
-            IAM_AUTH_REQUESTS
-                .with_label_values(&["failure", "expired_token"])
-                .inc();
-            IAM_AUTH_DURATION
-                .with_label_values(&["failure"])
-                .observe(auth_timer.elapsed().as_secs_f64());
-            let res = s3_error_response(AuthError::ExpiredToken);
-            audit_ctx.role_arn = Some(session_data.role_arn.clone());
-            audit_ctx.log(
-                &state,
-                res.status().as_u16(),
-                Some("ExpiredToken".to_string()),
-                &query_params,
-            );
-            return res;
-        }
-
-        role_arn_from_token = Some(session_data.role_arn.clone());
-        evaluation_context = Some(session_data.claims.to_policy_context());
-        session_data.temp_secret_key
-    } else {
-        match state
-            .credential_provider
-            .get_secret_key(&credentials.access_key)
-        {
-            Some(k) => k,
-            None => {
-                let err = AuthError::InvalidAccessKey {
-                    access_key: credentials.access_key.clone(),
-                };
-                IAM_AUTH_REQUESTS
-                    .with_label_values(&["failure", "invalid_access_key"])
-                    .inc();
-                IAM_AUTH_DURATION
-                    .with_label_values(&["failure"])
-                    .observe(auth_timer.elapsed().as_secs_f64());
-                let res = s3_error_response(err.clone());
-                let (err_code, _) = err.to_s3_error();
-                audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-                return res;
-            }
-        }
+    let (secret_key, role_arn_from_token, evaluation_context) = match resolve_secret_key(
+        &state,
+        sts_token.as_deref(),
+        &credentials,
+        &query_params,
+        &auth_timer,
+        &mut audit_ctx,
+    ) {
+        Ok(result) => result,
+        Err(response) => return response,
     };
 
     // Use cache for signing key
@@ -328,61 +229,24 @@ pub async fn auth_middleware(
     };
 
     // 8. Build SigningInput
-    let method_str = method.to_string();
-    let path_str = path.clone();
+    let input = build_signing_input(
+        &req,
+        &credentials,
+        method.as_str(),
+        &path,
+        normalized_query_string,
+    );
 
-    let mut normalized_headers = BTreeMap::new();
-    let mut signed_headers_vec = Vec::new();
-    for name in &credentials.signed_headers {
-        let name_lower = name.to_lowercase();
-        let header_values = req.headers().get_all(&name_lower);
-        let mut vals = Vec::new();
-        for val in header_values {
-            if let Ok(s) = val.to_str() {
-                vals.push(s.split_whitespace().collect::<Vec<_>>().join(" "));
-            }
-        }
-        let joined = vals.join(",");
-        normalized_headers.insert(name_lower.clone(), vec![joined]);
-        signed_headers_vec.push(name_lower);
-    }
-    signed_headers_vec.sort();
-    let signed_headers_list = signed_headers_vec.join(";");
-
-    // Payload hash. Default to UNSIGNED-PAYLOAD if not provided
-    let payload_hash = req
-        .headers()
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "UNSIGNED-PAYLOAD".to_string());
-
-    if payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload && !is_presigned {
-        IAM_AUTH_REQUESTS
-            .with_label_values(&["failure", "missing_auth"])
-            .inc();
-        IAM_AUTH_DURATION
-            .with_label_values(&["failure"])
-            .observe(auth_timer.elapsed().as_secs_f64());
-        let res = s3_error_response(AuthError::MissingAuth);
+    if input.payload_hash == "UNSIGNED-PAYLOAD" && !state.allow_unsigned_payload && !is_presigned {
         audit_ctx.role_arn = role_arn_from_token;
-        audit_ctx.log(
+        return auth_failure(
+            &AuthError::MissingAuth,
+            &auth_timer,
+            &audit_ctx,
             &state,
-            res.status().as_u16(),
-            Some("AccessDenied".to_string()),
             &query_params,
         );
-        return res;
     }
-
-    let input = SigningInput {
-        method: method_str,
-        path: path_str,
-        query_string: normalized_query_string,
-        headers: normalized_headers,
-        signed_headers_list,
-        payload_hash,
-    };
 
     // 9. Verify Signature
     match dfs_common::auth::signing::verify_signature_with_key(&input, &credentials, &signing_key) {
@@ -483,14 +347,6 @@ pub async fn auth_middleware(
             res
         }
         Err(e) => {
-            let error_type = classify_auth_error(&e);
-            IAM_AUTH_REQUESTS
-                .with_label_values(&["failure", &error_type])
-                .inc();
-            IAM_AUTH_DURATION
-                .with_label_values(&["failure"])
-                .observe(auth_timer.elapsed().as_secs_f64());
-
             if let AuthError::SignatureDoesNotMatch {
                 canonical_request,
                 string_to_sign,
@@ -502,11 +358,8 @@ pub async fn auth_middleware(
                     string_to_sign
                 );
             }
-            let res = s3_error_response(e.clone());
-            let (err_code, _) = e.to_s3_error();
             audit_ctx.role_arn = role_arn_from_token;
-            audit_ctx.log(&state, res.status().as_u16(), Some(err_code), &query_params);
-            res
+            auth_failure(&e, &auth_timer, &audit_ctx, &state, &query_params)
         }
     }
 }
@@ -728,6 +581,138 @@ fn normalize_query_string(query_string_raw: &str) -> String {
         normalized_query_parts.push(format!("{}={}", k, v));
     }
     normalized_query_parts.join("&")
+}
+
+/// Record an authentication failure in metrics and return an error response with audit log.
+fn auth_failure(
+    err: &AuthError,
+    auth_timer: &Instant,
+    audit_ctx: &AuditContext,
+    state: &AppState,
+    query_params: &BTreeMap<String, String>,
+) -> Response {
+    let error_type = classify_auth_error(err);
+    IAM_AUTH_REQUESTS
+        .with_label_values(&["failure", &error_type])
+        .inc();
+    IAM_AUTH_DURATION
+        .with_label_values(&["failure"])
+        .observe(auth_timer.elapsed().as_secs_f64());
+    let res = s3_error_response(err.clone());
+    let (err_code, _) = err.to_s3_error();
+    audit_ctx.log(state, res.status().as_u16(), Some(err_code), query_params);
+    res
+}
+
+/// Resolve the secret key for signature verification.
+/// Returns (secret_key, optional_role_arn, optional_evaluation_context) on success,
+/// or an auth error response on failure.
+#[allow(clippy::result_large_err)]
+fn resolve_secret_key(
+    state: &AppState,
+    sts_token: Option<&str>,
+    credentials: &dfs_common::auth::ParsedCredentials,
+    query_params: &BTreeMap<String, String>,
+    auth_timer: &Instant,
+    audit_ctx: &mut AuditContext,
+) -> Result<(String, Option<String>, Option<EvaluationContext>), Response> {
+    if let Some(token) = sts_token {
+        let sts_mgr = match state.sts_token_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return Err(s3_error_response(AuthError::InternalError(
+                    "STS is not enabled on this server".to_string(),
+                )));
+            }
+        };
+
+        let session_data = match sts_mgr.decrypt_token(token) {
+            Ok(data) => data,
+            Err(e) => {
+                return Err(auth_failure(&e, auth_timer, audit_ctx, state, query_params));
+            }
+        };
+
+        let now = Utc::now().timestamp() as u64;
+        if session_data.expiration < now {
+            audit_ctx.role_arn = Some(session_data.role_arn.clone());
+            return Err(auth_failure(
+                &AuthError::ExpiredToken,
+                auth_timer,
+                audit_ctx,
+                state,
+                query_params,
+            ));
+        }
+
+        Ok((
+            session_data.temp_secret_key,
+            Some(session_data.role_arn),
+            Some(session_data.claims.to_policy_context()),
+        ))
+    } else {
+        match state
+            .credential_provider
+            .get_secret_key(&credentials.access_key)
+        {
+            Some(k) => Ok((k, None, None)),
+            None => {
+                let err = AuthError::InvalidAccessKey {
+                    access_key: credentials.access_key.clone(),
+                };
+                Err(auth_failure(
+                    &err,
+                    auth_timer,
+                    audit_ctx,
+                    state,
+                    query_params,
+                ))
+            }
+        }
+    }
+}
+
+/// Build the SigningInput from request headers and credentials.
+fn build_signing_input(
+    req: &Request<Body>,
+    credentials: &dfs_common::auth::ParsedCredentials,
+    method: &str,
+    path: &str,
+    normalized_query_string: String,
+) -> SigningInput {
+    let mut normalized_headers = BTreeMap::new();
+    let mut signed_headers_vec = Vec::new();
+    for name in &credentials.signed_headers {
+        let name_lower = name.to_lowercase();
+        let header_values = req.headers().get_all(&name_lower);
+        let mut vals = Vec::new();
+        for val in header_values {
+            if let Ok(s) = val.to_str() {
+                vals.push(s.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        let joined = vals.join(",");
+        normalized_headers.insert(name_lower.clone(), vec![joined]);
+        signed_headers_vec.push(name_lower);
+    }
+    signed_headers_vec.sort();
+    let signed_headers_list = signed_headers_vec.join(";");
+
+    let payload_hash = req
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "UNSIGNED-PAYLOAD".to_string());
+
+    SigningInput {
+        method: method.to_string(),
+        path: path.to_string(),
+        query_string: normalized_query_string,
+        headers: normalized_headers,
+        signed_headers_list,
+        payload_hash,
+    }
 }
 
 fn presigned_is_expired(

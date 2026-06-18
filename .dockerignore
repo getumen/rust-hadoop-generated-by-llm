@@ -1,5 +1,6 @@
 target/
 .git/
+.worktrees/
 .gitignore
 *.md
 *.sh

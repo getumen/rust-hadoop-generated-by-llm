@@ -41,6 +41,7 @@ pub static AUDIT_LOG_FLUSH_ERRORS: LazyLock<IntCounter> = LazyLock::new(|| {
 
 pub struct AuditLogger {
     tx: mpsc::Sender<AuditRecord>,
+    /// Held to keep RocksDB handle alive for the background worker task.
     #[allow(dead_code)]
     db: Arc<DB>,
 }
@@ -280,6 +281,7 @@ impl AuditLogger {
         Ok(Self { tx, db })
     }
 
+    /// Register audit-specific Prometheus metrics. Available for explicit registry setup.
     #[allow(dead_code)]
     pub fn register_metrics(registry: &Registry) -> anyhow::Result<()> {
         registry.register(Box::new(AUDIT_LOG_TOTAL.clone()))?;
@@ -296,6 +298,7 @@ impl AuditLogger {
         }
     }
 
+    /// Direct DB access for testing and audit log queries.
     #[allow(dead_code)]
     pub fn db(&self) -> &DB {
         &self.db
