@@ -56,3 +56,7 @@ volumes:
   config-server-data-test:
   master-data-test:
   cs-test-data:
+
+secrets:
+  ca_cert:
+    file: ./ca.pem

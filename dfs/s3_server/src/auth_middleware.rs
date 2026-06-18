@@ -9,6 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use dfs_common::auth::audit::AuditRecord;
+use dfs_common::auth::bucket_policy::{BucketPolicyDocument, BucketPolicyEvaluator, PolicyResult};
 use dfs_common::auth::policy::EvaluationContext;
 use dfs_common::auth::{parse_credentials, AuthError, SigningInput};
 use std::collections::BTreeMap;
@@ -291,6 +292,46 @@ pub async fn auth_middleware(
                             &query_params,
                         );
                         return res;
+                    }
+                }
+            }
+
+            // 11. Bucket Policy Evaluation
+            // Skip for ?policy management operations to avoid circular dependency
+            let is_policy_op = query_params.contains_key("policy");
+            if !is_policy_op {
+                if let Some(bucket) = bucket_from_path(&path) {
+                    let policy_path = format!("/{bucket}/.s3_bucket_policy");
+                    if let Ok(data) = state.client.get_file_content(&policy_path).await {
+                        if let Ok(policy_doc) =
+                            serde_json::from_slice::<BucketPolicyDocument>(&data)
+                        {
+                            let (s3_action, s3_resource) = resolve_s3_action_and_resource(&req);
+                            let evaluator = BucketPolicyEvaluator::new(policy_doc);
+                            let principal_arn = role_arn_from_token.as_deref();
+                            match evaluator.evaluate(principal_arn, &s3_action, &s3_resource) {
+                                PolicyResult::ExplicitDeny => {
+                                    IAM_POLICY_EVALUATIONS
+                                        .with_label_values(&["deny", &s3_action])
+                                        .inc();
+                                    let res = s3_error_response(AuthError::MissingAuth);
+                                    audit_ctx.role_arn = role_arn_from_token;
+                                    audit_ctx.log(
+                                        &state,
+                                        res.status().as_u16(),
+                                        Some("AccessDenied".to_string()),
+                                        &query_params,
+                                    );
+                                    return res;
+                                }
+                                PolicyResult::Allow => {
+                                    IAM_POLICY_EVALUATIONS
+                                        .with_label_values(&["allow", &s3_action])
+                                        .inc();
+                                }
+                                PolicyResult::NotApplicable => {}
+                            }
+                        }
                     }
                 }
             }
@@ -775,4 +816,8 @@ fn classify_auth_error(err: &AuthError) -> String {
         AuthError::InternalError(_) => "internal_error",
     }
     .to_string()
+}
+
+fn bucket_from_path(path: &str) -> Option<&str> {
+    path.split('/').find(|s| !s.is_empty())
 }

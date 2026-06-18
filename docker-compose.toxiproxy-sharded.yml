@@ -156,3 +156,7 @@ volumes:
 networks:
   dfs-sharded-network:
     driver: bridge
+
+secrets:
+  ca_cert:
+    file: ./ca.pem
