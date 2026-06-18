@@ -96,6 +96,8 @@ pub struct InitiateMultipartUploadResult {
     pub upload_id: String,
 }
 
+/// S3 CompleteMultipartUpload request body. Deserialized from XML but parts are
+/// currently resolved from the filesystem. Retained for S3 API contract compliance.
 #[derive(Debug, Deserialize)]
 #[serde(rename = "CompleteMultipartUpload")]
 #[allow(dead_code)]
@@ -105,6 +107,7 @@ pub struct CompleteMultipartUpload {
     pub parts: Vec<Part>,
 }
 
+/// S3 Part reference in CompleteMultipartUpload request.
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Part {
@@ -174,6 +177,7 @@ pub struct Metadata {
 pub struct DeleteObjectsRequest {
     #[serde(rename = "Object")]
     pub objects: Vec<ObjectToDelete>,
+    /// S3 API field: suppress successful deletion results. Not yet implemented.
     #[serde(rename = "Quiet", default)]
     #[allow(dead_code)]
     pub quiet: bool,
@@ -183,6 +187,7 @@ pub struct DeleteObjectsRequest {
 pub struct ObjectToDelete {
     #[serde(rename = "Key")]
     pub key: String,
+    /// S3 API field: object versioning not yet implemented.
     #[serde(rename = "VersionId")]
     #[allow(dead_code)]
     pub version_id: Option<String>,

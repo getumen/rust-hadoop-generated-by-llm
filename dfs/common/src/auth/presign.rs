@@ -36,7 +36,7 @@ pub fn generate_presigned_url(params: &PresignParams<'_>) -> String {
         ("X-Amz-Expires".to_string(), params.expires_secs.to_string()),
         ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
     ];
-    query_params.sort_by(|(a, _), (b, _)| a.cmp(b));
+    query_params.sort_by_key(|(a, _)| a.clone());
 
     let canonical_query_string: String = query_params
         .iter()

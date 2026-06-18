@@ -11,6 +11,9 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+pub const MAX_GRPC_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const CHECKSUM_CHUNK_SIZE: usize = 512;
+
 /// Cached block data with metadata
 #[derive(Clone, Debug)]
 struct CachedBlock {
@@ -86,39 +89,12 @@ impl MyChunkServer {
     }
 
     async fn connect_endpoint(&self, url: &str) -> anyhow::Result<tonic::transport::Channel> {
-        let mut addr = url.to_string();
-        if self.ca_cert_path.is_some() && addr.starts_with("http://") {
-            addr = addr.replace("http://", "https://");
-        }
-        let resolved_addr = if addr.contains("://") {
-            addr.clone()
-        } else {
-            format!("http://{}", addr)
-        };
-
-        let mut endpoint = tonic::transport::Endpoint::from_shared(resolved_addr.clone())?;
-
-        if let Some(ca_path) = &self.ca_cert_path {
-            let domain = self.domain_name.clone().unwrap_or_else(|| {
-                addr.split("://")
-                    .last()
-                    .unwrap_or("")
-                    .split(':')
-                    .next()
-                    .unwrap_or("localhost")
-                    .to_string()
-            });
-            if let Ok(tls_config) = dfs_common::security::get_client_tls_config(ca_path, &domain) {
-                endpoint = endpoint
-                    .tls_config(tls_config)
-                    .expect("Failed to apply TLS config");
-            }
-        }
-
-        endpoint
-            .connect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to {}: {}", resolved_addr, e))
+        dfs_common::security::connect_endpoint(
+            url,
+            self.ca_cert_path.as_deref(),
+            self.domain_name.as_deref(),
+        )
+        .await
     }
 
     pub fn get_storage_dir(&self) -> PathBuf {
@@ -200,7 +176,7 @@ impl MyChunkServer {
 
     fn calculate_checksums(data: &[u8]) -> Vec<u32> {
         let mut checksums = Vec::new();
-        for chunk in data.chunks(512) {
+        for chunk in data.chunks(CHECKSUM_CHUNK_SIZE) {
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(chunk);
             checksums.push(hasher.finalize());
@@ -303,6 +279,65 @@ impl MyChunkServer {
             .enumerate()
         {
             if expected != actual {
+                return Err(format!("Checksum mismatch at chunk {}", i));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify checksums for a partial read by checking only the affected chunks.
+    /// `offset` and `length` define the byte range that was read from the block.
+    fn verify_partial_read(&self, block_id: &str, offset: u64, length: u64) -> Result<(), String> {
+        let meta_path = self.storage_dir.join(format!("{}.meta", block_id));
+        if !meta_path.exists() {
+            return Err("Checksum file missing".to_string());
+        }
+
+        let mut meta_file = fs::File::open(&meta_path).map_err(|e| e.to_string())?;
+        let mut meta_data = Vec::new();
+        meta_file
+            .read_to_end(&mut meta_data)
+            .map_err(|e| e.to_string())?;
+
+        let all_checksums: Vec<u32> = meta_data
+            .chunks_exact(4)
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk
+                    .try_into()
+                    .map_err(|_| "Invalid checksum size".to_string())?;
+                Ok(u32::from_be_bytes(bytes))
+            })
+            .collect::<Result<Vec<u32>, String>>()?;
+
+        let start_chunk = (offset as usize) / CHECKSUM_CHUNK_SIZE;
+        let end_chunk = ((offset + length).saturating_sub(1) as usize) / CHECKSUM_CHUNK_SIZE;
+
+        // Read the affected chunk range from the block file for verification
+        let block_path = self.storage_dir.join(block_id);
+        let mut file = fs::File::open(&block_path).map_err(|e| e.to_string())?;
+        let chunk_start_byte = start_chunk * CHECKSUM_CHUNK_SIZE;
+
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(chunk_start_byte as u64))
+            .map_err(|e| e.to_string())?;
+
+        let file_size = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+
+        for i in start_chunk..=end_chunk {
+            if i >= all_checksums.len() {
+                break;
+            }
+            let chunk_offset = i * CHECKSUM_CHUNK_SIZE;
+            let chunk_len = std::cmp::min(CHECKSUM_CHUNK_SIZE, file_size - chunk_offset);
+            let mut buf = vec![0u8; chunk_len];
+            file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&buf);
+            let actual = hasher.finalize();
+
+            if actual != all_checksums[i] {
                 return Err(format!("Checksum mismatch at chunk {}", i));
             }
         }
@@ -535,7 +570,7 @@ impl MyChunkServer {
                 };
                 let mut client =
                     crate::dfs::chunk_server_service_client::ChunkServerServiceClient::new(channel)
-                        .max_decoding_message_size(100 * 1024 * 1024);
+                        .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
                 let req = tonic::Request::new(crate::dfs::ReadBlockRequest {
                     block_id: block_id_c.clone(),
                     offset: 0,
@@ -728,7 +763,7 @@ impl ChunkServerService for MyChunkServer {
                 match self.connect_endpoint(next_server).await {
                     Ok(channel) => {
                         let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id.clone()))
-                            .max_decoding_message_size(100 * 1024 * 1024);
+                            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
                         let replicate_req = crate::dfs::ReplicateBlockRequest {
                             block_id: req.block_id.clone(),
                             data: req.data.clone(),
@@ -819,6 +854,27 @@ impl ChunkServerService for MyChunkServer {
                 }
                 Err(e) => return Err(Status::internal(format!("Failed to read block: {}", e))),
             };
+
+            // Partial read: verify only the affected checksum chunks
+            if !is_full_block_read {
+                if let Err(e) = self.verify_partial_read(
+                    &req.block_id,
+                    offset,
+                    bytes_to_read,
+                ) {
+                    tracing::warn!(
+                        "Partial read checksum verification failed for block {} (offset={}, len={}): {}",
+                        req.block_id, offset, bytes_to_read, e
+                    );
+                    // Don't fail the read for partial checksum errors,
+                    // but trigger recovery in background
+                    let server = self.clone();
+                    let block_id = req.block_id.clone();
+                    tokio::spawn(async move {
+                        let _ = server.recover_block(&block_id).await;
+                    });
+                }
+            }
 
             // Checksum verification for full-block reads (with auto-recovery)
             if is_full_block_read {
@@ -936,7 +992,7 @@ impl ChunkServerService for MyChunkServer {
                 match self.connect_endpoint(next_server).await {
                     Ok(channel) => {
                         let mut client = crate::dfs::chunk_server_service_client::ChunkServerServiceClient::with_interceptor(channel, dfs_common::telemetry::propagation_interceptor(request_id))
-                            .max_decoding_message_size(100 * 1024 * 1024);
+                            .max_decoding_message_size(MAX_GRPC_MESSAGE_SIZE);
                         let replicate_req = crate::dfs::ReplicateBlockRequest {
                             block_id: req.block_id,
                             data: req.data,
