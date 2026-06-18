@@ -62,10 +62,16 @@ impl CredentialProvider for StaticCredentialProvider {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::Mutex;
+
+    // Serialize all env-var tests to prevent races between parallel test threads.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Helper that saves current S3_ACCESS_KEY and S3_SECRET_KEY, runs `f`,
     /// then restores the previous values.
     fn with_env_vars<F: FnOnce()>(f: F) {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let prev_access = env::var("S3_ACCESS_KEY").ok();
         let prev_secret = env::var("S3_SECRET_KEY").ok();
 
