@@ -33,7 +33,7 @@ trap cleanup EXIT
 # Start cluster
 echo "🚀 Starting cluster..."
 docker compose down -v 2>/dev/null || true
-docker compose up -d --build
+docker compose up -d --no-build
 
 # Create test file
 echo "Creating test file..."

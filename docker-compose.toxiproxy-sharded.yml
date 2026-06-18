@@ -21,13 +21,15 @@ services:
 
   # Config Server
   config-server:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-config-server
     command: /app/config_server --addr 0.0.0.0:50050 --id 1 --peers "" --http-port 8080 --storage-dir /data/config-raft --advertise-addr http://toxiproxy:60150
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
-      - "50050:50050"
       - "8080:8080"
     networks:
       - dfs-sharded-network
@@ -37,13 +39,15 @@ services:
 
   # Shard 1 Master
   master1-shard1:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master1-shard1
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60151 --shard-id shard-1 --config-servers http://toxiproxy:60150 --merge-threshold-rps=-1.0
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
-      - "50051:50051"
       - "8081:8080"
     networks:
       - dfs-sharded-network
@@ -60,13 +64,15 @@ services:
 
   # Shard 2 Master
   master1-shard2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-master1-shard2
     command: /app/master --addr 0.0.0.0:50051 --id 1 --peers "" --http-port 8080 --storage-dir /data/raft --advertise-addr http://toxiproxy:60161 --shard-id shard-2 --config-servers http://toxiproxy:60150 --merge-threshold-rps=-1.0
     environment:
       - RUST_LOG=info,dfs_metaserver::simple_raft=warn
     ports:
-      - "50061:50051"
       - "8091:8080"
     networks:
       - dfs-sharded-network
@@ -83,11 +89,12 @@ services:
 
   # ChunkServer for Shard 1
   chunkserver1-shard1:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver1-shard1
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs1 --advertise-addr http://toxiproxy:60152
-    ports:
-      - "50052:50052"
     networks:
       - dfs-sharded-network
     depends_on:
@@ -102,11 +109,12 @@ services:
 
   # Extra services maintained for compatibility but not primary test targets
   chunkserver-extra:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-extra
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs-extra --advertise-addr dfs-chunkserver-extra:50052
-    ports:
-      - "50072:50052"
     networks:
       - dfs-sharded-network
     depends_on:
@@ -119,11 +127,12 @@ services:
     mem_limit: 256m
 
   chunkserver-extra2:
-    build: .
+    build:
+      context: .
+      secrets:
+        - ca_cert
     container_name: dfs-chunkserver-extra2
     command: /app/chunkserver --addr 0.0.0.0:50052 --config-servers http://toxiproxy:60150 --storage-dir /data/cs-extra2 --advertise-addr dfs-chunkserver-extra2:50052
-    ports:
-      - "50082:50052"
     networks:
       - dfs-sharded-network
     depends_on:

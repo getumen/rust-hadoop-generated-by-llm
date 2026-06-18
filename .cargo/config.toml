@@ -1,0 +1,5 @@
+[build]
+rustc-wrapper = "sccache"
+
+[net]
+retry = 3

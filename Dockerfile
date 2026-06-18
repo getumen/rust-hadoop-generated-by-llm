@@ -8,11 +8,28 @@ RUN apt-get update && apt-get install -y \
     clang \
     libclang-dev \
     build-essential \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install corporate CA certificates (for SSL-intercepting proxies)
-COPY corporate-ca.pem /usr/local/share/ca-certificates/corporate.crt
-RUN update-ca-certificates
+# Trust a custom CA cert if provided via BuildKit secret (e.g. corporate SSL proxy).
+# Usage: place cert at ./ca.pem (gitignored), then run docker compose up --build.
+RUN --mount=type=secret,id=ca_cert \
+    if [ -f /run/secrets/ca_cert ] && [ -s /run/secrets/ca_cert ]; then \
+        cp /run/secrets/ca_cert /usr/local/share/ca-certificates/ca.crt && \
+        update-ca-certificates; \
+    fi
+
+
+# Install sccache for faster incremental builds
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then SCCACHE_ARCH="aarch64-unknown-linux-musl"; else SCCACHE_ARCH="x86_64-unknown-linux-musl"; fi && \
+    curl -L "https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-${SCCACHE_ARCH}.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin "sccache-v0.9.1-${SCCACHE_ARCH}/sccache" && \
+    chmod +x /usr/local/bin/sccache
+
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/sccache
+# Allow cargo to work behind SSL-inspecting corporate proxies
 
 # Optimize build by caching dependencies
 COPY Cargo.toml Cargo.lock ./
@@ -21,11 +38,13 @@ COPY Cargo.toml Cargo.lock ./
 # COPY dfs/common/Cargo.toml dfs/common/Cargo.toml
 # ... (omitted for brevity, will copy all first)
 
-# Copy the entire project
+# Copy the entire project and build
+# External dependencies are downloaded via internet (CA cert installed above for corporate proxies)
+# The cargo registry cache speeds up rebuilds when only source code changes
 COPY . .
-
-# Build the project with optimizations
-RUN cargo build --release && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/sccache \
+    cargo build --release --locked && \
     strip target/release/master && \
     strip target/release/chunkserver && \
     strip target/release/config_server && \

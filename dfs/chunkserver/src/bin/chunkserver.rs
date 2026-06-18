@@ -42,6 +42,10 @@ struct Args {
     #[arg(short, long, default_value = "/tmp/chunkserver_data")]
     storage_dir: PathBuf,
 
+    /// Cold storage directory (HDD tier). If not set, tiering is disabled.
+    #[arg(long)]
+    cold_storage_dir: Option<PathBuf>,
+
     /// Address to advertise to master (defaults to addr if not specified)
     #[arg(long)]
     advertise_addr: Option<String>,
@@ -60,6 +64,11 @@ struct Args {
 
     #[arg(long)]
     domain_name: Option<String>,
+
+    /// Rack identifier for rack-aware replica placement.
+    /// Defaults to empty string (rack unknown).
+    #[arg(long, default_value = "")]
+    rack_id: String,
 }
 
 #[tokio::main]
@@ -79,7 +88,8 @@ async fn main() -> anyhow::Result<()> {
 
     let storage_dir = args.storage_dir.clone(); // Define storage_dir here
     let chunk_server = MyChunkServer::new(
-        storage_dir.clone(),         // Pass storage_dir
+        storage_dir.clone(), // Pass storage_dir
+        args.cold_storage_dir.clone(),
         args.config_servers.clone(), // Use config_servers as it's defined in Args
         args.ca_cert.clone(),
         args.domain_name.clone(),
@@ -173,6 +183,15 @@ async fn main() -> anyhow::Result<()> {
                 shard_map.get_all_masters()
             };
 
+            // Drain any bad blocks detected by the scrubber
+            let bad_blocks = {
+                let mut pending = chunk_server_heartbeat
+                    .pending_bad_blocks
+                    .lock()
+                    .expect("Mutex poisoned");
+                std::mem::take(&mut *pending)
+            };
+
             for master_addr in masters {
                 let mut master_url = master_addr.clone();
                 if args.ca_cert.is_some() && !master_url.starts_with("https://") {
@@ -227,24 +246,82 @@ async fn main() -> anyhow::Result<()> {
                             used_space,
                             available_space,
                             chunk_count,
+                            bad_blocks: bad_blocks.clone(),
+                            rack_id: args.rack_id.clone(),
                         });
 
                         match client.heartbeat(request).await {
                             Ok(response) => {
                                 tracing::debug!("Heartbeat successful to {}", master_url);
                                 let resp = response.into_inner();
+                                use dfs_chunkserver::dfs::chunk_server_command::CommandType;
                                 for command in resp.commands {
-                                    if command.r#type == 1 {
-                                        // REPLICATE
-                                        let chunk_server_clone = chunk_server_heartbeat.clone();
-                                        let block_id = command.block_id.clone();
-                                        let target = command.target_chunk_server_address.clone();
+                                    match CommandType::try_from(command.r#type) {
+                                        Ok(CommandType::Replicate) => {
+                                            let chunk_server_clone = chunk_server_heartbeat.clone();
+                                            let block_id = command.block_id.clone();
+                                            let target =
+                                                command.target_chunk_server_address.clone();
 
-                                        tokio::spawn(async move {
-                                            let _ = chunk_server_clone
-                                                .initiate_replication(&block_id, &target)
-                                                .await;
-                                        });
+                                            tokio::spawn(async move {
+                                                let _ = chunk_server_clone
+                                                    .initiate_replication(&block_id, &target)
+                                                    .await;
+                                            });
+                                        }
+                                        Ok(CommandType::ReconstructEcShard) => {
+                                            let chunk_server_clone = chunk_server_heartbeat.clone();
+                                            let block_id = command.block_id.clone();
+                                            let shard_index = command.shard_index as usize;
+                                            let data_shards = command.ec_data_shards as usize;
+                                            let parity_shards = command.ec_parity_shards as usize;
+                                            let sources = command.ec_shard_sources.clone();
+
+                                            tokio::spawn(async move {
+                                                if let Err(e) = chunk_server_clone
+                                                    .reconstruct_ec_shard(
+                                                        block_id.clone(),
+                                                        shard_index,
+                                                        data_shards,
+                                                        parity_shards,
+                                                        sources,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::error!(
+                                                        "EC reconstruct failed for block {} shard {}: {}",
+                                                        block_id,
+                                                        shard_index,
+                                                        e
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        Ok(CommandType::MoveToCold) => {
+                                            let server_clone = chunk_server_heartbeat.clone();
+                                            let block_id = command.block_id.clone();
+                                            tokio::spawn(async move {
+                                                match server_clone
+                                                    .move_block_to_cold(&block_id)
+                                                    .await
+                                                {
+                                                    Ok(()) => tracing::info!(
+                                                        "Moved block {} to cold tier",
+                                                        block_id
+                                                    ),
+                                                    Err(e) => tracing::warn!(
+                                                        "Failed to move block {} to cold: {}",
+                                                        block_id,
+                                                        e
+                                                    ),
+                                                }
+                                            });
+                                        }
+                                        Ok(CommandType::Unknown)
+                                        | Ok(CommandType::Delete)
+                                        | Err(_) => {
+                                            // No-op for unhandled command types
+                                        }
                                     }
                                 }
                             }

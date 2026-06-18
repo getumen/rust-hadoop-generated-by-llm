@@ -51,5 +51,6 @@ pub mod telemetry {
 }
 
 pub mod auth;
+pub mod erasure;
 pub mod security;
 pub mod sharding;

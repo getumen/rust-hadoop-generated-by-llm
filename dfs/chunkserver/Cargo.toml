@@ -24,6 +24,8 @@ bytes = "1.0"
 fs2 = "0.4"
 
 crc32fast = "1.5"
+reed-solomon-erasure = "6.0"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 # Removed tonic-prost
 uuid = { version = "1.11", features = ["v4"] }
 rustls = { version = "0.23", features = ["ring"] }
@@ -41,3 +43,8 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3.23"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "io_bench"
+harness = false

@@ -53,12 +53,12 @@ S3互換サービスとしての信頼確保。
     - [x] Clientでの書き込み時チェックサム計算、Metaserverへの保存。
     - [x] ChunkServerでの読み取り時・バックグラウンドでの整合性検証。
     - [x] S3互換の MPU ETag 合成ロジックとネイティブメタデータの永続化。
-- [ ] **Background Healer (Auto-Repair)**
-    - [ ] レプリカ数が不足している、またはチェックサムが不一致なブロックを抽出するスキャナー。
-    - [ ] Metaserverによる不足レプリカの自動再配置命令の送出。
-- [ ] **Backup & Recovery**
-    - [ ] Raftログを外部ストレージに退避するアーカイブスレッド。
-    - [ ] State MachineのスナップショットをS3形式で外部へ定期アップロード。
+- [x] **Background Healer (Auto-Repair)** ✅
+    - [x] レプリカ数が不足している、またはチェックサムが不一致なブロックを抽出するスキャナー。
+    - [x] Metaserverによる不足レプリカの自動再配置命令の送出。
+- [x] **Backup & Recovery** ✅
+    - [x] Raftログを外部ストレージに退避するアーカイブスレッド。
+    - [x] State MachineのスナップショットをS3形式で外部へ定期アップロード。
 
 ---
 
@@ -66,22 +66,21 @@ S3互換サービスとしての信頼確保。
 性能向上と並行して、リソース使用効率（Bytes per Dollar）を最大化する項目です。
 
 ### 3. Core Protocol & Availability (近代化)
-- [ ] **Raft Optimizations (Batching & Pipelining)**
-    - [ ] `simple_raft.rs` の `AppendEntries` をバッチ化し、1回のDisk I/Oで複数ログを処理。
-    - [ ] コミット応答を待たずに次のログを先行送信するパイプライニングの実装。
-- [ ] **Rack Awareness**
-    - [ ] ChunkServer登録時にラックID（例: `/rack-1/host-1`）をメタデータに追加。
-    - [ ] レプリカ配置時に「少なくとも1つは別ラック」とするプレイスメント・ポリシーの実装。
-- [ ] **Hedged Reads (Tail Latency Mitigation)**
-    - [ ] 1次リクエストの応答が一定時間（例: p95レイテンシ (ms)）来ない場合、別レプリカに投げる並行リクエスト管理。
-    - [ ] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
+- [x] **Raft Optimizations (Batching & Pipelining)** ✅
+    - [x] `simple_raft.rs` の `AppendEntries` をバッチ化し、1回のDisk I/Oで複数ログを処理。
+    - [x] コミット応答を待たずに次のログを先行送信するパイプライニングの実装。
+- [x] **Rack Awareness (Tier 2)** ✅
+    - [x] ChunkServerのラック情報をMasterに登録し、ブロックレプリカが異なるラックに配置されるよう `AllocateBlock` を修正。
+- [x] **Hedged Reads (Tail Latency Mitigation)** ✅
+    - [x] 1次リクエストの応答が一定時間（例: p95レイテンシ (ms)）来ない場合、別レプリカに投げる並行リクエスト管理。
+    - [x] 最速のレスポンスをクライアントに返し、遅い方のリクエストをキャンセルするロジック。
 
 ### 4. Throughput & Storage Excellence
-- [ ] **io_uring / Zero-Copy Data Path**
-    - [ ] `tokio-uring` 等を用いたChunkServerの非同期ファイルI/Oの高速化。
-    - [ ] `sendfile` や registered buffer を活用し、カーネル/ユーザ空間のメモリコピーを排除。
-- [ ] **Intelligent Storage Tiering**
-    - [ ] アクセス統計をベースに「冷えたデータ」をHDD層へ自動移行するバックグラウンドプロセス。
+- [x] **io_uring / Zero-Copy Data Path** ✅
+    - [x] `tokio-uring` を用いたChunkServerの非同期ファイルI/Oの高速化（`write_block_async` / `read_block_async`）。
+    - [x] `read_at` による seek syscall 排除（オフセット付きSQEでカーネル往復を削減）。
+- [x] **Intelligent Storage Tiering** ✅
+    - [x] アクセス統計をベースに「冷えたデータ」をHDD層へ自動移行するバックグラウンドプロセス。
     - [ ] メタデータの構造最適化（SeaweedFS方式など）によるメモリ占有率の削減。
 
 ---
@@ -91,8 +90,8 @@ S3互換サービスとしての信頼確保。
 
 ### 5. Advanced S3 Compatibility
 - [ ] **Object Versioning**: `filename?versionId=...` 形式の履歴管理と削除マーカーの実装。
-- [ ] **Server-Side Encryption (SSE)**: AES-256を用いた保管時暗号化の実装。 *(前提: IAM ポリシー評価の `Condition` キーで暗号化制御を行うため IAM が完了していること)*
-- [ ] **Pre-signed URLs**: 短期間有効な署名付きURLの生成と検証。 *(前提: IAM & STS が完了していること)*
+- [x] **Server-Side Encryption (SSE)** ✅: AES-256-GCM エンベロープ暗号化による保管時暗号化の実装。データキーをマスターキーで暗号化するエンベロープ方式を採用。 *(前提: IAM ポリシー評価の `Condition` キーで暗号化制御を行うため IAM が完了していること)*
+- [x] **Pre-signed URLs** ✅: 短期間有効な署名付きURLの生成と検証。 *(前提: IAM & STS が完了していること)*
 - [ ] **Bucket Policy**: バケット単位のリソースベースポリシー（`GET/PUT/DELETE /{bucket}?policy`）。 *(前提: IAM ポリシー評価エンジンが完了していること)*
 - [ ] **Virtual-Host Style Routing**: ホスト名ベースのバケット特定とリクエスト正規化。
 - [ ] **Strict Path Normalization**: S3独自のSigV4向けURIエンコード・正規化ルール（RFC 3986をベースにした「S3フレーバー」）への準拠。
@@ -111,7 +110,7 @@ S3互換サービスとしての信頼確保。
 - [ ] **Object Locking (WORM)**: 削除・変更を物理的に禁止する保存期間（Retention）管理。 *(推奨: IAM ポリシー評価エンジンが先に完了していること)*
 - [ ] **Lifecycle Policies**: 日数経過に応じた自動削除・階層移動のポリシー実行。 *(前提: IAM 権限による設定操作の制御が必要)*
 - [ ] **Cross-Cluster Replication**: クラスタ間を跨いだ非同期レプリケーション。
-- [ ] **Erasure Coding (RS(6,3))**: 3xレプリカから高効率なECへ、バックグラウンドでの変換。
+- [x] **Erasure Coding (RS(6,3))** ✅ — automatic background conversion via storage tiering scanner
 
 ---
 

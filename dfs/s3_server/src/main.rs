@@ -8,7 +8,9 @@ mod s3_types;
 mod state;
 mod sts_handler;
 
-use crate::state::{AppState as S3AppState, OidcValidator, PolicyEvaluator, StsTokenManager};
+use crate::state::{
+    AppState as S3AppState, OidcValidator, PolicyEvaluator, SseManager, StsTokenManager,
+};
 use axum::{
     http::StatusCode,
     middleware,
@@ -40,6 +42,13 @@ impl IntoResponse for InternalError {
     fn into_response(self) -> Response {
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     }
+}
+
+fn parse_sse_master_key(hex_str: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str)?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("SSE_MASTER_KEY must be 32 bytes (64 hex chars)"))
 }
 
 #[tokio::main]
@@ -203,6 +212,19 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let sse_manager = std::env::var("SSE_MASTER_KEY").ok().and_then(|hex_str| {
+        match parse_sse_master_key(&hex_str) {
+            Ok(kek) => {
+                tracing::info!("SSE-S3 enabled");
+                Some(Arc::new(SseManager::new(kek)))
+            }
+            Err(e) => {
+                tracing::error!("Invalid SSE_MASTER_KEY: {}", e);
+                None
+            }
+        }
+    });
+
     let state = S3AppState {
         client,
         auth_enabled,
@@ -215,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         sts_token_manager,
         policy_evaluator,
         audit_logger,
+        sse_manager,
     };
 
     let authed_routes = Router::new()
@@ -311,4 +334,21 @@ async fn handle_metrics() -> Result<String, InternalError> {
         tracing::error!("Failed to convert metrics buffer to string: {}", e);
         InternalError
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_sse_master_key_valid() {
+        let hex = "0".repeat(64);
+        let kek = parse_sse_master_key(&hex).unwrap();
+        assert_eq!(kek, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_parse_sse_master_key_too_short() {
+        assert!(parse_sse_master_key("deadbeef").is_err());
+    }
 }

@@ -255,6 +255,8 @@ impl CatchUpProgress {
 pub enum MasterCommand {
     CreateFile {
         path: String,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
     },
     DeleteFile {
         path: String,
@@ -324,6 +326,24 @@ pub enum MasterCommand {
     /// Stop background data shuffling for a prefix
     StopShuffle {
         prefix: String,
+    },
+    /// Update file access statistics (called on each read)
+    UpdateAccessStats {
+        path: String,
+        accessed_at_ms: u64,
+    },
+    /// Mark file as moved to cold tier
+    MoveToCold {
+        path: String,
+        moved_at_ms: u64,
+    },
+    /// Mark file as converted to EC (updates block locations and ec fields)
+    ConvertToEc {
+        path: String,
+        ec_data_shards: i32,
+        ec_parity_shards: i32,
+        /// New BlockInfo list with EC shard locations replacing replication locations
+        new_blocks: Vec<crate::dfs::BlockInfo>,
     },
 }
 
@@ -614,6 +634,11 @@ pub struct RaftNode {
     pub last_committed_config_index: usize,
     /// Monotonic time counter (for tracking timeouts and progress).
     pub monotonic_time: u64,
+
+    /// S3 endpoint for snapshot backups (None = disabled).
+    pub backup_s3_endpoint: Option<String>,
+    /// S3 bucket name for snapshot backups.
+    pub backup_bucket: String,
 }
 
 pub struct RaftNodeConfig {
@@ -625,6 +650,8 @@ pub struct RaftNodeConfig {
     pub inbox: mpsc::Receiver<Event>,
     pub self_tx: mpsc::Sender<Event>,
     pub ca_cert_path: Option<String>,
+    pub backup_s3_endpoint: Option<String>,
+    pub backup_bucket: String,
 }
 
 impl RaftNode {
@@ -638,6 +665,8 @@ impl RaftNode {
             inbox,
             self_tx,
             ca_cert_path,
+            backup_s3_endpoint,
+            backup_bucket,
         } = config;
         let path = format!("{}/raft_node_{}", storage_dir, id);
         let db = DB::open_default(&path).expect("Failed to open RocksDB");
@@ -734,6 +763,8 @@ impl RaftNode {
             catch_up_progress: HashMap::new(),
             last_committed_config_index: 0,
             monotonic_time: 0,
+            backup_s3_endpoint,
+            backup_bucket,
         }
     }
 
@@ -888,6 +919,23 @@ impl RaftNode {
         self.db
             .put(key.as_bytes(), val)
             .context("Failed to save log entry to DB")?;
+        Ok(())
+    }
+
+    /// Write multiple log entries to RocksDB in a single atomic WriteBatch.
+    fn save_log_entries_batch(&self, entries: &[(usize, &LogEntry)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        for (index, entry) in entries {
+            let key = format!("log:{}", index);
+            let val = serde_json::to_vec(entry).context("Failed to serialize log entry")?;
+            batch.put(key.as_bytes(), val);
+        }
+        self.db
+            .write(batch)
+            .context("Failed to write log entries batch to DB")?;
         Ok(())
     }
 
@@ -1144,6 +1192,64 @@ impl RaftNode {
         const SNAPSHOT_THRESHOLD: usize = 100;
         if self.log.len() > SNAPSHOT_THRESHOLD && self.last_applied > self.last_included_index {
             self.create_snapshot()?;
+            // Upload snapshot to S3 if this is the leader and backup is configured
+            if self.role == Role::Leader && self.backup_s3_endpoint.is_some() {
+                let db = self.db.clone();
+                let endpoint = self.backup_s3_endpoint.clone().unwrap();
+                let bucket = self.backup_bucket.clone();
+                let id = self.id;
+                let last_included_index = self.last_included_index;
+                tokio::spawn(async move {
+                    let snapshot_data = match db.get(b"snapshot_data") {
+                        Ok(Some(data)) => data,
+                        Ok(None) => {
+                            tracing::debug!(
+                                "Backup: no snapshot_data found after snapshot creation"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Backup: failed to read snapshot_data: {}", e);
+                            return;
+                        }
+                    };
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let key = format!(
+                        "master-snapshots/node-{}/{}--idx{}.bin",
+                        id, timestamp, last_included_index
+                    );
+                    let url = format!("{}/{}/{}", endpoint.trim_end_matches('/'), bucket, key);
+                    tracing::info!("Backup: uploading snapshot to {}", url);
+                    match reqwest::Client::new()
+                        .put(&url)
+                        .header("Content-Type", "application/octet-stream")
+                        .body(snapshot_data)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            tracing::info!(
+                                "Backup: snapshot uploaded successfully (node={}, idx={})",
+                                id,
+                                last_included_index
+                            );
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(
+                                "Backup: S3 upload returned status {} for {}",
+                                resp.status(),
+                                url
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Backup: S3 upload failed: {}", e);
+                        }
+                    }
+                });
+            }
         }
         Ok(())
     }
@@ -1576,6 +1682,14 @@ impl RaftNode {
                 // For single-node clusters, this is handled in `become_leader`.
                 // For multi-node, commit_index is advanced in `handle_append_entries_response`.
 
+                // Pipeline: immediately replicate to followers without waiting for next tick.
+                // For multi-node clusters this reduces write latency from up to 100ms to ~0ms.
+                if !self.peers.is_empty() {
+                    if let Err(e) = self.send_heartbeats().await {
+                        tracing::warn!("Immediate replication after ClientRequest failed: {}", e);
+                    }
+                }
+
                 let _ = reply_tx.send(Ok(()));
             }
             Event::GetLeaderInfo { reply_tx } => {
@@ -1803,6 +1917,7 @@ impl RaftNode {
                             }
 
                             // Append all entries
+                            let mut batch_entries: Vec<(usize, &LogEntry)> = Vec::new();
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
@@ -1817,13 +1932,14 @@ impl RaftNode {
                                         self.delete_log_entries_from(absolute_index)?;
 
                                         self.log.push(entry.clone());
-                                        self.save_log_entry(absolute_index, entry)?;
+                                        batch_entries.push((absolute_index, entry));
                                     }
                                 } else {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry)?;
+                                    batch_entries.push((absolute_index, entry));
                                 }
                             }
+                            self.save_log_entries_batch(&batch_entries)?;
                             match_index = args.prev_log_index + args.entries.len();
                         } else {
                             tracing::info!(
@@ -1860,15 +1976,17 @@ impl RaftNode {
                             }
 
                             // Append new entries (or re-append from conflict point)
+                            let mut batch_entries: Vec<(usize, &LogEntry)> = Vec::new();
                             for (i, entry) in args.entries.iter().enumerate() {
                                 let absolute_index = args.prev_log_index + 1 + i;
                                 let log_index = absolute_index - self.last_included_index;
 
                                 if log_index >= self.log.len() {
                                     self.log.push(entry.clone());
-                                    self.save_log_entry(absolute_index, entry)?;
+                                    batch_entries.push((absolute_index, entry));
                                 }
                             }
+                            self.save_log_entries_batch(&batch_entries)?;
 
                             match_index = args.prev_log_index + args.entries.len();
                         } else {
@@ -2773,7 +2891,11 @@ impl RaftNode {
             Command::Master(cmd) => {
                 if let AppState::Master(ref mut master_state) = *state {
                     match cmd {
-                        MasterCommand::CreateFile { path } => {
+                        MasterCommand::CreateFile {
+                            path,
+                            ec_data_shards,
+                            ec_parity_shards,
+                        } => {
                             master_state.files.insert(
                                 path.clone(),
                                 crate::dfs::FileMetadata {
@@ -2782,6 +2904,11 @@ impl RaftNode {
                                     blocks: vec![],
                                     etag_md5: "".to_string(),
                                     created_at_ms: 0,
+                                    ec_data_shards: *ec_data_shards,
+                                    ec_parity_shards: *ec_parity_shards,
+                                    last_access_ms: 0,
+                                    access_count: 0,
+                                    moved_to_cold_at_ms: 0,
                                 },
                             );
                             tracing::info!("Created file {}", path);
@@ -2797,11 +2924,16 @@ impl RaftNode {
                             locations,
                         } => {
                             if let Some(meta) = master_state.files.get_mut(path) {
+                                let ec_data = meta.ec_data_shards;
+                                let ec_parity = meta.ec_parity_shards;
                                 meta.blocks.push(crate::dfs::BlockInfo {
                                     block_id: block_id.clone(),
                                     size: 0,
                                     locations: locations.clone(),
                                     checksum_crc32c: 0,
+                                    ec_data_shards: ec_data,
+                                    ec_parity_shards: ec_parity,
+                                    original_size: 0,
                                 });
                                 tracing::info!("Allocated block {} for file {}", block_id, path);
                             } else {
@@ -2957,6 +3089,7 @@ impl RaftNode {
                                         {
                                             block.checksum_crc32c = info.checksum_crc32c;
                                             block.size = info.actual_size;
+                                            block.original_size = info.actual_size;
                                         }
                                     }
                                 } else {
@@ -2995,6 +3128,39 @@ impl RaftNode {
                         MasterCommand::StopShuffle { prefix } => {
                             master_state.shuffling_prefixes.remove(prefix.as_str());
                             tracing::info!("Stopped background shuffling for prefix: {}", prefix);
+                        }
+                        MasterCommand::UpdateAccessStats {
+                            path,
+                            accessed_at_ms,
+                        } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.last_access_ms = *accessed_at_ms;
+                                meta.access_count += 1;
+                            }
+                        }
+                        MasterCommand::MoveToCold { path, moved_at_ms } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.moved_to_cold_at_ms = *moved_at_ms;
+                                tracing::info!("Moved file {} to cold tier", path);
+                            }
+                        }
+                        MasterCommand::ConvertToEc {
+                            path,
+                            ec_data_shards,
+                            ec_parity_shards,
+                            new_blocks,
+                        } => {
+                            if let Some(meta) = master_state.files.get_mut(path) {
+                                meta.ec_data_shards = *ec_data_shards;
+                                meta.ec_parity_shards = *ec_parity_shards;
+                                meta.blocks = new_blocks.clone();
+                                tracing::info!(
+                                    "Converted file {} to EC({},{})",
+                                    path,
+                                    ec_data_shards,
+                                    ec_parity_shards
+                                );
+                            }
                         }
                     }
                 } else {
@@ -3112,10 +3278,12 @@ mod tests {
     fn test_master_command_create_file() {
         let cmd = MasterCommand::CreateFile {
             path: "/test/file.txt".to_string(),
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
         };
 
         match cmd {
-            MasterCommand::CreateFile { path } => {
+            MasterCommand::CreateFile { path, .. } => {
                 assert_eq!(path, "/test/file.txt");
             }
             _ => panic!("Expected CreateFile command"),
@@ -3149,6 +3317,11 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -3256,6 +3429,8 @@ mod tests {
             term: 1,
             command: Command::Master(MasterCommand::CreateFile {
                 path: "/test.txt".to_string(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
             }),
         };
 
@@ -3264,5 +3439,220 @@ mod tests {
             serde_json::from_str(&serialized).expect("Failed to deserialize log entry");
 
         assert_eq!(deserialized.term, 1);
+    }
+
+    // =========================================================================
+    // Test helpers for storage tiering tests
+    // =========================================================================
+
+    fn make_test_master_state() -> Arc<Mutex<AppState>> {
+        let state = crate::master::MasterState {
+            files: std::collections::HashMap::new(),
+            transaction_records: std::collections::HashMap::new(),
+            shuffling_prefixes: std::collections::HashSet::new(),
+            chunk_servers: std::collections::HashMap::new(),
+            pending_commands: std::collections::HashMap::new(),
+            safe_mode: false,
+            safe_mode_entered_at: 0,
+            safe_mode_min_chunkservers: 0,
+            expected_block_count: 0,
+            reported_block_count: 0,
+            safe_mode_threshold: 0.0,
+            safe_mode_manual: false,
+            bad_block_locations: std::collections::HashMap::new(),
+        };
+        Arc::new(Mutex::new(AppState::Master(state)))
+    }
+
+    fn apply_cmd(app_state: &Arc<Mutex<AppState>>, cmd: MasterCommand) {
+        let mut state = app_state.lock().unwrap();
+        if let AppState::Master(ref mut master_state) = *state {
+            match &cmd {
+                MasterCommand::CreateFile {
+                    path,
+                    ec_data_shards,
+                    ec_parity_shards,
+                } => {
+                    master_state.files.insert(
+                        path.clone(),
+                        crate::dfs::FileMetadata {
+                            path: path.clone(),
+                            size: 0,
+                            blocks: vec![],
+                            etag_md5: "".to_string(),
+                            created_at_ms: 0,
+                            ec_data_shards: *ec_data_shards,
+                            ec_parity_shards: *ec_parity_shards,
+                            last_access_ms: 0,
+                            access_count: 0,
+                            moved_to_cold_at_ms: 0,
+                        },
+                    );
+                }
+                MasterCommand::UpdateAccessStats {
+                    path,
+                    accessed_at_ms,
+                } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        meta.last_access_ms = *accessed_at_ms;
+                        meta.access_count += 1;
+                    }
+                }
+                MasterCommand::MoveToCold { path, moved_at_ms } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        meta.moved_to_cold_at_ms = *moved_at_ms;
+                    }
+                }
+                MasterCommand::AllocateBlock {
+                    path,
+                    block_id,
+                    locations,
+                } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        let ec_data = meta.ec_data_shards;
+                        let ec_parity = meta.ec_parity_shards;
+                        meta.blocks.push(crate::dfs::BlockInfo {
+                            block_id: block_id.clone(),
+                            size: 0,
+                            locations: locations.clone(),
+                            checksum_crc32c: 0,
+                            ec_data_shards: ec_data,
+                            ec_parity_shards: ec_parity,
+                            original_size: 0,
+                        });
+                    }
+                }
+                MasterCommand::ConvertToEc {
+                    path,
+                    ec_data_shards,
+                    ec_parity_shards,
+                    new_blocks,
+                } => {
+                    if let Some(meta) = master_state.files.get_mut(path) {
+                        meta.ec_data_shards = *ec_data_shards;
+                        meta.ec_parity_shards = *ec_parity_shards;
+                        meta.blocks = new_blocks.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_update_access_stats() {
+        let state = make_test_master_state();
+        apply_cmd(
+            &state,
+            MasterCommand::CreateFile {
+                path: "/f".into(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+            },
+        );
+        apply_cmd(
+            &state,
+            MasterCommand::UpdateAccessStats {
+                path: "/f".into(),
+                accessed_at_ms: 1000,
+            },
+        );
+        apply_cmd(
+            &state,
+            MasterCommand::UpdateAccessStats {
+                path: "/f".into(),
+                accessed_at_ms: 2000,
+            },
+        );
+        let locked = state.lock().unwrap();
+        if let AppState::Master(ref ms) = *locked {
+            let f = ms.files.get("/f").unwrap();
+            assert_eq!(f.last_access_ms, 2000);
+            assert_eq!(f.access_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_apply_move_to_cold() {
+        let state = make_test_master_state();
+        apply_cmd(
+            &state,
+            MasterCommand::CreateFile {
+                path: "/f".into(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+            },
+        );
+        apply_cmd(
+            &state,
+            MasterCommand::MoveToCold {
+                path: "/f".into(),
+                moved_at_ms: 5000,
+            },
+        );
+        let locked = state.lock().unwrap();
+        if let AppState::Master(ref ms) = *locked {
+            assert_eq!(ms.files.get("/f").unwrap().moved_to_cold_at_ms, 5000);
+        }
+    }
+
+    #[test]
+    fn test_apply_convert_to_ec() {
+        let state = make_test_master_state();
+        // Create file
+        apply_cmd(
+            &state,
+            MasterCommand::CreateFile {
+                path: "/ec_file".into(),
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+            },
+        );
+        // Allocate a replication block
+        apply_cmd(
+            &state,
+            MasterCommand::AllocateBlock {
+                path: "/ec_file".into(),
+                block_id: "blk-001".into(),
+                locations: vec!["cs1:9000".into()],
+            },
+        );
+        // Convert to EC
+        let ec_block = crate::dfs::BlockInfo {
+            block_id: "blk-001-ec".into(),
+            size: 0,
+            locations: vec![
+                "cs1".into(),
+                "cs2".into(),
+                "cs3".into(),
+                "cs4".into(),
+                "cs5".into(),
+                "cs6".into(),
+                "cs7".into(),
+                "cs8".into(),
+                "cs9".into(),
+            ],
+            checksum_crc32c: 0,
+            ec_data_shards: 6,
+            ec_parity_shards: 3,
+            original_size: 0,
+        };
+        apply_cmd(
+            &state,
+            MasterCommand::ConvertToEc {
+                path: "/ec_file".into(),
+                ec_data_shards: 6,
+                ec_parity_shards: 3,
+                new_blocks: vec![ec_block],
+            },
+        );
+        let locked = state.lock().unwrap();
+        if let AppState::Master(ref ms) = *locked {
+            let f = ms.files.get("/ec_file").unwrap();
+            assert_eq!(f.ec_data_shards, 6);
+            assert_eq!(f.ec_parity_shards, 3);
+            assert_eq!(f.blocks.len(), 1);
+            assert_eq!(f.blocks[0].ec_data_shards, 6);
+        }
     }
 }

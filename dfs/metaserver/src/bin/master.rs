@@ -68,6 +68,15 @@ struct Args {
 
     #[arg(long)]
     domain_name: Option<String>,
+
+    /// S3 endpoint for snapshot backups (e.g. http://dfs-s3-server:9000).
+    /// If not set, backup is disabled.
+    #[arg(long)]
+    backup_s3_endpoint: Option<String>,
+
+    /// S3 bucket name for snapshot backups.
+    #[arg(long, default_value = "dfs-backups")]
+    backup_bucket: String,
 }
 
 // Axum state for sharing the Raft channel
@@ -137,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
         inbox: raft_rx,
         self_tx: raft_tx_for_node,
         ca_cert_path: args.ca_cert.clone(),
+        backup_s3_endpoint: args.backup_s3_endpoint.clone(),
+        backup_bucket: args.backup_bucket.clone(),
     });
 
     // Start Raft Node
@@ -202,10 +213,29 @@ async fn main() -> anyhow::Result<()> {
             merge_threshold_rps: args.merge_threshold_rps,
             ca_cert_path: args.ca_cert.clone(),
             domain_name: args.domain_name.clone(),
+            cold_threshold_secs: std::env::var("COLD_THRESHOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(604800),
+            ec_threshold_secs: std::env::var("EC_THRESHOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2592000),
         },
     );
 
     tracing::info!("Master gRPC server listening on {}", addr);
+
+    // Storage tiering background scanner (60s interval)
+    let master_for_tiering = master.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            master_for_tiering.scan_tiering().await;
+            master_for_tiering.scan_ec_conversion().await;
+        }
+    });
 
     let mut server = Server::builder();
 

@@ -15,6 +15,7 @@ rustls = { version = "0.23", features = ["ring"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
+reed-solomon-erasure = "6.0"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
@@ -29,6 +30,7 @@ aes-gcm = "0.10.3"
 rand = "0.10.0"
 base64 = "0.22.1"
 regex = "1.10"
+zeroize = "1"
 
 [dev-dependencies]
 mockito = "1.5"

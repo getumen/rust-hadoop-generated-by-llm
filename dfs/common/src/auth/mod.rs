@@ -8,7 +8,9 @@ pub mod credentials;
 pub mod encoding;
 pub mod oidc;
 pub mod policy;
+pub mod presign;
 pub mod signing;
+pub mod sse;
 pub mod sts;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -48,6 +48,12 @@ enum Commands {
     Put {
         source: PathBuf,
         dest: String,
+        /// Erasure coding data shards (e.g. --ec-data 2 --ec-parity 2 for RS(2,2))
+        #[arg(long, default_value_t = 0)]
+        ec_data: i32,
+        /// Erasure coding parity shards
+        #[arg(long, default_value_t = 0)]
+        ec_parity: i32,
     },
     Get {
         source: String,
@@ -82,6 +88,20 @@ enum Commands {
     Benchmark {
         #[command(subcommand)]
         action: BenchmarkAction,
+    },
+    /// Generate a pre-signed URL for temporary access to an object
+    Presign {
+        /// S3 URL of the object (e.g. s3://bucket/key)
+        url: String,
+        /// HTTP method (GET, PUT, DELETE)
+        #[arg(long, default_value = "GET")]
+        method: String,
+        /// URL validity in seconds (max 604800 = 7 days)
+        #[arg(long, default_value_t = 3600)]
+        expires: u64,
+        /// S3 endpoint URL (overrides S3_ENDPOINT env var, default: http://localhost:9000)
+        #[arg(long)]
+        endpoint: Option<String>,
     },
 }
 
@@ -154,6 +174,21 @@ enum ClusterAction {
         /// Server ID to remove
         server_id: u32,
     },
+}
+
+fn parse_s3_url(url: &str) -> anyhow::Result<(String, String)> {
+    let path = url
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("URL must start with s3://"))?;
+    let slash = path
+        .find('/')
+        .ok_or_else(|| anyhow::anyhow!("URL must contain a key (s3://bucket/key)"))?;
+    let bucket = path[..slash].to_string();
+    let key = path[slash + 1..].to_string();
+    if bucket.is_empty() || key.is_empty() {
+        anyhow::bail!("Bucket and key must not be empty");
+    }
+    Ok((bucket, key))
 }
 
 #[tokio::main]
@@ -233,9 +268,24 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", file);
             }
         }
-        Commands::Put { source, dest } => {
-            client.create_file(&source, &dest).await?;
-            println!("File uploaded successfully with replication");
+        Commands::Put {
+            source,
+            dest,
+            ec_data,
+            ec_parity,
+        } => {
+            if ec_data > 0 && ec_parity > 0 {
+                client
+                    .create_file_ec(&source, &dest, ec_data, ec_parity)
+                    .await?;
+                println!(
+                    "File uploaded successfully with EC RS({},{})",
+                    ec_data, ec_parity
+                );
+            } else {
+                client.create_file(&source, &dest).await?;
+                println!("File uploaded successfully with replication");
+            }
         }
         Commands::Get { source, dest } => {
             client.get_file(&source, &dest).await?;
@@ -246,12 +296,29 @@ async fn main() -> anyhow::Result<()> {
             if let Some(meta) = metadata {
                 println!("File Metadata for: {}", meta.path);
                 println!("  Size: {} bytes", meta.size);
+                if meta.ec_data_shards > 0 {
+                    println!(
+                        "  Storage: EC RS({},{})",
+                        meta.ec_data_shards, meta.ec_parity_shards
+                    );
+                } else {
+                    println!("  Storage: Replicated");
+                }
                 println!("  Blocks: {}", meta.blocks.len());
                 for (i, block) in meta.blocks.iter().enumerate() {
-                    println!(
-                        "    Block {}: ID={}, Size={}, Locations={:?}",
-                        i, block.block_id, block.size, block.locations
-                    );
+                    if block.ec_data_shards > 0 {
+                        println!(
+                            "    Block {}: ID={}, Size={}, EC=RS({},{}), OriginalSize={}, Shards={:?}",
+                            i, block.block_id, block.size,
+                            block.ec_data_shards, block.ec_parity_shards,
+                            block.original_size, block.locations
+                        );
+                    } else {
+                        println!(
+                            "    Block {}: ID={}, Size={}, Locations={:?}",
+                            i, block.block_id, block.size, block.locations
+                        );
+                    }
                 }
             } else {
                 println!("File not found: {}", path);
@@ -378,6 +445,58 @@ async fn main() -> anyhow::Result<()> {
         Commands::Shuffle { prefix } => {
             client.initiate_shuffle(&prefix).await?;
             println!("Triggered background shuffling for prefix: {}", prefix);
+        }
+        Commands::Presign {
+            url,
+            method,
+            expires,
+            endpoint,
+        } => {
+            let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+                .map_err(|_| anyhow::anyhow!("AWS_ACCESS_KEY_ID environment variable not set"))?;
+            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
+                anyhow::anyhow!("AWS_SECRET_ACCESS_KEY environment variable not set")
+            })?;
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            let endpoint_url = endpoint
+                .or_else(|| std::env::var("S3_ENDPOINT").ok())
+                .unwrap_or_else(|| "http://localhost:9000".to_string());
+
+            let (bucket, key) = parse_s3_url(&url)?;
+
+            let method_upper = method.to_uppercase();
+            if !["GET", "PUT", "DELETE"].contains(&method_upper.as_str()) {
+                anyhow::bail!(
+                    "Unsupported method '{}'. Supported methods: GET, PUT, DELETE",
+                    method
+                );
+            }
+
+            if expires == 0 {
+                anyhow::bail!("--expires must be at least 1 second");
+            }
+            if expires > 604_800 {
+                anyhow::bail!(
+                    "--expires {} exceeds the maximum of 604800 seconds (7 days)",
+                    expires
+                );
+            }
+
+            let params = dfs_common::auth::presign::PresignParams {
+                endpoint: &endpoint_url,
+                bucket: &bucket,
+                key: &key,
+                method: &method_upper,
+                access_key: &access_key,
+                secret_key: &secret_key,
+                region: &region,
+                expires_secs: expires,
+            };
+
+            let presigned_url = dfs_common::auth::presign::generate_presigned_url(&params);
+            println!("{}", presigned_url);
         }
         Commands::Benchmark { action } => {
             match action {
@@ -607,6 +726,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_parse_s3_url_valid() {
+        let (bucket, key) = super::parse_s3_url("s3://mybucket/path/to/file.txt").unwrap();
+        assert_eq!(bucket, "mybucket");
+        assert_eq!(key, "path/to/file.txt");
+    }
+
+    #[test]
+    fn test_parse_s3_url_invalid_no_scheme() {
+        assert!(super::parse_s3_url("mybucket/key").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_invalid_no_key() {
+        assert!(super::parse_s3_url("s3://").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_empty_key_after_slash() {
+        assert!(super::parse_s3_url("s3://bucket/").is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_empty_bucket() {
+        // "s3:///key" has empty bucket
+        assert!(super::parse_s3_url("s3:///key").is_err());
+    }
 }
 
 fn print_stats(

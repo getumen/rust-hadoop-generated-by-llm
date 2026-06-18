@@ -7,6 +7,9 @@
 
 set -e
 
+# Change to project root
+cd "$(dirname "$0")/.."
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -103,7 +106,7 @@ echo "=============================================="
 
 # Build the project
 echo "Building project..."
-cargo build --package dfs-metaserver --release 2>&1 | grep -E "(Compiling|Finished)" || true
+cargo build --package dfs-metaserver --release 2>&1 | grep -vE "^$" || { echo -e "${RED}✗ Build failed${NC}"; exit 1; }
 
 BINARY="./target/release/master"
 

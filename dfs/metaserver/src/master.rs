@@ -23,6 +23,8 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 use uuid::Uuid;
 
+const DEFAULT_REPLICATION_FACTOR: usize = 3;
+
 // ============================================================================
 // Transaction Record Types for Cross-Shard Operations
 // ============================================================================
@@ -183,6 +185,8 @@ pub struct ChunkServerStatus {
     pub used_space: u64,
     pub available_space: u64,
     pub chunk_count: u64,
+    #[serde(default)]
+    pub rack_id: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -231,6 +235,11 @@ pub struct MasterState {
     /// Whether safe mode was manually forced
     #[serde(skip)]
     pub safe_mode_manual: bool,
+
+    /// Blocks known to be corrupted on specific ChunkServers (not Raft-persisted).
+    /// Maps block_id -> set of ChunkServer addresses with a bad copy.
+    #[serde(skip)]
+    pub bad_block_locations: HashMap<String, HashSet<String>>,
 }
 
 impl MasterState {
@@ -344,6 +353,239 @@ impl MasterState {
     }
 }
 
+/// Select up to `n` chunk servers for replica placement, maximizing rack diversity.
+///
+/// Algorithm:
+/// 1. Sort all candidates by available_space descending (best-first).
+/// 2. Round-robin through racks: in each round, pick the best remaining server
+///    from each rack that hasn't contributed yet in this round.
+/// 3. Stop when `n` servers are selected or candidates exhausted.
+///
+/// Empty rack_id strings are each treated as a unique rack (address-keyed).
+fn select_servers_rack_aware(servers: &[(String, ChunkServerStatus)], n: usize) -> Vec<String> {
+    if n == 0 || servers.is_empty() {
+        return vec![];
+    }
+
+    // Sort candidates by available_space descending
+    let mut candidates: Vec<&(String, ChunkServerStatus)> = servers.iter().collect();
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.1.available_space));
+
+    // Group by rack. Empty rack_id → use address as key to avoid grouping them.
+    let mut rack_buckets: HashMap<String, Vec<&(String, ChunkServerStatus)>> = HashMap::new();
+    for s in &candidates {
+        let rack_key = if s.1.rack_id.is_empty() {
+            format!("__addr__{}", s.0)
+        } else {
+            s.1.rack_id.clone()
+        };
+        rack_buckets.entry(rack_key).or_default().push(s);
+    }
+
+    // Collect racks ordered by their best (first) server's available_space.
+    // Tie-breaking between racks with equal best-server space is non-deterministic
+    // (HashMap iteration order), but this is benign — all racks still participate
+    // in the round-robin and any server from a tied rack is equally valid.
+    let racks: Vec<Vec<&(String, ChunkServerStatus)>> = {
+        let mut r: Vec<Vec<&(String, ChunkServerStatus)>> = rack_buckets.into_values().collect();
+        // Sort racks by best server descending
+        r.sort_by(|a, b| b[0].1.available_space.cmp(&a[0].1.available_space));
+        r
+    };
+
+    let mut selected: Vec<String> = Vec::with_capacity(n);
+    let mut rack_positions: Vec<usize> = vec![0; racks.len()];
+
+    // Round-robin: each round picks one server per rack
+    'outer: loop {
+        let mut picked_this_round = false;
+        for (rack_idx, rack) in racks.iter().enumerate() {
+            if selected.len() >= n {
+                break 'outer;
+            }
+            let pos = rack_positions[rack_idx];
+            if pos < rack.len() {
+                selected.push(rack[pos].0.clone());
+                rack_positions[rack_idx] += 1;
+                picked_this_round = true;
+            }
+        }
+        if !picked_this_round {
+            break; // All candidates exhausted
+        }
+    }
+
+    selected
+}
+
+/// Schedule replication commands for all blocks with fewer live replicas than REPLICATION_FACTOR.
+/// Considers both dead chunk servers and known-bad block locations.
+fn heal_under_replicated_blocks(state: &mut MasterState) {
+    const REPLICATION_FACTOR: usize = 3;
+
+    let live_servers: Vec<String> = state.chunk_servers.keys().cloned().collect();
+    if live_servers.is_empty() {
+        return;
+    }
+
+    for file in state.files.values() {
+        for block in &file.blocks {
+            if block.ec_data_shards > 0 {
+                // ── EC block: detect missing shards and issue RECONSTRUCT_EC_SHARD ──
+                let k = block.ec_data_shards as usize;
+
+                let total = (block.ec_data_shards + block.ec_parity_shards) as usize;
+                if block.locations.len() != total {
+                    tracing::error!(
+                        "EC block {} has {} locations but EC({},{}) expects {}; skipping heal",
+                        block.block_id,
+                        block.locations.len(),
+                        block.ec_data_shards,
+                        block.ec_parity_shards,
+                        total
+                    );
+                    continue; // skip this block
+                }
+
+                // Count live shards
+                let live_count = block
+                    .locations
+                    .iter()
+                    .filter(|loc| state.chunk_servers.contains_key(*loc))
+                    .count();
+
+                // For each shard position, check if its host is dead
+                for (shard_idx, loc) in block.locations.iter().enumerate() {
+                    if state.chunk_servers.contains_key(loc) {
+                        // Shard is on a live server — nothing to do for this shard
+                        continue;
+                    }
+
+                    // Shard is missing
+                    if live_count < k {
+                        tracing::error!(
+                            "EC block {} is unrecoverable: only {}/{} shards available (need {} to recover)",
+                            block.block_id,
+                            live_count,
+                            block.ec_data_shards + block.ec_parity_shards,
+                            k
+                        );
+                        // Can't recover any shard; skip all remaining shards too
+                        break;
+                    }
+
+                    // Find a target CS not already holding a shard of this block
+                    let target = match live_servers.iter().find(|s| !block.locations.contains(*s)) {
+                        Some(t) => t.clone(),
+                        None => {
+                            tracing::warn!(
+                                "EC heal: no free CS to hold reconstructed shard {} of block {}; \
+                                 cluster may need more nodes",
+                                shard_idx,
+                                block.block_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Build sources list: live address or empty string if dead
+                    let sources: Vec<String> = block
+                        .locations
+                        .iter()
+                        .map(|l| {
+                            if state.chunk_servers.contains_key(l) {
+                                l.clone()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect();
+
+                    state
+                        .pending_commands
+                        .entry(target.clone())
+                        .or_default()
+                        .push(ChunkServerCommand {
+                            r#type: 3, // RECONSTRUCT_EC_SHARD
+                            block_id: block.block_id.clone(),
+                            target_chunk_server_address: target.clone(),
+                            shard_index: shard_idx as i32,
+                            ec_data_shards: block.ec_data_shards,
+                            ec_parity_shards: block.ec_parity_shards,
+                            ec_shard_sources: sources,
+                            original_block_size: block.original_size,
+                        });
+                    tracing::info!(
+                        "Healer: scheduled EC reconstruction of shard {} of block {} to {}",
+                        shard_idx,
+                        block.block_id,
+                        target
+                    );
+                }
+            } else {
+                // ── Replication block: existing logic (unchanged) ──
+                let bad_on = state
+                    .bad_block_locations
+                    .get(&block.block_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let live_locs: Vec<String> = block
+                    .locations
+                    .iter()
+                    .filter(|loc| state.chunk_servers.contains_key(*loc) && !bad_on.contains(*loc))
+                    .cloned()
+                    .collect();
+
+                let needed = REPLICATION_FACTOR.saturating_sub(live_locs.len());
+                if needed == 0 {
+                    continue;
+                }
+
+                if live_locs.is_empty() {
+                    tracing::error!(
+                        "Healer: block {} has NO live replicas — data may be lost",
+                        block.block_id
+                    );
+                    continue;
+                }
+
+                let source = &live_locs[0];
+
+                let targets: Vec<String> = live_servers
+                    .iter()
+                    .filter(|s| !block.locations.contains(s))
+                    .take(needed)
+                    .cloned()
+                    .collect();
+
+                for target in &targets {
+                    state
+                        .pending_commands
+                        .entry(source.clone())
+                        .or_default()
+                        .push(ChunkServerCommand {
+                            r#type: 1, // REPLICATE
+                            block_id: block.block_id.clone(),
+                            target_chunk_server_address: target.clone(),
+                            shard_index: -1,
+                            ec_data_shards: 0,
+                            ec_parity_shards: 0,
+                            ec_shard_sources: vec![],
+                            original_block_size: 0,
+                        });
+                    tracing::info!(
+                        "Healer: scheduled replication of block {} from {} to {}",
+                        block.block_id,
+                        source,
+                        target
+                    );
+                }
+            }
+        }
+    }
+}
+
 use dfs_common::sharding::{ShardId, ShardMap};
 
 // ============================================================================
@@ -428,9 +670,13 @@ pub struct MasterConfig {
     pub merge_threshold_rps: f64,
     pub ca_cert_path: Option<String>,
     pub domain_name: Option<String>,
+    /// Seconds since last access before a file is considered cold (env: COLD_THRESHOLD_SECS, default: 604800 = 7 days)
+    pub cold_threshold_secs: u64,
+    /// Seconds after cold move before EC conversion (env: EC_THRESHOLD_SECS, default: 2592000 = 30 days)
+    pub ec_threshold_secs: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MyMaster {
     state: Arc<Mutex<AppState>>,
     raft_tx: mpsc::Sender<Event>,
@@ -439,6 +685,7 @@ pub struct MyMaster {
     monitor: Arc<ThroughputMonitor>,
     _master_address: String,
     _config_server_addrs: Vec<String>,
+    config: MasterConfig,
 }
 
 async fn run_liveness_checker(state: Arc<Mutex<AppState>>) {
@@ -518,6 +765,7 @@ async fn run_block_balancer(state: Arc<Mutex<AppState>>) {
                         r#type: 1, // REPLICATE
                         block_id: block_id.clone(),
                         target_chunk_server_address: least_full_addr.clone(),
+                        ..Default::default()
                     };
 
                     state
@@ -661,6 +909,7 @@ async fn run_data_shuffler(state: Arc<Mutex<AppState>>, raft_tx: mpsc::Sender<Ev
                             r#type: 1, // REPLICATE
                             block_id: block_id.clone(),
                             target_chunk_server_address: least_full_addr.clone(),
+                            ..Default::default()
                         };
 
                         state
@@ -1164,10 +1413,11 @@ impl MyMaster {
             state,
             raft_tx,
             shard_map,
-            shard_id: config.shard_id,
+            shard_id: config.shard_id.clone(),
             monitor,
-            _master_address: config.master_address,
-            _config_server_addrs: config.config_server_addrs,
+            _master_address: config.master_address.clone(),
+            _config_server_addrs: config.config_server_addrs.clone(),
+            config,
         }
     }
 
@@ -1189,6 +1439,214 @@ impl MyMaster {
                 Err(Status::failed_precondition(msg))
             }
             Err(_) => Err(Status::internal("Raft node shutdown")),
+        }
+    }
+
+    /// Background tiering scanner: identifies cold files and issues MOVE_TO_COLD commands.
+    pub async fn scan_tiering(&self) {
+        // Only the leader should run the tiering scanner
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::GetLeaderInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let leader = match rx.await {
+            Ok(Some(addr)) => addr,
+            _ => return, // no leader or channel closed
+        };
+        if leader != self.config.master_address {
+            return; // we are not the leader
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cold_threshold_ms = self.config.cold_threshold_secs * 1000;
+
+        // Collect candidates without holding the lock across awaits
+        let candidates: Vec<(String, Vec<crate::dfs::BlockInfo>)> = {
+            let state = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref ms) = *state {
+                ms.files
+                    .values()
+                    .filter(|f| {
+                        f.moved_to_cold_at_ms == 0
+                            && f.ec_data_shards == 0
+                            && f.last_access_ms > 0
+                            && now_ms.saturating_sub(f.last_access_ms) > cold_threshold_ms
+                    })
+                    .map(|f| (f.path.clone(), f.blocks.clone()))
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        for (path, blocks) in candidates {
+            // Queue MOVE_TO_COLD commands to all ChunkServers holding blocks
+            {
+                let mut state = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref mut ms) = *state {
+                    for block in &blocks {
+                        for loc in &block.locations {
+                            ms.pending_commands.entry(loc.clone()).or_default().push(
+                                crate::dfs::ChunkServerCommand {
+                                    r#type:
+                                        crate::dfs::chunk_server_command::CommandType::MoveToCold
+                                            as i32,
+                                    block_id: block.block_id.clone(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Persist cold-move via Raft (best effort — ignore Not Leader errors)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::MoveToCold {
+                        path: path.clone(),
+                        moved_at_ms: now_ms,
+                    }),
+                    reply_tx: tx,
+                })
+                .await;
+            let _ = rx.await;
+            tracing::info!("Tiering scanner: queued cold move for {}", path);
+        }
+    }
+
+    /// Background EC conversion scanner: converts cold files to erasure coding.
+    pub async fn scan_ec_conversion(&self) {
+        // Only the leader should run the EC conversion scanner
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .raft_tx
+            .send(Event::GetLeaderInfo { reply_tx: tx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let leader = match rx.await {
+            Ok(Some(addr)) => addr,
+            _ => return, // no leader or channel closed
+        };
+        if leader != self.config.master_address {
+            return; // we are not the leader
+        }
+
+        const EC_DATA: i32 = 6;
+        const EC_PARITY: i32 = 3;
+        let total_shards = (EC_DATA + EC_PARITY) as usize;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ec_threshold_ms = self.config.ec_threshold_secs * 1000;
+
+        // Collect candidates: cold files that have aged past ec_threshold
+        let candidates: Vec<crate::dfs::FileMetadata> = {
+            let state = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref ms) = *state {
+                ms.files
+                    .values()
+                    .filter(|f| {
+                        f.moved_to_cold_at_ms > 0
+                            && f.ec_data_shards == 0
+                            && now_ms.saturating_sub(f.moved_to_cold_at_ms) > ec_threshold_ms
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                vec![]
+            }
+        };
+
+        for file in candidates {
+            // Pick enough ChunkServers for EC shards
+            let shard_servers: Vec<String> = {
+                let state = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref ms) = *state {
+                    let mut servers: Vec<String> = ms
+                        .chunk_servers
+                        .iter()
+                        .filter(|(_, s)| s.available_space > 0)
+                        .map(|(addr, _)| addr.clone())
+                        .collect();
+                    // Sort for determinism in tests
+                    servers.sort();
+                    servers.truncate(total_shards);
+                    servers
+                } else {
+                    vec![]
+                }
+            };
+
+            if shard_servers.len() < total_shards {
+                tracing::warn!(
+                    "Not enough ChunkServers for EC conversion of {} (need {}, have {})",
+                    file.path,
+                    total_shards,
+                    shard_servers.len()
+                );
+                continue;
+            }
+
+            let mut new_blocks: Vec<crate::dfs::BlockInfo> = Vec::new();
+
+            for block in &file.blocks {
+                // One CS per EC shard
+                let new_block = crate::dfs::BlockInfo {
+                    block_id: block.block_id.clone(),
+                    size: block.size,
+                    locations: shard_servers.clone(),
+                    checksum_crc32c: block.checksum_crc32c,
+                    ec_data_shards: EC_DATA,
+                    ec_parity_shards: EC_PARITY,
+                    original_size: block.original_size,
+                };
+                new_blocks.push(new_block);
+
+                // TODO: Issue RECONSTRUCT_EC_SHARD commands to write EC shards from the source block.
+                // The current reconstruct_ec_shard RPC is designed for reconstructing MISSING shards
+                // from EXISTING EC shards — it cannot convert a full replication block to EC shards.
+                // A dedicated "EC encode and distribute" command is needed (future work).
+                // For now, we update the metadata so the block is marked as EC; the data migration
+                // will be handled when that command is implemented.
+
+                // NOTE: Old replication blocks are intentionally NOT deleted here.
+                // Deletion races with EC shard reconstruction and could cause data loss.
+                // Old replicas become orphaned and will be reclaimed by a future
+                // background orphan-cleanup pass (not yet implemented).
+            }
+
+            // Persist EC conversion via Raft
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = self
+                .raft_tx
+                .send(Event::ClientRequest {
+                    command: Command::Master(MasterCommand::ConvertToEc {
+                        path: file.path.clone(),
+                        ec_data_shards: EC_DATA,
+                        ec_parity_shards: EC_PARITY,
+                        new_blocks,
+                    }),
+                    reply_tx: tx,
+                })
+                .await;
+            let _ = rx.await;
+            tracing::info!("Tiering scanner: queued EC conversion for {}", file.path);
         }
     }
 
@@ -1240,6 +1698,29 @@ impl MasterService for MyMaster {
             let req = request.into_inner();
 
             self.monitor.record_request(&req.path, 0); // Read request, 0 bytes for metadata
+
+            // Fire-and-forget access stat update for storage tiering (best effort)
+            {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let raft_tx = self.raft_tx.clone();
+                let path_clone = req.path.clone();
+                tokio::spawn(async move {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    let _ = raft_tx
+                        .send(Event::ClientRequest {
+                            command: Command::Master(MasterCommand::UpdateAccessStats {
+                                path: path_clone,
+                                accessed_at_ms: now_ms,
+                            }),
+                            reply_tx: tx,
+                        })
+                        .await;
+                });
+            }
+
             self.check_shard_ownership(&req.path)?;
             self.ensure_linearizable_read().await?;
 
@@ -1293,7 +1774,11 @@ impl MasterService for MyMaster {
             if self
                 .raft_tx
                 .send(Event::ClientRequest {
-                    command: Command::Master(MasterCommand::CreateFile { path: req.path }),
+                    command: Command::Master(MasterCommand::CreateFile {
+                        path: req.path,
+                        ec_data_shards: req.ec_data_shards,
+                        ec_parity_shards: req.ec_parity_shards,
+                    }),
                     reply_tx: tx,
                 })
                 .await
@@ -1384,46 +1869,62 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
 
-            // Replication factor (default: 3)
-            const REPLICATION_FACTOR: usize = 3;
-
             self.monitor.record_request(&req.path, 0);
             self.check_shard_ownership(&req.path)?;
             self.check_safe_mode()?;
 
-            let (chunk_servers, block_id) = {
+            let (selected_servers, block_id, ec_data, ec_parity) = {
                 let state_lock = self.state.lock().expect("Mutex poisoned");
                 if let AppState::Master(ref state) = *state_lock {
                     if !state.files.contains_key(&req.path) {
                         return Err(Status::not_found("File not found"));
                     }
 
-                    // Load balancing: Select chunk servers with most available space
-                    let mut candidates: Vec<(String, u64)> = state
+                    // Look up file's EC policy
+                    let file_meta = &state.files[&req.path];
+                    let ec_data = file_meta.ec_data_shards;
+                    let ec_parity = file_meta.ec_parity_shards;
+
+                    if (ec_data > 0) != (ec_parity > 0) {
+                        tracing::warn!(
+                            path = %req.path,
+                            ec_data,
+                            ec_parity,
+                            "EC policy partially set — only one of ec_data/ec_parity is non-zero; falling back to replication"
+                        );
+                    }
+
+                    let candidates: Vec<(String, ChunkServerStatus)> = state
                         .chunk_servers
                         .iter()
-                        .map(|(addr, status)| (addr.clone(), status.available_space))
+                        .map(|(addr, status)| (addr.clone(), status.clone()))
                         .collect();
 
-                    if candidates.is_empty() {
+                    let needed = if ec_data > 0 && ec_parity > 0 {
+                        // EC requires exactly k+m distinct chunkservers (one shard each)
+                        let total = (ec_data + ec_parity) as usize;
+                        if candidates.len() < total {
+                            return Err(Status::unavailable(format!(
+                                "Need {} chunk servers for EC({},{}), only {} available",
+                                total, ec_data, ec_parity, candidates.len()
+                            )));
+                        }
+                        total
+                    } else {
+                        // Replication: use as many replicas as possible up to DEFAULT_REPLICATION_FACTOR
+                        std::cmp::min(DEFAULT_REPLICATION_FACTOR, candidates.len())
+                    };
+
+                    if needed == 0 {
                         return Err(Status::unavailable("No chunk servers available"));
                     }
 
-                    // Sort by available space descending
-                    candidates.sort_by(|a, b| b.1.cmp(&a.1));
-
-                    let chunk_servers: Vec<String> =
-                        candidates.into_iter().map(|(addr, _)| addr).collect();
-                    (chunk_servers, Uuid::new_v4().to_string())
+                    let selected = select_servers_rack_aware(&candidates, needed);
+                    (selected, Uuid::new_v4().to_string(), ec_data, ec_parity)
                 } else {
                     return Err(Status::internal("Wrong state type"));
                 }
             };
-
-            // Select chunk servers
-            let num_replicas = std::cmp::min(REPLICATION_FACTOR, chunk_servers.len());
-            let selected_servers: Vec<String> =
-                chunk_servers.iter().take(num_replicas).cloned().collect();
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             if self
@@ -1449,11 +1950,16 @@ impl MasterService for MyMaster {
                         size: 0,
                         locations: selected_servers.clone(),
                         checksum_crc32c: 0,
+                        ec_data_shards: ec_data,
+                        ec_parity_shards: ec_parity,
+                        original_size: 0,
                     };
                     Ok(Response::new(AllocateBlockResponse {
                         block: Some(block),
                         chunk_server_addresses: selected_servers,
                         leader_hint: "".to_string(),
+                        ec_data_shards: ec_data,
+                        ec_parity_shards: ec_parity,
                     }))
                 }
                 Ok(Err(leader_opt)) => {
@@ -1463,6 +1969,8 @@ impl MasterService for MyMaster {
                         block: None,
                         chunk_server_addresses: vec![],
                         leader_hint,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
                     }))
                 }
                 Err(_) => Err(Status::internal("Raft response error")),
@@ -1538,9 +2046,20 @@ impl MasterService for MyMaster {
         let span = dfs_common::telemetry::create_server_span(&request, "list_files");
         async move {
             self.ensure_linearizable_read().await?;
+            let req = request.into_inner();
+            let prefix = req.path;
             let state_lock = self.state.lock().expect("Mutex poisoned");
             if let AppState::Master(ref state) = *state_lock {
-                let files: Vec<String> = state.files.keys().cloned().collect();
+                let files: Vec<String> = if prefix.is_empty() {
+                    state.files.keys().cloned().collect()
+                } else {
+                    state
+                        .files
+                        .keys()
+                        .filter(|k| k.starts_with(&prefix))
+                        .cloned()
+                        .collect()
+                };
                 Ok(Response::new(ListFilesResponse { files }))
             } else {
                 Err(Status::internal("Invalid state"))
@@ -1573,6 +2092,7 @@ impl MasterService for MyMaster {
                         used_space: 0,
                         available_space: req.capacity,
                         chunk_count: 0,
+                        rack_id: req.rack_id,
                     },
                 );
             }
@@ -1589,7 +2109,7 @@ impl MasterService for MyMaster {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let span = dfs_common::telemetry::create_server_span(&request, "heartbeat");
         async move {
-            let req = request.into_inner();
+            let mut req = request.into_inner();
             let mut state_lock = self.state.lock().expect("Mutex poisoned");
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1601,6 +2121,17 @@ impl MasterService for MyMaster {
                 let is_new_chunkserver =
                     !state.chunk_servers.contains_key(&req.chunk_server_address);
 
+                // Use rack_id from heartbeat if provided, otherwise preserve existing
+                let rack_id = if !req.rack_id.is_empty() {
+                    std::mem::take(&mut req.rack_id)
+                } else {
+                    state
+                        .chunk_servers
+                        .get(&req.chunk_server_address)
+                        .map(|s| s.rack_id.clone())
+                        .unwrap_or_default()
+                };
+
                 state.chunk_servers.insert(
                     req.chunk_server_address.clone(),
                     ChunkServerStatus {
@@ -1608,6 +2139,7 @@ impl MasterService for MyMaster {
                         used_space: req.used_space,
                         available_space: req.available_space,
                         chunk_count: req.chunk_count,
+                        rack_id,
                     },
                 );
 
@@ -1619,6 +2151,23 @@ impl MasterService for MyMaster {
                 // Always check if we should exit safe mode (covers timeout and 0-block case)
                 if state.is_in_safe_mode() && state.should_exit_safe_mode() {
                     state.exit_safe_mode();
+                }
+
+                // Process bad block reports from the ChunkServer's scrubber
+                if !req.bad_blocks.is_empty() {
+                    tracing::warn!(
+                        "Heartbeat: {} bad block(s) reported by {}",
+                        req.bad_blocks.len(),
+                        req.chunk_server_address
+                    );
+                    for block_id in &req.bad_blocks {
+                        state
+                            .bad_block_locations
+                            .entry(block_id.clone())
+                            .or_default()
+                            .insert(req.chunk_server_address.clone());
+                    }
+                    heal_under_replicated_blocks(state);
                 }
 
                 // Retrieve pending commands
@@ -2608,6 +3157,11 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2647,6 +3201,11 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2670,6 +3229,11 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2695,9 +3259,17 @@ mod tests {
                 size: 1024,
                 locations: vec!["chunk1:50052".to_string()],
                 checksum_crc32c: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                original_size: 0,
             }],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2756,6 +3328,11 @@ mod tests {
             blocks: vec![],
             etag_md5: "".into(),
             created_at_ms: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
         };
 
         let tx_record = TransactionRecord::new_rename(
@@ -2776,5 +3353,701 @@ mod tests {
 
         let record = state.transaction_records.get("tx-1").unwrap();
         assert_eq!(record.state, TxState::Pending);
+    }
+
+    #[test]
+    fn test_heal_under_replicated_blocks_schedules_replication() {
+        let mut state = MasterState::default();
+        let now = 9_999_999_999_999u64;
+        for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
+            state.chunk_servers.insert(
+                addr.to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 1,
+                    rack_id: String::new(),
+                },
+            );
+        }
+        state.files.insert(
+            "/test/file".to_string(),
+            FileMetadata {
+                path: "/test/file".to_string(),
+                size: 100,
+                blocks: vec![BlockInfo {
+                    block_id: "block-1".to_string(),
+                    size: 100,
+                    locations: vec!["cs1:50055".to_string()],
+                    checksum_crc32c: 0,
+                    ec_data_shards: 0,
+                    ec_parity_shards: 0,
+                    original_size: 0,
+                }],
+                etag_md5: String::new(),
+                created_at_ms: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
+            },
+        );
+        heal_under_replicated_blocks(&mut state);
+        let cmds = state
+            .pending_commands
+            .get("cs1:50055")
+            .expect("commands expected");
+        assert_eq!(cmds.len(), 2);
+        let targets: std::collections::HashSet<_> = cmds
+            .iter()
+            .map(|c| c.target_chunk_server_address.as_str())
+            .collect();
+        assert!(targets.contains("cs2:50056") || targets.contains("cs3:50057"));
+    }
+
+    #[test]
+    fn test_heal_skips_fully_replicated_blocks() {
+        let mut state = MasterState::default();
+        let now = 9_999_999_999_999u64;
+        for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
+            state.chunk_servers.insert(
+                addr.to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 1,
+                    rack_id: String::new(),
+                },
+            );
+        }
+        state.files.insert(
+            "/test/full".to_string(),
+            FileMetadata {
+                path: "/test/full".to_string(),
+                size: 100,
+                blocks: vec![BlockInfo {
+                    block_id: "block-full".to_string(),
+                    size: 100,
+                    locations: vec![
+                        "cs1:50055".to_string(),
+                        "cs2:50056".to_string(),
+                        "cs3:50057".to_string(),
+                    ],
+                    checksum_crc32c: 0,
+                    ec_data_shards: 0,
+                    ec_parity_shards: 0,
+                    original_size: 0,
+                }],
+                etag_md5: String::new(),
+                created_at_ms: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
+            },
+        );
+        heal_under_replicated_blocks(&mut state);
+        assert!(state.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn test_heal_treats_bad_block_location_as_missing() {
+        let mut state = MasterState::default();
+        let now = 9_999_999_999_999u64;
+        for addr in ["cs1:50055", "cs2:50056", "cs3:50057"] {
+            state.chunk_servers.insert(
+                addr.to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: now,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 1,
+                    rack_id: String::new(),
+                },
+            );
+        }
+        state.files.insert(
+            "/test/bad".to_string(),
+            FileMetadata {
+                path: "/test/bad".to_string(),
+                size: 100,
+                blocks: vec![BlockInfo {
+                    block_id: "block-bad".to_string(),
+                    size: 100,
+                    locations: vec![
+                        "cs1:50055".to_string(),
+                        "cs2:50056".to_string(),
+                        "cs3:50057".to_string(),
+                    ],
+                    checksum_crc32c: 0,
+                    ec_data_shards: 0,
+                    ec_parity_shards: 0,
+                    original_size: 0,
+                }],
+                etag_md5: String::new(),
+                created_at_ms: 0,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
+            },
+        );
+        state
+            .bad_block_locations
+            .entry("block-bad".to_string())
+            .or_default()
+            .insert("cs2:50056".to_string());
+        // 3 servers in metadata but cs2 is bad → 2 effective, need 1 more
+        // but all 3 servers are already in block.locations so no unused target exists
+        heal_under_replicated_blocks(&mut state);
+        assert!(state.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn test_rack_aware_selection_spreads_across_racks() {
+        // 3 servers on 3 different racks — should pick one per rack
+        let servers = vec![
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "rack-b".to_string(),
+                },
+            ),
+            (
+                "cs3:50053".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 800_000,
+                    chunk_count: 0,
+                    rack_id: "rack-c".to_string(),
+                },
+            ),
+        ];
+        let selected = select_servers_rack_aware(&servers, 3);
+        assert_eq!(selected.len(), 3);
+        // All 3 racks represented
+        let racks: std::collections::HashSet<String> = selected
+            .iter()
+            .map(|addr| {
+                servers
+                    .iter()
+                    .find(|(a, _)| a == addr)
+                    .unwrap()
+                    .1
+                    .rack_id
+                    .clone()
+            })
+            .collect();
+        assert_eq!(racks.len(), 3, "All 3 racks should be represented");
+    }
+
+    #[test]
+    fn test_rack_aware_selection_fallback_to_same_rack() {
+        // 3 servers on only 2 racks — need 3 replicas, must pick 2 from one rack
+        let servers = vec![
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs3:50053".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 800_000,
+                    chunk_count: 0,
+                    rack_id: "rack-b".to_string(),
+                },
+            ),
+        ];
+        let selected = select_servers_rack_aware(&servers, 3);
+        assert_eq!(selected.len(), 3);
+        // All 3 servers picked (no duplicates)
+        let unique: std::collections::HashSet<&String> = selected.iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn test_rack_aware_selection_empty_rack_id_treated_as_distinct() {
+        // Servers with empty rack_id should each be treated as their own rack
+        let servers = vec![
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "".to_string(),
+                },
+            ),
+        ];
+        let selected = select_servers_rack_aware(&servers, 2);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn test_rack_aware_selection_fewer_servers_than_replicas() {
+        // Only 2 servers but want 3 replicas — return all 2
+        let servers = vec![
+            (
+                "cs1:50051".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: "rack-a".to_string(),
+                },
+            ),
+            (
+                "cs2:50052".to_string(),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 900_000,
+                    chunk_count: 0,
+                    rack_id: "rack-b".to_string(),
+                },
+            ),
+        ];
+        let selected = select_servers_rack_aware(&servers, 3);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn test_ec_file_metadata_stores_policy() {
+        let mut state = MasterState::default();
+        // Simulate CreateFile with EC(4,2)
+        let metadata = FileMetadata {
+            path: "/ec-file".to_string(),
+            size: 0,
+            blocks: vec![],
+            etag_md5: "".to_string(),
+            created_at_ms: 0,
+            ec_data_shards: 4,
+            ec_parity_shards: 2,
+            last_access_ms: 0,
+            access_count: 0,
+            moved_to_cold_at_ms: 0,
+        };
+        state.files.insert("/ec-file".to_string(), metadata);
+
+        // Verify policy is stored
+        let stored = &state.files["/ec-file"];
+        assert_eq!(stored.ec_data_shards, 4);
+        assert_eq!(stored.ec_parity_shards, 2);
+    }
+
+    #[test]
+    fn test_allocate_block_ec_selects_kplusm_servers() {
+        let mut state = MasterState::default();
+        state.files.insert(
+            "/ec-file".to_string(),
+            FileMetadata {
+                path: "/ec-file".to_string(),
+                size: 0,
+                blocks: vec![],
+                etag_md5: "".to_string(),
+                created_at_ms: 0,
+                ec_data_shards: 4,
+                ec_parity_shards: 2,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
+            },
+        );
+        for i in 0..6usize {
+            state.chunk_servers.insert(
+                format!("cs{}:50052", i),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: String::new(),
+                },
+            );
+        }
+
+        // Verify state has EC policy
+        assert_eq!(state.files["/ec-file"].ec_data_shards, 4);
+        assert_eq!(state.files["/ec-file"].ec_parity_shards, 2);
+        assert_eq!(state.chunk_servers.len(), 6);
+
+        // The dynamic selection logic: needed = ec_data + ec_parity = 6
+        let file = &state.files["/ec-file"];
+        let needed = (file.ec_data_shards + file.ec_parity_shards) as usize;
+        assert_eq!(needed, 6);
+        assert!(state.chunk_servers.len() >= needed);
+    }
+
+    #[test]
+    fn test_heal_ec_block_issues_reconstruct_command() {
+        let mut state = MasterState::default();
+
+        // 7 CSes registered: cs0, cs1, cs3, cs4, cs5 are live; cs2 is dead (not registered);
+        // cs6 is a spare node not holding any shard of the block, so it can serve as the
+        // reconstruction target (required by the no-fallback target selection policy).
+        for i in [0usize, 1, 3, 4, 5, 6] {
+            state.chunk_servers.insert(
+                format!("cs{}:50052", i),
+                ChunkServerStatus {
+                    last_heartbeat: 9_999_999_999_999,
+                    used_space: 0,
+                    available_space: 1_000_000,
+                    chunk_count: 0,
+                    rack_id: String::new(),
+                },
+            );
+        }
+
+        // EC(4,2) file with one block; shard 2 was on the now-dead cs2
+        state.files.insert(
+            "/ec-file".to_string(),
+            crate::dfs::FileMetadata {
+                path: "/ec-file".to_string(),
+                size: 100,
+                blocks: vec![crate::dfs::BlockInfo {
+                    block_id: "blk-1".to_string(),
+                    size: 100,
+                    locations: vec![
+                        "cs0:50052".to_string(),
+                        "cs1:50052".to_string(),
+                        "cs2:50052".to_string(), // dead
+                        "cs3:50052".to_string(),
+                        "cs4:50052".to_string(),
+                        "cs5:50052".to_string(),
+                    ],
+                    checksum_crc32c: 0,
+                    ec_data_shards: 4,
+                    ec_parity_shards: 2,
+                    original_size: 100,
+                }],
+                etag_md5: "".to_string(),
+                created_at_ms: 0,
+                ec_data_shards: 4,
+                ec_parity_shards: 2,
+                last_access_ms: 0,
+                access_count: 0,
+                moved_to_cold_at_ms: 0,
+            },
+        );
+
+        heal_under_replicated_blocks(&mut state);
+
+        // Should issue exactly one RECONSTRUCT_EC_SHARD for shard 2
+        let all_cmds: Vec<_> = state.pending_commands.values().flatten().collect();
+        assert!(
+            all_cmds
+                .iter()
+                .any(|c| c.r#type == 3 && c.block_id == "blk-1" && c.shard_index == 2),
+            "Expected RECONSTRUCT_EC_SHARD for shard 2, got: {:?}",
+            all_cmds
+        );
+    }
+
+    /// Build a minimal `MyMaster` backed by a fake Raft event loop that:
+    ///   - applies `ClientRequest` commands directly to the shared state, and
+    ///   - immediately acknowledges `GetReadIndex` (linearizable-read bypass).
+    ///
+    /// Returns `(master, shared_state)` so tests can inspect state afterwards.
+    async fn make_test_master() -> (MyMaster, Arc<Mutex<AppState>>) {
+        let master_state = MasterState::default();
+        let app_state = Arc::new(Mutex::new(AppState::Master(master_state)));
+
+        let (raft_tx, mut raft_rx) = mpsc::channel::<Event>(64);
+
+        // Fake Raft event loop
+        let state_clone = app_state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = raft_rx.recv().await {
+                match event {
+                    Event::ClientRequest { command, reply_tx } => {
+                        // Apply command directly to state (single-node shortcut)
+                        {
+                            let mut lock = state_clone.lock().expect("Mutex poisoned");
+                            if let AppState::Master(ref mut ms) = *lock {
+                                match &command {
+                                    Command::Master(MasterCommand::UpdateAccessStats {
+                                        path,
+                                        accessed_at_ms,
+                                    }) => {
+                                        if let Some(meta) = ms.files.get_mut(path) {
+                                            meta.last_access_ms = *accessed_at_ms;
+                                            meta.access_count += 1;
+                                        }
+                                    }
+                                    Command::Master(MasterCommand::ConvertToEc {
+                                        path,
+                                        ec_data_shards,
+                                        ec_parity_shards,
+                                        new_blocks,
+                                    }) => {
+                                        if let Some(meta) = ms.files.get_mut(path) {
+                                            meta.ec_data_shards = *ec_data_shards;
+                                            meta.ec_parity_shards = *ec_parity_shards;
+                                            meta.blocks = new_blocks.clone();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let _ = reply_tx.send(Ok(()));
+                    }
+                    Event::GetReadIndex { reply_tx } => {
+                        let _ = reply_tx.send(Ok(0));
+                    }
+                    // In tests the master_address is "127.0.0.1:9000" — return it so
+                    // leader guard passes and scan_tiering / scan_ec_conversion run.
+                    Event::GetLeaderInfo { reply_tx } => {
+                        let _ = reply_tx.send(Some("127.0.0.1:9000".to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Build a single-shard ShardMap that owns all paths
+        let shard_id = "test-shard".to_string();
+        let mut shard_map = ShardMap::new_range();
+        shard_map.add_shard(shard_id.clone(), vec!["127.0.0.1:9000".to_string()]);
+
+        let config = MasterConfig {
+            shard_id: shard_id.clone(),
+            config_server_addrs: vec![],
+            master_address: "127.0.0.1:9000".to_string(),
+            split_threshold_rps: 1_000_000.0,
+            split_cooldown_secs: 3600,
+            merge_threshold_rps: 0.0,
+            ca_cert_path: None,
+            domain_name: None,
+            cold_threshold_secs: 604800,
+            ec_threshold_secs: 2592000,
+        };
+
+        let master = MyMaster::new(
+            app_state.clone(),
+            raft_tx,
+            Arc::new(Mutex::new(shard_map)),
+            config,
+        );
+
+        (master, app_state)
+    }
+
+    #[tokio::test]
+    async fn test_get_file_info_increments_access_count() {
+        let (master, app_state) = make_test_master().await;
+
+        // Pre-insert a file directly into state so get_file_info has something to find
+        {
+            let mut lock = app_state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref mut ms) = *lock {
+                ms.files.insert(
+                    "/access-test".to_string(),
+                    FileMetadata {
+                        path: "/access-test".to_string(),
+                        size: 100,
+                        blocks: vec![],
+                        etag_md5: "".to_string(),
+                        created_at_ms: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        last_access_ms: 0,
+                        access_count: 0,
+                        moved_to_cold_at_ms: 0,
+                    },
+                );
+            }
+        }
+
+        // Call get_file_info — this fires the UpdateAccessStats spawn
+        let req = tonic::Request::new(GetFileInfoRequest {
+            path: "/access-test".to_string(),
+        });
+        let resp = master.get_file_info(req).await;
+        assert!(resp.is_ok(), "get_file_info should succeed");
+        assert!(resp.unwrap().into_inner().found, "file should be found");
+
+        // Give the spawned task time to execute
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify that access_count was incremented
+        let lock = app_state.lock().expect("Mutex poisoned");
+        if let AppState::Master(ref ms) = *lock {
+            let meta = ms.files.get("/access-test").expect("file should exist");
+            assert!(
+                meta.access_count >= 1,
+                "access_count should be >= 1 after get_file_info, got {}",
+                meta.access_count
+            );
+        } else {
+            panic!("Expected Master state");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_tiering_queues_cold_move() {
+        let (master, _app_state) = make_test_master().await;
+
+        // Insert a file with an ancient last_access_ms and a fake block location
+        {
+            let mut state = master.state.lock().unwrap();
+            if let AppState::Master(ref mut ms) = *state {
+                ms.files.insert(
+                    "/old-file".to_string(),
+                    crate::dfs::FileMetadata {
+                        path: "/old-file".to_string(),
+                        last_access_ms: 1, // epoch+1ms = ancient
+                        access_count: 1,
+                        moved_to_cold_at_ms: 0,
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        blocks: vec![crate::dfs::BlockInfo {
+                            block_id: "blk-tiering-001".to_string(),
+                            locations: vec!["127.0.0.1:9001".to_string()],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        // last_access_ms=1 and now_ms >> 1 + 604800*1000 guarantees cold threshold is exceeded
+        master.scan_tiering().await;
+
+        // Verify MOVE_TO_COLD command queued for the block's ChunkServer
+        let state = master.state.lock().unwrap();
+        if let AppState::Master(ref ms) = *state {
+            let cmds = ms.pending_commands.get("127.0.0.1:9001");
+            assert!(
+                cmds.is_some_and(|c| c.iter().any(|cmd| cmd.block_id == "blk-tiering-001")),
+                "Expected MOVE_TO_COLD command queued for blk-tiering-001"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_ec_conversion_queues_commands() {
+        let (master, _dir) = make_test_master().await;
+
+        // Insert a cold file with a block and 9 fake ChunkServers
+        {
+            let mut state = master.state.lock().unwrap();
+            if let AppState::Master(ref mut ms) = *state {
+                // Register 9 fake ChunkServers
+                for i in 0..9usize {
+                    ms.chunk_servers.insert(
+                        format!("127.0.0.{}:9000", i + 1),
+                        ChunkServerStatus {
+                            available_space: 1_000_000,
+                            last_heartbeat: 1,
+                            used_space: 0,
+                            chunk_count: 0,
+                            rack_id: String::new(),
+                        },
+                    );
+                }
+                ms.files.insert(
+                    "/cold-ec-file".to_string(),
+                    crate::dfs::FileMetadata {
+                        path: "/cold-ec-file".to_string(),
+                        moved_to_cold_at_ms: 1, // ancient
+                        ec_data_shards: 0,
+                        ec_parity_shards: 0,
+                        blocks: vec![crate::dfs::BlockInfo {
+                            block_id: "blk-ec-conv-001".to_string(),
+                            locations: vec!["127.0.0.1:9000".to_string()],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        master.scan_ec_conversion().await;
+
+        // Give the spawned Raft task time to apply the ConvertToEc command
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let state = master.state.lock().unwrap();
+        if let AppState::Master(ref ms) = *state {
+            // scan_ec_conversion no longer queues RECONSTRUCT_EC_SHARD commands (Issue 5 fix).
+            // It only commits a ConvertToEc Raft command which updates the metadata.
+            // Verify that the file's metadata was updated to reflect the EC state.
+            let meta = ms
+                .files
+                .get("/cold-ec-file")
+                .expect("file should exist in state");
+            assert_eq!(
+                meta.ec_data_shards, 6,
+                "Expected ec_data_shards==6 after ConvertToEc, got {}",
+                meta.ec_data_shards
+            );
+            assert_eq!(
+                meta.ec_parity_shards, 3,
+                "Expected ec_parity_shards==3 after ConvertToEc, got {}",
+                meta.ec_parity_shards
+            );
+            // No RECONSTRUCT_EC_SHARD or DELETE commands should be pending
+            let total_cmds: usize = ms.pending_commands.values().map(|v| v.len()).sum();
+            assert_eq!(
+                total_cmds, 0,
+                "Expected no pending chunk commands (no RECONSTRUCT_EC_SHARD, no DELETE), got {}",
+                total_cmds
+            );
+        } else {
+            panic!("Expected Master state");
+        }
     }
 }

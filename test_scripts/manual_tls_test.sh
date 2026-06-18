@@ -3,6 +3,18 @@ set -e
 
 # Get script directory
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
+cleanup() {
+    echo "Cleaning up..."
+    kill $CONFIG_SERVER_PID 2>/dev/null || true
+    kill $MASTER_PID 2>/dev/null || true
+    kill $CHUNKSERVER_PID 2>/dev/null || true
+    wait $CONFIG_SERVER_PID 2>/dev/null || true
+    wait $MASTER_PID 2>/dev/null || true
+    wait $CHUNKSERVER_PID 2>/dev/null || true
+}
+trap cleanup EXIT
+
 CERT_DIR="$DIR/../certs"
 CA_CERT="$CERT_DIR/ca.crt"
 SERVER_CERT="$CERT_DIR/server.crt"
@@ -97,11 +109,4 @@ echo "CLI completed."
 # Verify logs
 echo "Converting logs to check for errors..."
 
-# Cleanup
-echo "Cleaning up..."
-kill $CONFIG_SERVER_PID
-kill $MASTER_PID
-kill $CHUNKSERVER_PID
-wait $CONFIG_SERVER_PID 2>/dev/null || true
-wait $MASTER_PID 2>/dev/null || true
-wait $CHUNKSERVER_PID 2>/dev/null || true
+# Cleanup handled by trap
