@@ -389,7 +389,7 @@ fn select_servers_rack_aware(servers: &[(String, ChunkServerStatus)], n: usize) 
     let racks: Vec<Vec<&(String, ChunkServerStatus)>> = {
         let mut r: Vec<Vec<&(String, ChunkServerStatus)>> = rack_buckets.into_values().collect();
         // Sort racks by best server descending
-        r.sort_by(|a, b| b[0].1.available_space.cmp(&a[0].1.available_space));
+        r.sort_by_key(|a| std::cmp::Reverse(a[0].1.available_space));
         r
     };
 
@@ -733,7 +733,7 @@ async fn run_block_balancer(state: Arc<Mutex<AppState>>) {
             }
 
             let mut sorted_servers = servers;
-            sorted_servers.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending available space (Least available first)
+            sorted_servers.sort_by_key(|a| a.1); // Ascending available space (Least available first)
 
             let (most_full_addr, min_avail) = sorted_servers.first().unwrap();
             let (least_full_addr, max_avail) = sorted_servers.last().unwrap();
@@ -884,7 +884,7 @@ async fn run_data_shuffler(state: Arc<Mutex<AppState>>, raft_tx: mpsc::Sender<Ev
                 let mut state_lock = state.lock().expect("Mutex poisoned");
                 if let AppState::Master(ref mut state) = *state_lock {
                     let mut sorted_servers = servers.clone();
-                    sorted_servers.sort_by(|a, b| b.1.cmp(&a.1)); // Descending available space (Coolest first)
+                    sorted_servers.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending available space (Coolest first)
 
                     let (least_full_addr, _) = sorted_servers.first().unwrap();
                     let (most_full_addr, _) = sorted_servers.last().unwrap();
@@ -993,7 +993,7 @@ async fn run_shard_map_refresh(
 
                     // Deterministic sort
                     let mut shards_vec: Vec<_> = shards_data.into_iter().collect();
-                    shards_vec.sort_by(|a, b| a.0.cmp(&b.0));
+                    shards_vec.sort_by_key(|a| a.0.clone());
 
                     let mut new_map = ShardMap::new_range();
 

@@ -1492,7 +1492,7 @@ impl Client {
                 if let Ok(resp) = client.fetch_shard_map(FetchShardMapRequest {}).await {
                     let shards_data = resp.into_inner().shards;
                     let mut shards_vec: Vec<_> = shards_data.into_iter().collect();
-                    shards_vec.sort_by(|a, b| a.0.cmp(&b.0));
+                    shards_vec.sort_by_key(|a| a.0.clone());
 
                     let mut new_map = ShardMap::new_range(); // Assume range strategy for dynamic sharding
 
