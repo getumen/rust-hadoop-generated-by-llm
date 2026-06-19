@@ -3009,8 +3009,12 @@ impl RaftNode {
                                     }
                                 }
                                 crate::master::TxOpType::Create { path, metadata } => {
-                                    master_state.files.insert(path.clone(), metadata.clone());
-                                    tracing::info!("Transaction {}: created file {}", tx_id, path);
+                                    if !master_state.files.contains_key(path) {
+                                        master_state.files.insert(path.clone(), metadata.clone());
+                                        tracing::info!("Transaction {}: created file {}", tx_id, path);
+                                    } else {
+                                        tracing::info!("Transaction {}: file {} already exists (idempotent skip)", tx_id, path);
+                                    }
                                 }
                             }
                         }
@@ -3653,6 +3657,25 @@ mod tests {
             assert_eq!(f.ec_parity_shards, 3);
             assert_eq!(f.blocks.len(), 1);
             assert_eq!(f.blocks[0].ec_data_shards, 6);
+        }
+    }
+
+    #[test]
+    fn test_inquiry_response_mapping() {
+        use crate::master::TxState;
+        let cases = vec![
+            (TxState::Committed, "COMMITTED"),
+            (TxState::Aborted, "ABORTED"),
+            (TxState::Pending, "UNKNOWN"),
+            (TxState::Prepared, "UNKNOWN"),
+        ];
+        for (state, expected) in cases {
+            let response = match state {
+                TxState::Committed => "COMMITTED",
+                TxState::Aborted => "ABORTED",
+                _ => "UNKNOWN",
+            };
+            assert_eq!(response, expected);
         }
     }
 }

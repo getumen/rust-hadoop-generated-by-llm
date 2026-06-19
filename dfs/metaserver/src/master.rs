@@ -2479,6 +2479,20 @@ impl MasterService for MyMaster {
             let path = req.path;
             let metadata = req.metadata;
 
+            // Idempotency: if we already have this transaction record, return success
+            {
+                let state_lock = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref state) = *state_lock {
+                    if state.transaction_records.contains_key(&tx_id) {
+                        return Ok(Response::new(PrepareTransactionResponse {
+                            success: true,
+                            error_message: String::new(),
+                            leader_hint: String::new(),
+                        }));
+                    }
+                }
+            }
+
             // Check shard ownership
             self.check_shard_ownership(&path)?;
 
@@ -2567,6 +2581,22 @@ impl MasterService for MyMaster {
         async move {
             let req = request.into_inner();
             let tx_id = req.tx_id;
+
+            // Idempotency: if already committed, return success
+            {
+                let state_lock = self.state.lock().expect("Mutex poisoned");
+                if let AppState::Master(ref state) = *state_lock {
+                    if let Some(record) = state.transaction_records.get(&tx_id) {
+                        if record.state == TxState::Committed {
+                            return Ok(Response::new(CommitTransactionResponse {
+                                success: true,
+                                error_message: String::new(),
+                                leader_hint: String::new(),
+                            }));
+                        }
+                    }
+                }
+            }
 
             // Find transaction record and apply the operation
             let operation = {
