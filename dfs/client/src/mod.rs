@@ -448,6 +448,16 @@ impl Client {
             bail!("Failed to write block: {}", write_resp.error_message);
         }
 
+        let expected_replicas = chunk_servers.len() as i32;
+        if write_resp.replicas_written < expected_replicas {
+            tracing::warn!(
+                "Block written to {}/{} replicas (expected {})",
+                write_resp.replicas_written,
+                expected_replicas,
+                expected_replicas
+            );
+        }
+
         // 5. Complete file
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

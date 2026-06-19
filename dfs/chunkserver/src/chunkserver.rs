@@ -742,6 +742,7 @@ impl ChunkServerService for MyChunkServer {
                             "Checksum mismatch: expected {}, actual {}",
                             req.expected_checksum_crc32c, actual_checksum
                         ),
+                        ..Default::default()
                     }));
                 }
             }
@@ -751,10 +752,13 @@ impl ChunkServerService for MyChunkServer {
                 return Ok(Response::new(WriteBlockResponse {
                     success: false,
                     error_message: e.to_string(),
+                    ..Default::default()
                 }));
             }
 
             // If there are next servers in the pipeline, replicate to them
+            let mut replicas_written = 1i32; // This server's local write
+
             if !req.next_servers.is_empty() {
                 let next_server = &req.next_servers[0];
                 let remaining_servers = req.next_servers[1..].to_vec();
@@ -771,8 +775,18 @@ impl ChunkServerService for MyChunkServer {
                             expected_checksum_crc32c: req.expected_checksum_crc32c,
                         };
 
-                        if let Err(e) = client.replicate_block(replicate_req).await {
-                            tracing::error!("Failed to replicate to {}: {}", next_server, e);
+                        match client.replicate_block(replicate_req).await {
+                            Ok(resp) => {
+                                let inner = resp.into_inner();
+                                if inner.success {
+                                    replicas_written += inner.replicas_written;
+                                } else {
+                                    tracing::error!("Downstream replication failed at {}: {}", next_server, inner.error_message);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to replicate to {}: {}", next_server, e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -788,6 +802,7 @@ impl ChunkServerService for MyChunkServer {
             Ok(Response::new(WriteBlockResponse {
                 success: true,
                 error_message: "".to_string(),
+                replicas_written,
             }))
         }
         .instrument(span)
@@ -973,6 +988,7 @@ impl ChunkServerService for MyChunkServer {
                             "Replication checksum mismatch: expected {}, actual {}",
                             req.expected_checksum_crc32c, actual_checksum
                         ),
+                        ..Default::default()
                     }));
                 }
             }
@@ -982,8 +998,11 @@ impl ChunkServerService for MyChunkServer {
                 return Ok(Response::new(crate::dfs::ReplicateBlockResponse {
                     success: false,
                     error_message: e.to_string(),
+                    ..Default::default()
                 }));
             }
+
+            let mut replicas_written = 1i32; // This server's local write
 
             if !req.next_servers.is_empty() {
                 let next_server = &req.next_servers[0];
@@ -1000,8 +1019,18 @@ impl ChunkServerService for MyChunkServer {
                             expected_checksum_crc32c: req.expected_checksum_crc32c,
                         };
 
-                        if let Err(e) = client.replicate_block(replicate_req).await {
-                            tracing::error!("Failed to replicate to {}: {}", next_server, e);
+                        match client.replicate_block(replicate_req).await {
+                            Ok(resp) => {
+                                let inner = resp.into_inner();
+                                if inner.success {
+                                    replicas_written += inner.replicas_written;
+                                } else {
+                                    tracing::error!("Downstream replication failed at {}: {}", next_server, inner.error_message);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to replicate to {}: {}", next_server, e);
+                            }
                         }
                     }
                     Err(e) => {
@@ -1017,6 +1046,7 @@ impl ChunkServerService for MyChunkServer {
             Ok(Response::new(crate::dfs::ReplicateBlockResponse {
                 success: true,
                 error_message: "".to_string(),
+                replicas_written,
             }))
         }
         .instrument(span)
