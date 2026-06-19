@@ -179,6 +179,7 @@ message WriteBlockRequest {
 message WriteBlockResponse {
   bool success = 1;
   string error_message = 2;
+  int32 replicas_written = 3;
 }
 
 message ReadBlockRequest {
@@ -229,6 +230,7 @@ message ReplicateBlockRequest {
 message ReplicateBlockResponse {
   bool success = 1;
   string error_message = 2;
+  int32 replicas_written = 3;
 }
 
 message GetBlockLocationsRequest {
