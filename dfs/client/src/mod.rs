@@ -1,3 +1,4 @@
+pub mod checker;
 pub mod dfs {
     include!(concat!(env!("OUT_DIR"), "/dfs.rs"));
 }
