@@ -7,7 +7,8 @@ use crate::dfs::{
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetClusterInfoRequest,
     GetClusterInfoResponse, GetFileInfoRequest, GetFileInfoResponse, GetSafeModeStatusRequest,
     GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse, IngestMetadataRequest,
-    IngestMetadataResponse, InitiateShuffleRequest, InitiateShuffleResponse, ListFilesRequest,
+    IngestMetadataResponse, InitiateShuffleRequest, InitiateShuffleResponse,
+    InquireTransactionRequest, InquireTransactionResponse, ListFilesRequest,
     ListFilesResponse, PrepareTransactionRequest, PrepareTransactionResponse,
     RegisterChunkServerRequest, RegisterChunkServerResponse, RemoveRaftServerRequest,
     RemoveRaftServerResponse, RenameRequest, RenameResponse, SetSafeModeRequest,
@@ -2681,6 +2682,38 @@ impl MasterService for MyMaster {
                     leader_hint: leader_opt.unwrap_or_default(),
                 })),
                 Err(_) => Err(Status::internal("Raft response error")),
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn inquire_transaction(
+        &self,
+        request: Request<InquireTransactionRequest>,
+    ) -> Result<Response<InquireTransactionResponse>, Status> {
+        let span = dfs_common::telemetry::create_server_span(&request, "inquire_transaction");
+        async move {
+            let req = request.into_inner();
+            let tx_id = req.tx_id;
+
+            self.ensure_linearizable_read().await?;
+
+            let state_lock = self.state.lock().expect("Mutex poisoned");
+            if let AppState::Master(ref state) = *state_lock {
+                let status = match state.transaction_records.get(&tx_id) {
+                    Some(record) => match record.state {
+                        TxState::Committed => "COMMITTED",
+                        TxState::Aborted => "ABORTED",
+                        _ => "UNKNOWN",
+                    },
+                    None => "UNKNOWN", // Presumed Abort
+                };
+                Ok(Response::new(InquireTransactionResponse {
+                    status: status.to_string(),
+                }))
+            } else {
+                Err(Status::internal("Wrong state type"))
             }
         }
         .instrument(span)
