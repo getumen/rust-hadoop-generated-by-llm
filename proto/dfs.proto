@@ -19,6 +19,7 @@ service MasterService {
   rpc PrepareTransaction (PrepareTransactionRequest) returns (PrepareTransactionResponse);
   rpc CommitTransaction (CommitTransactionRequest) returns (CommitTransactionResponse);
   rpc AbortTransaction (AbortTransactionRequest) returns (AbortTransactionResponse);
+  rpc InquireTransaction (InquireTransactionRequest) returns (InquireTransactionResponse);
 
   // DataNode registration (simplified)
   rpc RegisterChunkServer (RegisterChunkServerRequest) returns (RegisterChunkServerResponse);
@@ -484,4 +485,16 @@ message InitiateShuffleResponse {
   bool success = 1;
   string error_message = 2;
   string leader_hint = 3;
+}
+
+// ============================================================================
+// Transaction Inquiry (Presumed Abort Recovery)
+// ============================================================================
+
+message InquireTransactionRequest {
+    string tx_id = 1;
+}
+
+message InquireTransactionResponse {
+    string status = 1;
 }
