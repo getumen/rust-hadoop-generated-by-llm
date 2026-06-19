@@ -349,6 +349,10 @@ pub enum MasterCommand {
     SetParticipantAcked {
         tx_id: String,
     },
+    /// Increment the inquiry retry count for a transaction
+    IncrementInquiryCount {
+        tx_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3178,6 +3182,11 @@ impl RaftNode {
                             if let Some(record) = master_state.transaction_records.get_mut(tx_id) {
                                 record.participant_acked = true;
                                 tracing::info!("Transaction {}: participant acked", tx_id);
+                            }
+                        }
+                        MasterCommand::IncrementInquiryCount { tx_id } => {
+                            if let Some(record) = master_state.transaction_records.get_mut(tx_id) {
+                                record.inquiry_count += 1;
                             }
                         }
                     }
