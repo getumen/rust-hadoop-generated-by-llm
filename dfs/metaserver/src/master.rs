@@ -8,11 +8,10 @@ use crate::dfs::{
     GetClusterInfoResponse, GetFileInfoRequest, GetFileInfoResponse, GetSafeModeStatusRequest,
     GetSafeModeStatusResponse, HeartbeatRequest, HeartbeatResponse, IngestMetadataRequest,
     IngestMetadataResponse, InitiateShuffleRequest, InitiateShuffleResponse,
-    InquireTransactionRequest, InquireTransactionResponse, ListFilesRequest,
-    ListFilesResponse, PrepareTransactionRequest, PrepareTransactionResponse,
-    RegisterChunkServerRequest, RegisterChunkServerResponse, RemoveRaftServerRequest,
-    RemoveRaftServerResponse, RenameRequest, RenameResponse, SetSafeModeRequest,
-    SetSafeModeResponse,
+    InquireTransactionRequest, InquireTransactionResponse, ListFilesRequest, ListFilesResponse,
+    PrepareTransactionRequest, PrepareTransactionResponse, RegisterChunkServerRequest,
+    RegisterChunkServerResponse, RemoveRaftServerRequest, RemoveRaftServerResponse, RenameRequest,
+    RenameResponse, SetSafeModeRequest, SetSafeModeResponse,
 };
 use crate::simple_raft::{AppState, Command, Event, MasterCommand, MembershipCommand, Role};
 use serde::{Deserialize, Serialize};
@@ -2334,7 +2333,7 @@ impl MasterService for MyMaster {
                 let mut dest_metadata = source_metadata.clone();
                 dest_metadata.path = dest_path.clone();
 
-                // Step 1: Create Transaction Record (state = Pending)
+                // Step 1: Create Transaction Record (state = Pending) via Raft
                 let tx_record = TransactionRecord::new_rename(
                     tx_id.clone(),
                     source_path.clone(),
@@ -2356,88 +2355,80 @@ impl MasterService for MyMaster {
                     .await
                     .is_err()
                 {
-                    return Err(Status::internal("Raft channel closed"));
-                }
-
-                if let Err(leader_opt) = rx
-                    .await
-                    .map_err(|_| Status::internal("Raft response error"))?
-                {
+                    tracing::error!("Raft channel closed during 2PC for tx {}", tx_id);
                     return Ok(Response::new(RenameResponse {
                         success: false,
-                        error_message: "Not Leader".to_string(),
-                        leader_hint: leader_opt.unwrap_or_default(),
-                        redirect_hint: "".to_string(),
+                        error_message: "Internal error: Raft unavailable".to_string(),
+                        ..Default::default()
                     }));
                 }
 
-                // Step 2: Send PrepareTransaction to dest shard
+                match rx.await {
+                    Ok(Ok(())) => { /* continue */ }
+                    Ok(Err(leader_opt)) => {
+                        return Ok(Response::new(RenameResponse {
+                            success: false,
+                            error_message: "Not Leader".to_string(),
+                            leader_hint: leader_opt.unwrap_or_default(),
+                            redirect_hint: "".to_string(),
+                        }));
+                    }
+                    _ => {
+                        tracing::error!("Raft commit failed during 2PC for tx {}", tx_id);
+                        return Ok(Response::new(RenameResponse {
+                            success: false,
+                            error_message: "Internal error: Raft commit failed".to_string(),
+                            ..Default::default()
+                        }));
+                    }
+                }
+
+                // Step 2: Update to Prepared state via Raft
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if self
+                    .raft_tx
+                    .send(Event::ClientRequest {
+                        command: Command::Master(MasterCommand::UpdateTransactionState {
+                            tx_id: tx_id.clone(),
+                            new_state: TxState::Prepared,
+                        }),
+                        reply_tx: tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("Raft channel closed during 2PC for tx {}", tx_id);
+                    let _ = self.send_abort_to_dest_shard(&tx_id, &dest_peers).await;
+                    return Ok(Response::new(RenameResponse {
+                        success: false,
+                        error_message: "Internal error: Raft unavailable".to_string(),
+                        ..Default::default()
+                    }));
+                }
+                match rx.await {
+                    Ok(Ok(())) => { /* continue */ }
+                    _ => {
+                        tracing::error!("Raft commit failed during 2PC for tx {}", tx_id);
+                        let _ = self.send_abort_to_dest_shard(&tx_id, &dest_peers).await;
+                        return Ok(Response::new(RenameResponse {
+                            success: false,
+                            error_message: "Internal error: Raft commit failed".to_string(),
+                            ..Default::default()
+                        }));
+                    }
+                }
+
+                // Step 3: Send PrepareTransaction RPC to participant
                 let prepare_result = self
                     .send_prepare_to_dest_shard(&tx_id, &dest_path, &dest_metadata, &dest_peers)
                     .await;
 
                 match prepare_result {
-                    Ok(true) => {
-                        // Step 3: Update to Prepared state
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .raft_tx
-                            .send(Event::ClientRequest {
-                                command: Command::Master(MasterCommand::UpdateTransactionState {
-                                    tx_id: tx_id.clone(),
-                                    new_state: TxState::Prepared,
-                                }),
-                                reply_tx: tx,
-                            })
-                            .await;
-                        let _ = rx.await;
-
-                        // Step 4: Delete source file and update to Committed
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .raft_tx
-                            .send(Event::ClientRequest {
-                                command: Command::Master(
-                                    MasterCommand::ApplyTransactionOperation {
-                                        tx_id: tx_id.clone(),
-                                        operation: TxOperation {
-                                            shard_id: source_shard.clone(),
-                                            op_type: TxOpType::Delete {
-                                                path: source_path.clone(),
-                                            },
-                                        },
-                                    },
-                                ),
-                                reply_tx: tx,
-                            })
-                            .await;
-                        let _ = rx.await;
-
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .raft_tx
-                            .send(Event::ClientRequest {
-                                command: Command::Master(MasterCommand::UpdateTransactionState {
-                                    tx_id: tx_id.clone(),
-                                    new_state: TxState::Committed,
-                                }),
-                                reply_tx: tx,
-                            })
-                            .await;
-                        let _ = rx.await;
-
-                        // Step 5: Send CommitTransaction to dest shard
-                        let _ = self.send_commit_to_dest_shard(&tx_id, &dest_peers).await;
-
-                        Ok(Response::new(RenameResponse {
-                            success: true,
-                            error_message: "".to_string(),
-                            leader_hint: "".to_string(),
-                            redirect_hint: "".to_string(),
-                        }))
-                    }
-                    Ok(false) | Err(_) => {
-                        // Prepare failed - abort transaction
+                    Ok(true) => { /* continue */ }
+                    _ => {
+                        // Prepare failed - abort locally and on participant
+                        tracing::error!("Prepare failed for tx {}, aborting", tx_id);
+                        let _ = self.send_abort_to_dest_shard(&tx_id, &dest_peers).await;
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         let _ = self
                             .raft_tx
@@ -2451,14 +2442,97 @@ impl MasterService for MyMaster {
                             .await;
                         let _ = rx.await;
 
-                        Ok(Response::new(RenameResponse {
+                        return Ok(Response::new(RenameResponse {
                             success: false,
                             error_message: "Cross-shard prepare failed".to_string(),
-                            leader_hint: "".to_string(),
-                            redirect_hint: "".to_string(),
-                        }))
+                            ..Default::default()
+                        }));
                     }
                 }
+
+                // Step 4: Send CommitTransaction RPC to participant
+                match self.send_commit_to_dest_shard(&tx_id, &dest_peers).await {
+                    Ok(true) => { /* proceed to delete source */ }
+                    _ => {
+                        tracing::warn!(
+                            "Commit RPC failed for tx {}. Recovery task will retry.",
+                            tx_id
+                        );
+                        return Ok(Response::new(RenameResponse {
+                            success: false,
+                            error_message: "Cross-shard commit pending, will be retried"
+                                .to_string(),
+                            ..Default::default()
+                        }));
+                    }
+                }
+
+                // Step 5: Delete source file via Raft (commit already sent, so don't abort on failure)
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if self
+                    .raft_tx
+                    .send(Event::ClientRequest {
+                        command: Command::Master(MasterCommand::ApplyTransactionOperation {
+                            tx_id: tx_id.clone(),
+                            operation: TxOperation {
+                                shard_id: source_shard.clone(),
+                                op_type: TxOpType::Delete {
+                                    path: source_path.clone(),
+                                },
+                            },
+                        }),
+                        reply_tx: tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        "Raft channel closed after commit sent for tx {}. Source file may remain.",
+                        tx_id
+                    );
+                }
+                if let Err(e) = rx.await {
+                    tracing::error!(
+                        "Raft response error after commit sent for tx {}: {:?}",
+                        tx_id,
+                        e
+                    );
+                }
+
+                // Step 6: Update to Committed state via Raft
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = self
+                    .raft_tx
+                    .send(Event::ClientRequest {
+                        command: Command::Master(MasterCommand::UpdateTransactionState {
+                            tx_id: tx_id.clone(),
+                            new_state: TxState::Committed,
+                        }),
+                        reply_tx: tx,
+                    })
+                    .await;
+                let _ = rx.await;
+
+                // Step 7: Set participant_acked via Raft
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = self
+                    .raft_tx
+                    .send(Event::ClientRequest {
+                        command: Command::Master(MasterCommand::SetParticipantAcked {
+                            tx_id: tx_id.clone(),
+                        }),
+                        reply_tx: tx,
+                    })
+                    .await;
+                let _ = rx.await;
+
+                // Step 8: Return success
+                Ok(Response::new(RenameResponse {
+                    success: true,
+                    error_message: "".to_string(),
+                    leader_hint: "".to_string(),
+                    redirect_hint: "".to_string(),
+                }))
             }
         }
         .instrument(span)
@@ -3196,6 +3270,54 @@ impl MyMaster {
                         }
                         Err(e) => {
                             tracing::error!("CommitTransaction failed to {}: {}", addr, e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to connect to {}: {}", addr, e);
+                    continue;
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Send AbortTransaction RPC to destination shard
+    async fn send_abort_to_dest_shard(
+        &self,
+        tx_id: &str,
+        dest_peers: &[String],
+    ) -> Result<bool, Status> {
+        use crate::dfs::master_service_client::MasterServiceClient;
+
+        for peer in dest_peers {
+            let addr = if peer.starts_with("http://") {
+                peer.clone()
+            } else {
+                format!("http://{}", peer)
+            };
+
+            match MasterServiceClient::connect(addr.clone()).await {
+                Ok(mut client) => {
+                    let request = tonic::Request::new(AbortTransactionRequest {
+                        tx_id: tx_id.to_string(),
+                    });
+
+                    match client.abort_transaction(request).await {
+                        Ok(response) => {
+                            let resp = response.into_inner();
+                            if resp.success {
+                                return Ok(true);
+                            }
+                            if !resp.leader_hint.is_empty() {
+                                continue;
+                            }
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            tracing::error!("AbortTransaction failed to {}: {}", addr, e);
                             continue;
                         }
                     }

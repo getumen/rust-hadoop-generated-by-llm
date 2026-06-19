@@ -345,6 +345,10 @@ pub enum MasterCommand {
         /// New BlockInfo list with EC shard locations replacing replication locations
         new_blocks: Vec<crate::dfs::BlockInfo>,
     },
+    /// Mark participant as having acknowledged a cross-shard transaction
+    SetParticipantAcked {
+        tx_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3011,7 +3015,11 @@ impl RaftNode {
                                 crate::master::TxOpType::Create { path, metadata } => {
                                     if !master_state.files.contains_key(path) {
                                         master_state.files.insert(path.clone(), metadata.clone());
-                                        tracing::info!("Transaction {}: created file {}", tx_id, path);
+                                        tracing::info!(
+                                            "Transaction {}: created file {}",
+                                            tx_id,
+                                            path
+                                        );
                                     } else {
                                         tracing::info!("Transaction {}: file {} already exists (idempotent skip)", tx_id, path);
                                     }
@@ -3164,6 +3172,12 @@ impl RaftNode {
                                     ec_data_shards,
                                     ec_parity_shards
                                 );
+                            }
+                        }
+                        MasterCommand::SetParticipantAcked { tx_id } => {
+                            if let Some(record) = master_state.transaction_records.get_mut(tx_id) {
+                                record.participant_acked = true;
+                                tracing::info!("Transaction {}: participant acked", tx_id);
                             }
                         }
                     }
