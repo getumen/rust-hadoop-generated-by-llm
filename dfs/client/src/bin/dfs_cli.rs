@@ -89,6 +89,28 @@ enum Commands {
         #[command(subcommand)]
         action: BenchmarkAction,
     },
+    /// Check a JSONL history file for linearizability violations
+    CheckHistory {
+        /// Path to JSONL history file
+        #[arg(default_value = "")]
+        path: String,
+        /// Run built-in self-tests instead
+        #[arg(long)]
+        self_test: bool,
+    },
+    /// Run concurrent workload and record operation history
+    Workload {
+        #[arg(long, default_value = "50")]
+        ops: usize,
+        #[arg(long, default_value = "5")]
+        clients: usize,
+        #[arg(long, default_value = "4")]
+        key_space: usize,
+        #[arg(long, default_value = "0.3")]
+        rename_ratio: f64,
+        #[arg(long)]
+        history: String,
+    },
     /// Generate a pre-signed URL for temporary access to an object
     Presign {
         /// S3 URL of the object (e.g. s3://bucket/key)
@@ -497,6 +519,62 @@ async fn main() -> anyhow::Result<()> {
 
             let presigned_url = dfs_common::auth::presign::generate_presigned_url(&params);
             println!("{}", presigned_url);
+        }
+        Commands::CheckHistory { path, self_test } => {
+            if self_test {
+                match dfs_client::checker::run_self_tests() {
+                    Ok(()) => {
+                        println!("All checker self-tests passed.");
+                    }
+                    Err(e) => {
+                        eprintln!("Checker self-test FAILED: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let file = std::fs::File::open(&path).unwrap_or_else(|e| {
+                    eprintln!("Cannot open {}: {}", path, e);
+                    std::process::exit(1);
+                });
+                let reader = std::io::BufReader::new(file);
+                let ops = dfs_client::checker::parse_history(reader).unwrap_or_else(|e| {
+                    eprintln!("Parse error: {}", e);
+                    std::process::exit(1);
+                });
+                println!("Parsed {} operations", ops.len());
+                match dfs_client::checker::check_linearizability(&ops) {
+                    Ok(()) => {
+                        println!("Linearizability check PASSED");
+                    }
+                    Err(violations) => {
+                        eprintln!("Linearizability FAILED:");
+                        for v in &violations {
+                            eprintln!("  - {}", v);
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::Workload {
+            ops,
+            clients,
+            key_space,
+            rename_ratio,
+            history,
+        } => {
+            let config = dfs_client::workload::WorkloadConfig {
+                ops_per_client: ops,
+                num_clients: clients,
+                key_space,
+                rename_ratio,
+                history_path: history,
+            };
+            if let Err(e) = dfs_client::workload::run_workload(client, config).await {
+                eprintln!("Workload failed: {}", e);
+                std::process::exit(1);
+            }
+            println!("Workload completed.");
         }
         Commands::Benchmark { action } => {
             match action {
