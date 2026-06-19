@@ -88,6 +88,15 @@ pub struct TransactionRecord {
     pub participants: Vec<String>,
     /// Operations to be performed on each shard
     pub operations: Vec<TxOperation>,
+    /// Which shard is the coordinator for this transaction
+    #[serde(default)]
+    pub coordinator_shard: String,
+    /// Whether the participant has acknowledged the commit
+    #[serde(default)]
+    pub participant_acked: bool,
+    /// Number of inquiry retries performed
+    #[serde(default)]
+    pub inquiry_count: u32,
 }
 
 impl TransactionRecord {
@@ -116,7 +125,7 @@ impl TransactionRecord {
             participants: vec![source_shard.clone(), dest_shard.clone()],
             operations: vec![
                 TxOperation {
-                    shard_id: source_shard,
+                    shard_id: source_shard.clone(),
                     op_type: TxOpType::Delete { path: source_path },
                 },
                 TxOperation {
@@ -127,6 +136,9 @@ impl TransactionRecord {
                     },
                 },
             ],
+            coordinator_shard: source_shard,
+            participant_acked: false,
+            inquiry_count: 0,
         }
     }
 
@@ -2505,6 +2517,9 @@ impl MasterService for MyMaster {
                         metadata: metadata.unwrap_or_default(),
                     },
                 }],
+                coordinator_shard: req.coordinator_shard.clone(),
+                participant_acked: false,
+                inquiry_count: 0,
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
