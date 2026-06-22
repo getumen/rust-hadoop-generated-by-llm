@@ -719,11 +719,31 @@ async fn run_liveness_checker(state: Arc<Mutex<AppState>>) {
                 .map(|(addr, _)| addr.clone())
                 .collect();
 
-            for addr in dead_servers {
+            for addr in &dead_servers {
                 tracing::warn!("ChunkServer {} is dead (no heartbeat), removing...", addr);
-                state.chunk_servers.remove(&addr);
-                state.pending_commands.remove(&addr);
+                state.chunk_servers.remove(addr);
+                state.pending_commands.remove(addr);
             }
+
+            // Trigger healer to fix under-replicated blocks after dead server removal
+            if !dead_servers.is_empty() {
+                heal_under_replicated_blocks(state);
+            }
+        }
+    }
+}
+
+async fn run_periodic_healer(state: Arc<Mutex<AppState>>) {
+    // Wait 60 seconds before first run to let cluster stabilize
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+    loop {
+        interval.tick().await;
+
+        let mut state_lock = state.lock().expect("Mutex poisoned");
+        if let AppState::Master(ref mut master_state) = *state_lock {
+            heal_under_replicated_blocks(master_state);
         }
     }
 }
@@ -1808,6 +1828,7 @@ impl MyMaster {
         let domain_name = config.domain_name.clone();
 
         tokio::spawn(run_liveness_checker(state.clone()));
+        tokio::spawn(run_periodic_healer(state.clone()));
         tokio::spawn(run_block_balancer(state.clone()));
         tokio::spawn(run_transaction_cleanup(
             state.clone(),
