@@ -58,6 +58,7 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   bool success = 1;
   repeated ChunkServerCommand commands = 2;
+  uint64 master_term = 3;
 }
 
 message ChunkServerCommand {
@@ -77,6 +78,7 @@ message ChunkServerCommand {
   int32 ec_parity_shards = 6;
   repeated string ec_shard_sources = 7;  // CS address per shard (k+m entries, empty string = unavailable)
   uint64 original_block_size = 8;
+  uint64 master_term = 9;
 }
 
 service ChunkServerService {
@@ -119,6 +121,7 @@ message AllocateBlockResponse {
   // Echo of EC policy from the file
   int32 ec_data_shards = 4;
   int32 ec_parity_shards = 5;
+  uint64 master_term = 6;
 }
 
 message CompleteFileRequest {
@@ -174,6 +177,7 @@ message WriteBlockRequest {
   repeated string next_servers = 3; // For replication pipeline
   uint32 expected_checksum_crc32c = 4;
   int32 shard_index = 5;  // -1 = replicated, 0..k+m-1 = EC shard index
+  uint64 master_term = 6; // Epoch-based fencing: Raft term of the master that allocated this block
 }
 
 message WriteBlockResponse {
@@ -225,6 +229,7 @@ message ReplicateBlockRequest {
   bytes data = 2;
   repeated string next_servers = 3; // Remaining servers in the pipeline
   uint32 expected_checksum_crc32c = 4;
+  uint64 master_term = 5; // Epoch-based fencing: Raft term of the master that issued this replication
 }
 
 message ReplicateBlockResponse {

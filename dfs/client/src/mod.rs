@@ -293,6 +293,7 @@ impl Client {
             .block
             .ok_or_else(|| anyhow!("No block allocated"))?;
         let chunk_servers = alloc_resp.chunk_server_addresses;
+        let master_term = alloc_resp.master_term;
 
         if chunk_servers.is_empty() {
             bail!("No chunk servers available");
@@ -363,6 +364,7 @@ impl Client {
                         next_servers: vec![],
                         expected_checksum_crc32c: checksum,
                         shard_index: shard_idx_i32,
+                        master_term,
                     });
                     let resp = cs_client.write_block(req).await?.into_inner();
                     if !resp.success {
@@ -441,6 +443,7 @@ impl Client {
             next_servers,
             expected_checksum_crc32c: checksum_crc32c,
             shard_index: -1, // -1 = replicated (not EC)
+            master_term,
         });
 
         let write_resp = chunk_client.write_block(write_req).await?.into_inner();
@@ -565,6 +568,7 @@ impl Client {
             .block
             .ok_or_else(|| anyhow!("No block allocated"))?;
         let chunk_servers = alloc_resp.chunk_server_addresses;
+        let master_term = alloc_resp.master_term;
 
         if chunk_servers.is_empty() {
             bail!("No chunk servers available for EC write");
@@ -629,6 +633,7 @@ impl Client {
                     next_servers: vec![],
                     expected_checksum_crc32c: checksum,
                     shard_index: shard_idx_i32,
+                    master_term,
                 });
                 let resp = cs_client.write_block(req).await?.into_inner();
                 if !resp.success {

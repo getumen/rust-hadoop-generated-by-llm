@@ -9,6 +9,7 @@ use tracing::Instrument;
 use dfs_common::sharding::ShardMap;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const MAX_GRPC_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
@@ -34,6 +35,9 @@ pub struct MyChunkServer {
     domain_name: Option<String>,
     /// Corrupted block IDs detected by the scrubber, waiting to be reported to Master.
     pub pending_bad_blocks: Arc<Mutex<Vec<String>>>,
+    /// Highest Raft term seen from any master. Used for epoch-based fencing
+    /// to reject write/replicate requests from stale (pre-partition) leaders.
+    pub known_term: Arc<AtomicU64>,
 }
 
 impl MyChunkServer {
@@ -85,6 +89,7 @@ impl MyChunkServer {
             ca_cert_path,
             domain_name,
             pending_bad_blocks: Arc::new(Mutex::new(Vec::new())),
+            known_term: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -484,6 +489,7 @@ impl MyChunkServer {
             data,
             next_servers: vec![], // No further forwarding
             expected_checksum_crc32c: 0,
+            master_term: self.known_term.load(Ordering::Relaxed),
         });
 
         match client.replicate_block(request).await {
@@ -722,7 +728,19 @@ impl ChunkServerService for MyChunkServer {
         let span = tracing::info_span!("write_block", request_id = %request_id);
         async move {
             let req = request.into_inner();
-            // ...
+
+            // Epoch-based fencing: reject writes from stale leaders
+            let req_term = req.master_term;
+            let known = self.known_term.load(Ordering::Relaxed);
+            if req_term > 0 && req_term < known {
+                return Err(Status::failed_precondition(format!(
+                    "Stale master term: request has {} but known term is {}",
+                    req_term, known
+                )));
+            }
+            if req_term > known {
+                self.known_term.store(req_term, Ordering::Relaxed);
+            }
 
             // Verify checksum if provided
             if req.expected_checksum_crc32c != 0 {
@@ -773,6 +791,7 @@ impl ChunkServerService for MyChunkServer {
                             data: req.data.clone(),
                             next_servers: remaining_servers,
                             expected_checksum_crc32c: req.expected_checksum_crc32c,
+                            master_term: req.master_term,
                         };
 
                         match client.replicate_block(replicate_req).await {
@@ -970,6 +989,19 @@ impl ChunkServerService for MyChunkServer {
         async move {
             let req = request.into_inner();
 
+            // Epoch-based fencing: reject replication from stale leaders
+            let req_term = req.master_term;
+            let known = self.known_term.load(Ordering::Relaxed);
+            if req_term > 0 && req_term < known {
+                return Err(Status::failed_precondition(format!(
+                    "Stale master term: request has {} but known term is {}",
+                    req_term, known
+                )));
+            }
+            if req_term > known {
+                self.known_term.store(req_term, Ordering::Relaxed);
+            }
+
             // Verify checksum if provided (Phase 3: ChunkServer In-flight Verification)
             if req.expected_checksum_crc32c != 0 {
                 let mut hasher = crc32fast::Hasher::new();
@@ -1017,6 +1049,7 @@ impl ChunkServerService for MyChunkServer {
                             data: req.data,
                             next_servers: remaining_servers,
                             expected_checksum_crc32c: req.expected_checksum_crc32c,
+                            master_term: req.master_term,
                         };
 
                         match client.replicate_block(replicate_req).await {

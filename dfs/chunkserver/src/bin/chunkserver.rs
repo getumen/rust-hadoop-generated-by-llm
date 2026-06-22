@@ -254,6 +254,19 @@ async fn main() -> anyhow::Result<()> {
                             Ok(response) => {
                                 tracing::debug!("Heartbeat successful to {}", master_url);
                                 let resp = response.into_inner();
+
+                                // Update known_term from master's heartbeat response (epoch fencing)
+                                if resp.master_term
+                                    > chunk_server_heartbeat
+                                        .known_term
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    chunk_server_heartbeat.known_term.store(
+                                        resp.master_term,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+
                                 use dfs_chunkserver::dfs::chunk_server_command::CommandType;
                                 for command in resp.commands {
                                     match CommandType::try_from(command.r#type) {

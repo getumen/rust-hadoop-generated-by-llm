@@ -16,6 +16,7 @@ use crate::dfs::{
 use crate::simple_raft::{AppState, Command, Event, MasterCommand, MembershipCommand, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -526,6 +527,7 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                             ec_parity_shards: block.ec_parity_shards,
                             ec_shard_sources: sources,
                             original_block_size: block.original_size,
+                            master_term: 0, // Term set by heartbeat response
                         });
                     tracing::info!(
                         "Healer: scheduled EC reconstruction of shard {} of block {} to {}",
@@ -585,6 +587,7 @@ fn heal_under_replicated_blocks(state: &mut MasterState) {
                             ec_parity_shards: 0,
                             ec_shard_sources: vec![],
                             original_block_size: 0,
+                            master_term: 0, // Term set by heartbeat response
                         });
                     tracing::info!(
                         "Healer: scheduled replication of block {} from {} to {}",
@@ -698,6 +701,29 @@ pub struct MyMaster {
     _master_address: String,
     _config_server_addrs: Vec<String>,
     config: MasterConfig,
+    /// Current Raft term, updated by a background poller.
+    /// Used for epoch-based fencing so ChunkServers can reject stale leader commands.
+    current_term: Arc<AtomicU64>,
+}
+
+/// Background task that polls the Raft node for the current term and updates
+/// the shared `AtomicU64`. This allows the Master to stamp commands with the
+/// current term without blocking on the Raft event loop.
+async fn run_term_updater(raft_tx: mpsc::Sender<Event>, current_term: Arc<AtomicU64>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if raft_tx
+            .send(Event::GetClusterInfo { reply_tx: tx })
+            .await
+            .is_ok()
+        {
+            if let Ok(info) = rx.await {
+                current_term.store(info.current_term, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 async fn run_liveness_checker(state: Arc<Mutex<AppState>>) {
@@ -1866,6 +1892,9 @@ impl MyMaster {
             domain_name,
         ));
 
+        let current_term = Arc::new(AtomicU64::new(0));
+        tokio::spawn(run_term_updater(raft_tx.clone(), current_term.clone()));
+
         MyMaster {
             state,
             raft_tx,
@@ -1875,6 +1904,7 @@ impl MyMaster {
             _master_address: config.master_address.clone(),
             _config_server_addrs: config.config_server_addrs.clone(),
             config,
+            current_term,
         }
     }
 
@@ -2400,6 +2430,7 @@ impl MasterService for MyMaster {
                 return Err(Status::internal("Raft channel closed"));
             }
 
+            let term = self.current_term.load(Ordering::Relaxed);
             match rx.await {
                 Ok(Ok(())) => {
                     let block = BlockInfo {
@@ -2417,6 +2448,7 @@ impl MasterService for MyMaster {
                         leader_hint: "".to_string(),
                         ec_data_shards: ec_data,
                         ec_parity_shards: ec_parity,
+                        master_term: term,
                     }))
                 }
                 Ok(Err(leader_opt)) => {
@@ -2428,6 +2460,7 @@ impl MasterService for MyMaster {
                         leader_hint,
                         ec_data_shards: 0,
                         ec_parity_shards: 0,
+                        master_term: 0,
                     }))
                 }
                 Err(_) => Err(Status::internal("Raft response error")),
@@ -2633,14 +2666,17 @@ impl MasterService for MyMaster {
                     .remove(&req.chunk_server_address)
                     .unwrap_or_default();
 
+                let term = self.current_term.load(Ordering::Relaxed);
                 Ok(Response::new(HeartbeatResponse {
                     success: true,
                     commands,
+                    master_term: term,
                 }))
             } else {
                 Ok(Response::new(HeartbeatResponse {
                     success: false,
                     commands: vec![],
+                    master_term: 0,
                 }))
             }
         }
