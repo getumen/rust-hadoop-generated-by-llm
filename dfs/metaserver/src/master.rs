@@ -3314,6 +3314,8 @@ impl MasterService for MyMaster {
     ) -> Result<Response<GetSafeModeStatusResponse>, Status> {
         let span = dfs_common::telemetry::create_server_span(&_request, "get_safe_mode_status");
         async move {
+            self.ensure_linearizable_read().await?;
+
             let state_lock = self.state.lock().expect("Mutex poisoned");
             if let AppState::Master(ref state) = *state_lock {
                 Ok(Response::new(GetSafeModeStatusResponse {
