@@ -19,6 +19,23 @@ impl MyConfigServer {
     pub fn new(state: Arc<Mutex<AppState>>, raft_tx: mpsc::Sender<Event>) -> Self {
         MyConfigServer { state, raft_tx }
     }
+
+    async fn ensure_linearizable_read(&self) -> Result<(), Status> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.raft_tx
+            .send(Event::GetReadIndex { reply_tx: tx })
+            .await
+            .map_err(|e| Status::internal(format!("Failed to send to Raft node: {}", e)))?;
+
+        match rx.await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(hint)) => Err(Status::failed_precondition(format!(
+                "Not Leader|{}",
+                hint.unwrap_or_default()
+            ))),
+            Err(_) => Err(Status::internal("Raft response error")),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -27,6 +44,8 @@ impl ConfigService for MyConfigServer {
         &self,
         _request: Request<FetchShardMapRequest>,
     ) -> Result<Response<FetchShardMapResponse>, Status> {
+        self.ensure_linearizable_read().await?;
+
         let state_lock = self.state.lock().unwrap();
         if let AppState::Config(ref config_state) = *state_lock {
             let mut shards = HashMap::new();
