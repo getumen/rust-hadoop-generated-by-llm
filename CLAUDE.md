@@ -39,6 +39,11 @@ bash test_scripts/rename_test.sh
 
 Debug logging: `RUST_LOG=debug cargo run --bin master -- [args]`
 
+## Merge Rules
+
+- **Bug reports and documentation-only changes**: `cargo test --lib` passing is sufficient. `run_all_tests.sh` (Docker integration tests) is NOT required.
+- **Code changes**: `cargo test --lib` required. `run_all_tests.sh` recommended for changes to core logic (Raft, replication, sharding, S3 handlers).
+
 ## Architecture
 
 ### Workspace Structure
