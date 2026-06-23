@@ -51,9 +51,13 @@ pub async fn auth_middleware(
     };
 
     // 1.5 Skip auth for STS requests (they authenticate via OIDC JWT internally)
-    if let Some(query) = req.uri().query() {
-        if query.contains("Action=AssumeRoleWithWebIdentity") {
-            return next.run(req).await;
+    // Only skip for POST to root path — the actual STS endpoint.
+    // Never skip auth for bucket/object paths regardless of query parameters.
+    if method == axum::http::Method::POST && path == "/" {
+        if let Some(query) = req.uri().query() {
+            if query.contains("Action=AssumeRoleWithWebIdentity") {
+                return next.run(req).await;
+            }
         }
     }
 
