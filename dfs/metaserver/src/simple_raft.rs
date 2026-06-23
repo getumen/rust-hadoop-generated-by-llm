@@ -622,6 +622,9 @@ pub struct RaftNode {
 
     /// Pending ReadIndex requests awaiting majority confirmation.
     pub pending_read_indices: Vec<ReadIndexRequest>,
+    /// Pending ClientRequest reply channels, keyed by absolute log index.
+    /// Replies are sent when the entry is committed and applied.
+    pub pending_replies: HashMap<usize, tokio::sync::oneshot::Sender<Result<(), Option<String>>>>,
     /// Timestamp of the last heartbeat sent (leader only).
     pub last_heartbeat_time: Instant,
     /// Timestamp of the last majority acknowledgment received.
@@ -762,6 +765,7 @@ impl RaftNode {
             db,
             http_client,
             pending_read_indices: vec![],
+            pending_replies: HashMap::new(),
             last_heartbeat_time: Instant::now(),
             last_majority_ack_time: Instant::now(),
             cluster_config,
@@ -1642,6 +1646,37 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Centralized leader-to-follower transition. Updates term/vote if the
+    /// incoming term is higher, sets the leader address hint, and drains all
+    /// pending client replies and read-index requests with a redirect error.
+    fn step_down_to_follower(&mut self, term: u64, leader_hint: Option<String>) {
+        let was_leader = self.role == Role::Leader;
+        self.role = Role::Follower;
+        if term > self.current_term {
+            self.current_term = term;
+            self.voted_for = None;
+            if let Err(e) = self.save_term() {
+                tracing::error!("Failed to save term on stepdown: {}", e);
+            }
+            if let Err(e) = self.save_vote() {
+                tracing::error!("Failed to save vote on stepdown: {}", e);
+            }
+        }
+        if let Some(hint) = &leader_hint {
+            self.current_leader_address = Some(hint.clone());
+        }
+        // Drain pending write replies (only exist if we were leader)
+        if was_leader {
+            for (_, reply_tx) in self.pending_replies.drain() {
+                let _ = reply_tx.send(Err(leader_hint.clone()));
+            }
+            // Drain pending read-index replies
+            for req in self.pending_read_indices.drain(..) {
+                let _ = req.reply_tx.send(Err(leader_hint.clone()));
+            }
+        }
+    }
+
     async fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Rpc { msg, reply_tx } => {
@@ -1779,13 +1814,7 @@ impl RaftNode {
                             args.term,
                             self.current_term
                         );
-                        self.current_term = args.term;
-                        self.save_term()?; // Persist term
-
-                        self.role = Role::Follower;
-                        self.voted_for = None;
-                        self.save_vote()?; // Persist vote (None)
-
+                        self.step_down_to_follower(args.term, None);
                         self.current_leader = None;
                         self.current_leader_address = None;
                     }
@@ -1861,13 +1890,7 @@ impl RaftNode {
                         self.id,
                         reply.term
                     );
-                    self.current_term = reply.term;
-                    self.save_term()?; // Persist term
-
-                    self.role = Role::Follower;
-                    self.voted_for = None;
-                    self.save_vote()?; // Persist vote
-
+                    self.step_down_to_follower(reply.term, None);
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
@@ -1884,15 +1907,9 @@ impl RaftNode {
                             self.id,
                             args.term
                         );
-                        self.current_term = args.term;
-                        self.save_term()?;
-                        self.voted_for = None; // Clear vote on new term
-                        self.save_vote()?;
                     }
-
-                    self.role = Role::Follower;
+                    self.step_down_to_follower(args.term, Some(args.leader_address.clone()));
                     self.current_leader = Some(args.leader_id);
-                    self.current_leader_address = Some(args.leader_address.clone());
                     self.last_election_time = Instant::now();
 
                     // Check if prev_log_index is in snapshot
@@ -2166,11 +2183,7 @@ impl RaftNode {
                         self.id,
                         reply.term
                     );
-                    self.current_term = reply.term;
-                    self.save_term()?;
-                    self.role = Role::Follower;
-                    self.voted_for = None;
-                    self.save_vote()?;
+                    self.step_down_to_follower(reply.term, None);
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
@@ -2184,13 +2197,8 @@ impl RaftNode {
                             self.id,
                             args.term
                         );
-                        self.current_term = args.term;
-                        self.save_term()?;
-                        self.voted_for = None; // Clear vote on new term
-                        self.save_vote()?;
                     }
-
-                    self.role = Role::Follower;
+                    self.step_down_to_follower(args.term, None);
                     self.current_leader = Some(args.leader_id);
                     self.last_election_time = Instant::now();
 
@@ -2264,11 +2272,7 @@ impl RaftNode {
                         self.id,
                         reply.term
                     );
-                    self.current_term = reply.term;
-                    self.save_term()?;
-                    self.role = Role::Follower;
-                    self.voted_for = None;
-                    self.save_vote()?;
+                    self.step_down_to_follower(reply.term, None);
                     self.current_leader = None;
                     self.current_leader_address = None;
                 }
@@ -2290,11 +2294,7 @@ impl RaftNode {
                 }
 
                 if args.term > self.current_term {
-                    self.current_term = args.term;
-                    self.save_term()?;
-                    self.voted_for = None;
-                    self.save_vote()?;
-                    self.role = Role::Follower;
+                    self.step_down_to_follower(args.term, None);
                 }
 
                 // Immediately start election
@@ -2712,7 +2712,7 @@ impl RaftNode {
             "Leader stepping down after initiating transfer to {}",
             target_id
         );
-        self.role = Role::Follower;
+        self.step_down_to_follower(self.current_term, None);
         self.current_leader = None;
         self.current_leader_address = None;
 
