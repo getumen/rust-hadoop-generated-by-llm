@@ -130,10 +130,20 @@ S3互換サービスとしての信頼確保。
 - [x] **Dynamic Membership**: Support for adding/removing Master nodes via Joint Consensus.
 - [x] **Self-Healing Base**: Heartbeat-based liveness and basic block reporting.
 
+### Strong Consistency & Safety (2026-06)
+- [x] **Cross-Shard 2PC Recovery**: Presumed Abort protocol with InquireTransaction RPC, participant inquiry, coordinator recovery task. Source deletion deferred until after commit confirmation. Idempotency guards on prepare/commit/apply. (#50)
+- [x] **Synchronous Pipeline Replication**: Write/ReplicateBlockResponse now includes `replicas_written` count. Each ChunkServer waits for downstream ack before responding. Client logs under-replication warnings. (#52)
+- [x] **Epoch-Based Fencing**: ChunkServers track highest Raft term seen and reject write/replicate from stale leaders. Master includes `master_term` in block allocation, heartbeat, and commands. (#54)
+- [x] **Linearizable Read Enforcement**: All read RPCs (`get_file_info`, `list_files`, `get_block_locations`, `get_safe_mode_status`, `fetch_shard_map`) now call `ensure_linearizable_read()`. (#55)
+- [x] **Raft Commit-Wait**: ClientRequest reply deferred until after Raft commit (majority replication + apply). Fixes safety bug where uncommitted writes returned success. (#56)
+- [x] **Raft Leader-Side Log Batching**: Event loop batch drain (up to 256 events). Multiple ClientRequests share one `WriteBatch` + one `send_heartbeats()` round. (#56)
+- [x] **step_down_to_follower Helper**: All 8 leader stepdown paths centralized. Drains `pending_replies` + `pending_read_indices` on every transition. (#56)
+
 ### Testing & Quality Assurance
-- [x] **Unit Testing**: Over 20 tests covering Raft state machine and core logic.
-- [x] **Integration Testing**: Chaos tests (Network partitions) and consistency checkers.
+- [x] **Unit Testing**: 105+ tests covering Raft, transactions, checksums, erasure coding, auth, linearizability checker.
+- [x] **Integration Testing**: 22+ shell scripts covering chaos, network partition, cross-shard, S3, IAM, TLS, erasure coding, SSE, bucket policy.
 - [x] **Toxiproxy Integration**: Simulating network instability in local K8s.
+- [x] **Linearizability Testing Framework**: WGL checker with Register+Rename model, concurrent workload generator (`dfs_cli workload`), 7 fault-injection scenarios via Docker+Toxiproxy. (#51)
 
 ### Observability & Infrastructure
 - [x] **Metrics & Dashboards**: Prometheus exporters for Metaserver/S3Server and Grafana dashboards.
@@ -144,6 +154,7 @@ S3互換サービスとしての信頼確保。
 - [x] **RaftNode Initialization**: Refactored `RaftNode::new` to use `RaftNodeConfig` struct.
 - [x] **Clippy Compliance**: Fixed all clippy warnings across meta-server, chunk-server, and test suites.
 - [x] **Large Result Types**: Resolved large `Result` variant warnings by boxing large error types or adding allows.
+- [x] **Tech Debt Cleanup**: eprintln→tracing, connect_endpoint dedup, magic number constants, auth_middleware/master background task extraction, partial read checksum. (#49)
 
-**Last Updated**: 2026-03-19
+**Last Updated**: 2026-06-23
 **Maintainer**: Development Team
