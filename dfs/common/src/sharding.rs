@@ -168,9 +168,13 @@ impl ShardMap {
                 if ranges.is_empty() {
                     return None;
                 }
-                // Find the first entry with a key (end-range) > key
-                // Since we use exclusive end, we want the first range-end that is >= key
-                let entry = ranges.range(key.to_string()..).next();
+                // Find the first entry with range-end strictly greater than key.
+                // Range boundaries are exclusive upper bounds, so a key equal to a
+                // boundary belongs to the NEXT shard, not the one whose end matches.
+                use std::ops::Bound;
+                let entry = ranges
+                    .range((Bound::Excluded(key.to_string()), Bound::Unbounded))
+                    .next();
                 entry.map(|(_, shard_id)| shard_id.clone())
             }
         }
@@ -448,5 +452,43 @@ mod tests {
         assert_eq!(map.get_shard("/mango").unwrap(), "shard-2");
         assert_eq!(map.get_shard("/orange").unwrap(), "shard-2");
         assert_eq!(map.get_shard("/zebra").unwrap(), "shard-0");
+    }
+
+    #[test]
+    fn test_range_boundary_exclusive() {
+        // Verify that keys exactly at a range boundary belong to the NEXT shard,
+        // not the shard whose exclusive upper bound equals that key.
+        let mut map = ShardMap::new_range();
+        map.add_shard("shard-0".to_string(), vec![]);
+        // shard-1 covers [min, "/m"), shard-0 covers ["/m", max)
+        map.split_shard("/m".to_string(), "shard-1".to_string(), vec![]);
+
+        // Key just below boundary → shard-1
+        assert_eq!(map.get_shard("/lzzz").unwrap(), "shard-1");
+        // Key exactly at boundary → shard-0 (boundary is exclusive upper bound of shard-1)
+        assert_eq!(map.get_shard("/m").unwrap(), "shard-0");
+        // Key just above boundary → shard-0
+        assert_eq!(map.get_shard("/m0").unwrap(), "shard-0");
+
+        // With 3 shards: shard-1=[min,"/m"), shard-2=["/m","/t"), shard-0=["/t",max)
+        map.split_shard("/t".to_string(), "shard-2".to_string(), vec![]);
+
+        assert_eq!(map.get_shard("/lzzz").unwrap(), "shard-1");
+        assert_eq!(map.get_shard("/m").unwrap(), "shard-2");
+        assert_eq!(map.get_shard("/szzz").unwrap(), "shard-2");
+        assert_eq!(map.get_shard("/t").unwrap(), "shard-0");
+        assert_eq!(map.get_shard("/t0").unwrap(), "shard-0");
+    }
+
+    #[test]
+    fn test_range_empty_key() {
+        let mut map = ShardMap::new_range();
+        map.add_shard("shard-0".to_string(), vec![]);
+        // Empty key should map to the single shard
+        assert_eq!(map.get_shard("").unwrap(), "shard-0");
+
+        // After split, empty key should map to the first shard
+        map.split_shard("/m".to_string(), "shard-1".to_string(), vec![]);
+        assert_eq!(map.get_shard("").unwrap(), "shard-1");
     }
 }
