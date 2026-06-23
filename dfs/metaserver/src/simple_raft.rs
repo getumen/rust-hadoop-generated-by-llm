@@ -1172,8 +1172,15 @@ impl RaftNode {
                     }
                 }
                 Some(event) = self.inbox.recv() => {
-                    if let Err(e) = self.handle_event(event).await {
-                        tracing::error!("Error in handle_event: {:?}", e);
+                    let mut events = vec![event];
+                    while events.len() < 256 {
+                        match self.inbox.try_recv() {
+                            Ok(more) => events.push(more),
+                            Err(_) => break,
+                        }
+                    }
+                    if let Err(e) = self.handle_event_batch(events).await {
+                        tracing::error!("Error in handle_event_batch: {:?}", e);
                     }
                 }
             }
@@ -1675,6 +1682,99 @@ impl RaftNode {
                 let _ = req.reply_tx.send(Err(leader_hint.clone()));
             }
         }
+    }
+
+    /// Process a batch of events, grouping ClientRequests for batched disk
+    /// writes and a single round of AppendEntries RPCs.
+    async fn handle_event_batch(&mut self, events: Vec<Event>) -> Result<()> {
+        // Separate into client requests and other events
+        let mut client_requests = Vec::new();
+        let mut other_events = Vec::new();
+
+        for event in events {
+            match event {
+                Event::ClientRequest { .. } => client_requests.push(event),
+                other => other_events.push(other),
+            }
+        }
+
+        // Process non-ClientRequests first (may trigger stepdown)
+        for event in other_events {
+            self.handle_event(event).await?;
+        }
+
+        // Process ClientRequests as a batch (if still leader)
+        if client_requests.is_empty() {
+            return Ok(());
+        }
+
+        if self.role != Role::Leader {
+            // Not leader — reject all with leader hint
+            let hint = self.current_leader_address.clone();
+            for event in client_requests {
+                if let Event::ClientRequest { reply_tx, .. } = event {
+                    let _ = reply_tx.send(Err(hint.clone()));
+                }
+            }
+            return Ok(());
+        }
+
+        // Leader: batch append all entries
+        let pre_batch_len = self.log.len();
+        let mut batch_entries = Vec::new();
+        let mut batch_reply_txs = Vec::new();
+
+        for event in client_requests {
+            if let Event::ClientRequest { command, reply_tx } = event {
+                let entry = LogEntry {
+                    term: self.current_term,
+                    command,
+                };
+                self.log.push(entry.clone());
+                let absolute_index = self.last_included_index + self.log.len() - 1;
+                batch_entries.push((absolute_index, entry));
+                batch_reply_txs.push((absolute_index, reply_tx));
+            }
+        }
+
+        // Batch disk write
+        let entries_ref: Vec<(usize, &LogEntry)> = batch_entries
+            .iter()
+            .map(|(idx, entry)| (*idx, entry))
+            .collect();
+
+        if let Err(e) = self.save_log_entries_batch(&entries_ref) {
+            // Rollback: truncate in-memory log
+            tracing::error!(
+                "Failed to persist batch of {} entries: {}",
+                batch_entries.len(),
+                e
+            );
+            self.log.truncate(pre_batch_len);
+            for (_, reply_tx) in batch_reply_txs {
+                let _ = reply_tx.send(Err(None));
+            }
+            return Err(e);
+        }
+
+        // Store reply senders
+        for (idx, reply_tx) in batch_reply_txs {
+            self.pending_replies.insert(idx, reply_tx);
+        }
+
+        // Single-node: immediate commit
+        if self.peers.is_empty() {
+            let last_index = self.last_included_index + self.log.len() - 1;
+            if last_index > self.commit_index {
+                self.commit_index = last_index;
+                self.apply_logs();
+            }
+        }
+
+        // Send heartbeats once for the whole batch
+        self.send_heartbeats().await?;
+
+        Ok(())
     }
 
     async fn handle_event(&mut self, event: Event) -> Result<()> {
