@@ -1725,6 +1725,9 @@ impl RaftNode {
                 // For single-node clusters, this is handled in `become_leader`.
                 // For multi-node, commit_index is advanced in `handle_append_entries_response`.
 
+                // Store reply for when entry is committed and applied
+                self.pending_replies.insert(absolute_index, reply_tx);
+
                 // Pipeline: immediately replicate to followers without waiting for next tick.
                 // For multi-node clusters this reduces write latency from up to 100ms to ~0ms.
                 if !self.peers.is_empty() {
@@ -1732,8 +1735,6 @@ impl RaftNode {
                         tracing::warn!("Immediate replication after ClientRequest failed: {}", e);
                     }
                 }
-
-                let _ = reply_tx.send(Ok(()));
             }
             Event::GetLeaderInfo { reply_tx } => {
                 let _ = reply_tx.send(self.current_leader_address.clone());
@@ -2346,6 +2347,10 @@ impl RaftNode {
                     "Warning: log_index {} >= log.len() {} during apply_logs. last_applied={}, last_included_index={}",
                     log_index, self.log.len(), self.last_applied, self.last_included_index
                 );
+            }
+            // Send pending reply if we have one for this index (entry committed and applied)
+            if let Some(reply_tx) = self.pending_replies.remove(&self.last_applied) {
+                let _ = reply_tx.send(Ok(()));
             }
         }
     }
